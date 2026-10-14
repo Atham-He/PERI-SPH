@@ -21,6 +21,11 @@ src/shared/peridynamics/pd_numerics.h:
   PrescribedTranslation: exact reference-position motion with consistent Velocity,
     AverageVelocity, Acceleration, and AverageAcceleration.
   ParticleStateCheck: explicit finite-value and positive-scalar checks.
+ProjectedPairStabilization in nosbpd_dynamics.h:
+  A central, endpoint-averaged penalty for non-affine deformation. The old
+  LittleWoodHourGlassControl name is retained as a source-compatible alias.
+  Parameters: non-negative coefficient and symmetric endpoint damage cutoff.
+  HourglassForce records its contribution in force units.
 src/shared/peridynamics/pd_case_config.h:
   Strict key=value inputs; unknown, duplicate, malformed, and non-finite values fail.
   --case-config is removed before upstream command-line parsing.
@@ -44,7 +49,12 @@ Core changes
 6. Drucker-Prager uses smooth-cone and hydrostatic-apex return branches, including
    saturation hardening. Its internal hardening variable is the plastic multiplier.
    Associated flow, non-negative alpha, and isotropic hardening are supported.
-7. Non-finite states, singular shape tensors, and det(F) < 0.05 raise errors.
+7. Projected stabilization uses K/delta^(d+2), preserving acceleration scaling
+   under geometrically similar problems. Endpoint deformation gradients are
+   averaged and damage eligibility is symmetric, balancing pair forces.
+   This is an independently normalized pair variant, not a claim of numerical
+   equivalence to a specific published Littlewood implementation.
+8. Non-finite states, singular shape tensors, and det(F) < 0.05 raise errors.
    The determinant threshold is a numerical admissibility guard, not a fracture law.
    NumericalFailureReason is separate from physical Damage and ParticleLive.
 
@@ -99,7 +109,7 @@ The cantilever and brittle-disc examples also use the shared PD time-step and
 exact-boundary controls; both were rebuilt. Their full physical benchmarks were
 not rerun in this stabilization pass.
 
-The peri_fast suite includes 15 core checks, four small 3D cases, their output
+The peri_fast suite includes 17 core checks, four small 3D cases, their output
 verification, and an injected-NaN end-to-end failure check.
 Small cases: radius 80 um, shell thickness 20 um, stroke 2 um, speed 0.1 m/s,
 end time 20 us. They are intentionally thick shells for fast integration regression;
@@ -133,8 +143,9 @@ or reducing plate speed alone did not fix it.
 Keeping c=25 and material parameters fixed, acoustic CFL 0.06 and 0.03 both completed
 20 us. Their maximum recorded density deviations were 0.887% and 0.517%; peak forces
 were 9.482 and 9.491 uN. This is short-case evidence about temporal sensitivity only.
-The final wall-surface-friction revision completed 20 us with density deviation
-0.662%, maximum recorded fluid speed 0.0788 m/s, and unchanged total particle mass.
+The final wall-surface-friction and stabilization revision completed 20 us with
+density deviation 0.668%, maximum recorded fluid speed 0.0794 m/s,
+and unchanged total particle mass.
 The low-threshold dry fracture control developed damage while NumericalFailureReason
 remained zero. Injected NaN stopped the run, saved a failure snapshot, and returned 1.
 
@@ -151,3 +162,16 @@ Remaining work before declaring the framework physically validated
 8. Define released mass with a moving boundary or control surface and a mass-flux balance.
 Do not interpret disappeared or invalid particles as released liquid. The historical B3
 run contains invalid liquid coordinates and is not an accepted calibration result.
+
+Stabilization normalization evidence
+The pre-correction geometric-scaling test gave relative error 3: doubling all
+lengths doubled the stabilization acceleration instead of halving it.
+A non-affine cuboid also had an unbalanced stabilization resultant of 1.639 N.
+The revised operator passes inverse-length acceleration scaling, affine nullspace,
+and resultant-momentum checks. Its coefficient and damage cutoff remain numerical
+controls requiring independent convergence studies and an energy budget.
+The penalty-force concept was checked against the primary Peridigm implementation
+https://github.com/peridigm/peridigm/blob/master/src/materials/correspondence.cxx
+and the control-scheme discussion in Zhang et al. (2023), Materials 16, 4050,
+https://doi.org/10.3390/ma16114050. The revised normalization and endpoint pairing
+follow the dimensional and momentum checks of this project.

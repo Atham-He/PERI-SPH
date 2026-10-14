@@ -511,8 +511,8 @@ void NosbPDFourthStep::update(size_t index_i, Real dt)
     pos_[index_i] += vel_[index_i] * dt * 0.5;
 }
 //=================================================================================================//
-LittleWoodHourGlassControl::
-    LittleWoodHourGlassControl(BaseInnerRelation &inner_relation)
+ProjectedPairStabilization::
+    ProjectedPairStabilization(BaseInnerRelation &inner_relation, Real coefficient, Real damage_cutoff)
     : LocalDynamics(inner_relation.getSPHBody()), DataDelegateInner(inner_relation),
       hw_solid_(DynamicCast<HughesWingetSolid>(this, inner_relation.getSPHBody().getMatterMaterial())),
       particleLive_(particles_->getVariableDataByName<int>("ParticleLive")),
@@ -520,45 +520,47 @@ LittleWoodHourGlassControl::
       Vol_(particles_->getVariableDataByName<Real>("VolumetricMeasure")),
       pos_(particles_->getVariableDataByName<Vecd>("Position")),
       acc_(particles_->registerStateVariableData<Vecd>("PDAcceleration")),
+      hourglass_force_(particles_->registerStateVariableData<Vecd>("HourglassForce")),
       F_(particles_->registerStateVariableData<Matd>("DeformationGradient", IdentityMatrix<Matd>::value))
 {
+    if (!std::isfinite(coefficient) || coefficient < 0 || !std::isfinite(damage_cutoff) || damage_cutoff <= 0 || damage_cutoff > 1)
+        throw std::invalid_argument("PD stabilization requires a non-negative coefficient and 0 < damage cutoff <= 1");
+    particles_->addVariableToWrite<Vecd>("HourglassForce");
     rho0_ = hw_solid_.ReferenceDensity();
-    Chg_ = 0.5;
+    Chg_ = coefficient;
+    damage_cutoff_ = damage_cutoff;
     Kbulk_ = hw_solid_.getBulkModulusforHGC(Dimensions);
     horizon_ = sph_body_->getSPHAdaptation().getKernel()->CutOffRadius();
 }
 //=================================================================================================//
-void LittleWoodHourGlassControl::interaction(size_t index_i, Real dt)
+void ProjectedPairStabilization::interaction(size_t index_i, Real dt)
 {
-    /** skip damaged particles: the hourglass force measures the deviation
-     * between the F-predicted and the actual neighbor positions. In damaged
-     * (crushed) zones F is no longer representative, so the deviation is
-     * physical (fracture) rather than a zero-energy mode — and the
-     * horizon^-3 stiffness would blow the velocity field up. */
-    if (particleLive_[index_i] == 1 && damage_[index_i] < 0.1)
+    hourglass_force_[index_i].setZero();
+    if (particleLive_[index_i] != 1 || damage_[index_i] >= damage_cutoff_ || Chg_ == 0) return;
+    // Scale-consistent projected pair penalty. In d dimensions, K/delta^(d+2)
+    // times a length error and neighbor measure produces force density (Pa/m).
+    Real bond_const = 12.0 * Kbulk_ / (Pi * std::pow(horizon_, Dimensions + 2));
+    Vecd force_density = Vecd::Zero();
+    const Neighborhood &neighbors = inner_configuration_[index_i];
+    for (size_t n = 0; n < neighbors.current_size_; ++n)
     {
-        Real bond_const = 12.0 * Kbulk_ / Pi / pow(horizon_, 3);
-        Vecd dhg_force = Vecd::Zero();
-
-        const Neighborhood &inner_neighborhood = inner_configuration_[index_i];
-        for (size_t n = 0; n != inner_neighborhood.current_size_; ++n)
-        {
-            size_t index_j = inner_neighborhood.j_[n];
-            /** reference bond vector r_j - r_i */
-            Vecd r_ij = -inner_neighborhood.r_ij_[n] * inner_neighborhood.e_ij_[n];
-            if (inner_neighborhood.bondLive_[n])
-            {
-                Vecd r_ij_predict = F_[index_i] * r_ij;
-                Vecd pos_j_predict = pos_[index_i] + r_ij_predict;
-                Vecd hour_dir = pos_j_predict - pos_[index_j];
-                Vecd eta = pos_[index_j] - pos_[index_i];
-                Real hproj = hour_dir.transpose() * eta;
-
-                dhg_force += Chg_ * bond_const * hproj / r_ij.norm() / eta.norm() * Vol_[index_j] * eta;
-            }
-        }
-        acc_[index_i] -= dhg_force / rho0_;
+        size_t j = neighbors.j_[n];
+        // Eligibility and endpoint averaging are symmetric; only this row's
+        // acceleration is written, so parallel execution does not scatter data.
+        if (!neighbors.bondLive_[n] || particleLive_[j] != 1 || damage_[j] >= damage_cutoff_) continue;
+        Vecd reference = -neighbors.r_ij_[n] * neighbors.e_ij_[n];
+        Vecd current = pos_[j] - pos_[index_i];
+        Real length = current.norm();
+        if (!std::isfinite(length) || length <= SqrtEps * neighbors.r_ij_[n])
+            peridynamics::numericalFailure(sph_body_->Name(), index_i, "collapsed stabilization bond");
+        Vecd error = (0.5 * (F_[index_i] + F_[j])) * reference - current;
+        Real projection = error.dot(current);
+        force_density -= Chg_ * bond_const * projection / (neighbors.r_ij_[n] * length) * Vol_[j] * current;
     }
+    if (!force_density.allFinite())
+        peridynamics::numericalFailure(sph_body_->Name(), index_i, "HourglassForce");
+    acc_[index_i] += force_density / rho0_;
+    hourglass_force_[index_i] = force_density * Vol_[index_i];
 }
 //=================================================================================================//
 PairNumericalDampingforPD::

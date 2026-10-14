@@ -21,7 +21,7 @@ Real plate_friction_mu = 0.3, plate_friction_veps = 0.005;
 Real rho0_f = 935, c_f = 25, mu_f = 0.25, fluid_spacing_ratio = 1.5;
 Real gravity_g = 9.8, compression_speed = 0.1, compression_distance = 0.58e-3;
 Real U_ref = 0.5, pd_cfl = 0.1, acoustic_cfl = 0.3, acoustic_damping_factor = 0.3;
-Real max_density_error = 0.1, max_fluid_mach = 0.3;
+Real max_density_error = 0.1, max_fluid_mach = 0.3, hourglass_coefficient = 0.5, hourglass_damage_cutoff = 0.1;
 bool shell_viscoplastic = true, with_liquid = true, reinitialize_density = false;
 int output_frames = 50, bond_check_interval = 1, inject_nan_step = -1, max_pd_substeps = 6;
 Real capsule_radius_in, resolution_ref, capsule_center_y, upper_plate_bottom, end_time;
@@ -57,7 +57,7 @@ static peridynamics::CaseParameters parameters()
     BIND(plate_friction_mu); BIND(plate_friction_veps); BIND(rho0_f); BIND(c_f); BIND(mu_f);
     BIND(fluid_spacing_ratio); BIND(gravity_g); BIND(compression_speed); BIND(compression_distance);
     BIND(reinitialize_density); BIND(U_ref); BIND(pd_cfl); BIND(acoustic_cfl); BIND(acoustic_damping_factor);
-    BIND(max_density_error); BIND(max_fluid_mach); BIND(shell_viscoplastic); BIND(with_liquid);
+    BIND(hourglass_coefficient); BIND(hourglass_damage_cutoff); BIND(max_density_error); BIND(max_fluid_mach); BIND(shell_viscoplastic); BIND(with_liquid);
     BIND(max_pd_substeps); BIND(output_frames); BIND(bond_check_interval); BIND(inject_nan_step);
 #undef BIND
     return p;
@@ -73,7 +73,10 @@ static void validateParameters()
         output_frames < 1 || bond_check_interval < 1 || max_pd_substeps < 1 || pd_cfl <= 0 || pd_cfl > 0.2 ||
         acoustic_cfl <= 0 || acoustic_cfl > 0.6 || acoustic_damping_factor < 0 ||
         max_density_error <= 0 || max_density_error >= 1 || max_fluid_mach <= 0 ||
-        plate_friction_mu < 0 || plate_friction_veps <= 0)
+        plate_friction_mu < 0 || plate_friction_veps <= 0 ||
+        yield_stress_shell <= 0 || hardening_shell < 0 || viscosity_shell < 0 ||
+        max_tension_stress <= 0 || critical_plastic_strain <= 0 || U_ref <= 0 ||
+        hourglass_coefficient < 0 || hourglass_damage_cutoff <= 0 || hourglass_damage_cutoff > 1 || inject_nan_step < -1)
         throw std::invalid_argument("invalid capsule geometry, material, schedule or numerical controls");
     capsule_radius_in = capsule_radius_out - shell_thickness;
     resolution_ref = shell_thickness / shell_layers;
@@ -174,7 +177,7 @@ int main(int argc, char **argv)
         second = makeUnique<InteractionWithUpdate<solid_dynamics::NosbPDSecondStep>>(shell_inner);
         fracture = makeUnique<InteractionDynamics<solid_dynamics::BondBreakByPrinStress>>(shell_inner, max_tension_stress);
     }
-    InteractionDynamics<solid_dynamics::LittleWoodHourGlassControl> hourglass(shell_inner);
+    InteractionDynamics<solid_dynamics::LittleWoodHourGlassControl> hourglass(shell_inner, hourglass_coefficient, hourglass_damage_cutoff);
     InteractionDynamics<solid_dynamics::PairNumericalDampingforPD> pd_damping(shell_inner);
     InteractionDynamics<solid_dynamics::NosbPDThirdStep> third(shell_inner);
     SimpleDynamics<solid_dynamics::NosbPDFourthStep> fourth(shell);

@@ -271,27 +271,30 @@ class NosbPDFourthStep : public LocalDynamics
 };
 
 /**
- * @class LittleWoodHourGlassControl
- * @brief Hourglass (zero-energy mode) control by a background bond force,
- * Littlewood (2015).
+ * @class ProjectedPairStabilization
+ * @brief Scale-consistent central pair penalty for non-affine deformation.
+ * Endpoint averaging and symmetric damage eligibility preserve pair momentum.
+ * The legacy LittleWoodHourGlassControl name remains a source-compatible alias.
  */
-class LittleWoodHourGlassControl : public LocalDynamics, public DataDelegateInner
+class ProjectedPairStabilization : public LocalDynamics, public DataDelegateInner
 {
   public:
-    explicit LittleWoodHourGlassControl(BaseInnerRelation &inner_relation);
-    virtual ~LittleWoodHourGlassControl() {};
+    explicit ProjectedPairStabilization(BaseInnerRelation &inner_relation, Real coefficient = 0.5, Real damage_cutoff = 0.1);
+    virtual ~ProjectedPairStabilization() {};
 
     void interaction(size_t index_i, Real dt = 0.0);
 
   protected:
     HughesWingetSolid &hw_solid_;
-    Real rho0_, Chg_, Kbulk_, horizon_;
+    Real rho0_, Chg_, Kbulk_, horizon_, damage_cutoff_;
     int *particleLive_;
     Real *damage_;
     Real *Vol_;
-    Vecd *pos_, *acc_;
+    Vecd *pos_, *acc_, *hourglass_force_;
     Matd *F_;
 };
+
+using LittleWoodHourGlassControl = ProjectedPairStabilization;
 
 /**
  * @class PairNumericalDampingforPD

@@ -7,8 +7,11 @@ using namespace SPH;
 class PDTestBody
 {
   public:
-    SPHSystem system{BoundingBoxd(Vecd(-1, -1, -1), Vecd(1, 1, 1)), 0.1};
-    PDBody body{system, makeShared<GeometricShapeBox>(Transform(), Vecd(0.3, 0.3, 0.3), "TestSolid")};
+    SPHSystem system;
+    PDBody body;
+    explicit PDTestBody(Real scale = 1)
+        : system(BoundingBoxd(Vecd(-scale, -scale, -scale), Vecd(scale, scale, scale)), 0.1 * scale),
+          body(system, makeShared<GeometricShapeBox>(Transform(), Vecd(0.3 * scale, 0.3 * scale, 0.3 * scale), "TestSolid")) {}
     UniquePtr<InnerRelation> inner;
     template <class Material, class... Args> void generate(Args... args)
     {
@@ -267,4 +270,58 @@ TEST(PDContact, NormalWallMotionDoesNotCreateTangentialFriction)
 {
     Vecd force(3, 10, 1), relative(0, -2, 0), wall_normal(0, 1, 0);
     EXPECT_LT((solid_dynamics::pdContactPairForce(force, relative, wall_normal, 0.3, 0.01) - force).norm(), 1e-12);
+}
+
+static StdVec<Vecd> hourglassAcceleration(Real scale, bool perturb, Vecd &net_force)
+{
+    PDTestBody f(scale);
+    f.generate<HughesWingetSolid>(1000, 1e6, 0.25);
+    InteractionWithUpdate<solid_dynamics::NosbPDShapeMatrix> shape(*f.inner);
+    InteractionWithUpdate<solid_dynamics::NosbPDSecondStep> second(*f.inner);
+    InteractionDynamics<solid_dynamics::LittleWoodHourGlassControl> hourglass(*f.inner);
+    shape.exec();
+    auto &p = f.body.getBaseParticles();
+    auto *x = p.getVariableDataByName<Vecd>("Position");
+    if (perturb)
+    {
+        size_t center = 0;
+        for (size_t i = 1; i < p.TotalRealParticles(); ++i)
+            if (x[i].squaredNorm() < x[center].squaredNorm()) center = i;
+        x[center] += scale * Vecd(0.001, 0.0004, -0.0003);
+    }
+    else
+    {
+        Matd A = Matd::Identity(); A(0,0) = 1.02; A(1,1) = 0.99; A(0,2) = 0.01;
+        for (size_t i = 0; i < p.TotalRealParticles(); ++i) x[i] = A * x[i] + scale * Vecd(0.1, 0.2, -0.1);
+    }
+    second.exec(1e-5); hourglass.exec();
+    auto *a = p.getVariableDataByName<Vecd>("PDAcceleration");
+    auto *mass = p.getVariableDataByName<Real>("Mass");
+    StdVec<Vecd> result(p.TotalRealParticles());
+    net_force.setZero();
+    for (size_t i = 0; i < p.TotalRealParticles(); ++i) {result[i] = a[i]; net_force += mass[i] * a[i];}
+    return result;
+}
+
+TEST(PDHourglass, GeometricScalingHasInverseLengthAcceleration)
+{
+    Vecd force;
+    auto small = hourglassAcceleration(1, true, force);
+    auto large = hourglassAcceleration(2, true, force);
+    ASSERT_EQ(small.size(), large.size());
+    Real norm = 0, error = 0;
+    for (size_t i = 0; i < small.size(); ++i) {norm += small[i].squaredNorm(); error += (small[i] - 2 * large[i]).squaredNorm();}
+    ASSERT_GT(norm, 1e-20);
+    EXPECT_LT(std::sqrt(error / norm), 1e-9);
+}
+
+TEST(PDHourglass, VanishesForAffineMotionAndBalancesMomentum)
+{
+    Vecd net;
+    auto affine = hourglassAcceleration(1, false, net);
+    for (const Vecd &a : affine) EXPECT_LT(a.norm(), 1e-8);
+    auto perturbed = hourglassAcceleration(1, true, net);
+    Real scale = 0;
+    for (const Vecd &a : perturbed) scale += a.norm();
+    EXPECT_LT(net.norm(), 1e-9 * std::max(scale, Real(1)));
 }

@@ -1,0 +1,153 @@
+PERI-SPH framework: stabilization foundation
+Date: 2026-10-15 (Asia/Shanghai)
+
+Purpose
+A reusable NOSB-PD module on SPHinXsys, with a 3D single-capsule application.
+This revision establishes numerical interfaces and reproducible validation.
+It does not establish experimental calibration or full-resolution fracture convergence.
+The tested build is double-precision, CPU, three-dimensional.
+
+Source and history
+The development checkout is /home/hezhy58/SPHinXsys, branch capsule.
+The desktop SPHinXsys directory is the unchanged upstream copy.
+95a99ff checkpoints the pre-stabilization custom implementation.
+An independent backup is in the desktop framework_work/2026-10-14/baseline directory.
+No historical production simulation output was replaced.
+
+Reusable interfaces
+src/shared/peridynamics/pd_numerics.h:
+  boundedTimeStep: validate and clip one increment to all remaining intervals.
+  PDTimeStep: limit the solid increment by wave speed, speed, and acceleration.
+  PrescribedTranslation: exact reference-position motion with consistent Velocity,
+    AverageVelocity, Acceleration, and AverageAcceleration.
+  ParticleStateCheck: explicit finite-value and positive-scalar checks.
+src/shared/peridynamics/pd_case_config.h:
+  Strict key=value inputs; unknown, duplicate, malformed, and non-finite values fail.
+  --case-config is removed before upstream command-line parsing.
+
+Core changes
+1. Contact friction is computed from wall-relative slip projected onto the wall surface
+   tangent plane per neighbor pair and applied once. Initialize wall NormalDirection
+   before using friction; prescribed translation preserves those normals.
+   Use identical mu and velocity regularization in FromWall and ToWall operators.
+   Reaction and applied contact force pass an action/reaction check.
+2. Acoustic damping applies an explicit velocity increment. Its diagnostic forces have
+   force units and do not overwrite the upstream pressure Force accumulator.
+3. Fluid-wall divergence obtains velocity through the material's virtual AverageVelocity
+   interface, supporting rigid and deformable walls consistently.
+4. Derived stress/shear/pressure fracture criteria dynamically dispatch via virtual/override.
+   Symmetric principal-value evaluation uses Eigen's direct self-adjoint solver.
+5. J2 solves a nonlinear scalar consistency equation including saturation hardening.
+   Backstress = H_kin * internal_strain; the linear resistance is
+   G + H_iso/3 + H_kin/2. Viscosity adds eta/(3*dt) to this resistance.
+   Positive dt is mandatory for a viscous plastic update. YieldFunc is implemented.
+6. Drucker-Prager uses smooth-cone and hydrostatic-apex return branches, including
+   saturation hardening. Its internal hardening variable is the plastic multiplier.
+   Associated flow, non-negative alpha, and isotropic hardening are supported.
+7. Non-finite states, singular shape tensors, and det(F) < 0.05 raise errors.
+   The determinant threshold is a numerical admissibility guard, not a fracture law.
+   NumericalFailureReason is separate from physical Damage and ParticleLive.
+
+Capsule application
+Geometry defaults: outer diameter 1 mm; shell thickness 20 um; nominal three layers.
+Shell defaults remain generic, without an established material calibration.
+The default liquid is rho=935 kg/m3, dynamic viscosity 0.25 Pa*s, artificial sound
+speed 25 m/s. Core viscosity is implemented through the upstream viscous-force
+operator, including its reaction on the shell. It is not random velocity damping.
+The default plate speed is 0.1 m/s and stroke is 0.58 mm.
+
+The fluid and PD solvers consume the same accepted outer increment; the clock is
+advanced with that increment. Output and end times land on prescribed boundaries.
+An explicit fluid-solid exchange increment is limited to max_pd_substeps times the
+current PD stability increment (default six). This is a configurable conservative
+control, not a general stability theorem. Validate it for every new problem.
+Bond checks use PD-substep count; bond_check_interval is in PD substeps.
+The plastic-strain criterion uses maximum principal value of the average plastic
+strain tensor, with its existing stretch safeguard; it is not equivalent plastic strain.
+
+The enclosed core defaults to continuity-based density evolution with volume update.
+Optional reinitialize_density uses the original free-surface density summation and
+requires separate validation. Fracture and outflow need additional free-surface checks.
+Dry control still allocates frozen fluid particles because the upstream body requires
+particles; with_liquid=false prevents their integration and load contribution.
+PD reference neighborhoods must remain fixed, and PD particles must not be sorted.
+Restart is explicitly rejected: reference bond state and all internal variables do not
+have a complete restart/reload serialization contract yet.
+
+Outputs
+output/effective_parameters.cfg: all active controls in SI units.
+output/diagnostics.csv: time, prescribed stroke, step counts, liquid mass, maximum
+  speed, density deviation, damage, numerical failures, kinetic energies, force parts.
+output/UpperPlate_TotalReaction.dat: shell-contact and direct fluid pressure/viscous
+  contributions and their sum; no longer only shell repulsion.
+output/run_status.txt: completed or failed, phase, time, counters, failure reason.
+VTP: density, pressure, mass, shell velocity, stress, deformation gradient, plastic
+  variables, bond count, numerical failure reason, and existing force fields.
+The status marks failure snapshots as partial steps. Never use them as accepted results.
+Density/Mach admissibility limits are configurable and do not replace convergence checks.
+Kinetic energies are diagnostics; a full elastic/plastic/damping/work energy budget
+and an interface momentum residual are still required.
+
+Build and regression
+For the existing local Conda environment:
+  export PATH=/home/hezhy58/sphenv/bin:$PATH
+  cmake --build build --parallel 2 --target extra_3d_PD_framework_tests extra_3d_PD_capsule_compression
+  ctest --test-dir build -L peri_fast --output-on-failure
+For a different host, configure upstream dependencies as described in INSTALL_HPC.md.
+
+The cantilever and brittle-disc examples also use the shared PD time-step and
+exact-boundary controls; both were rebuilt. Their full physical benchmarks were
+not rerun in this stabilization pass.
+
+The peri_fast suite includes 15 core checks, four small 3D cases, their output
+verification, and an injected-NaN end-to-end failure check.
+Small cases: radius 80 um, shell thickness 20 um, stroke 2 um, speed 0.1 m/s,
+end time 20 us. They are intentionally thick shells for fast integration regression;
+they are not a resolution-reduced substitute for the 1-mm thin-shell experiment.
+The fracture control uses a deliberately low stress threshold only to exercise bond breaking.
+The full-resolution default capsule CTest is disabled by default. Enable it explicitly
+with PERI_ENABLE_LONG_TESTS=ON for long runs; normal executable runs remain available.
+
+Reproducible isolated run
+  python3 tools/peri_run.py run \
+    --executable build/tests/3d_examples/extra_3d_PD_capsule_compression/bin/extra_3d_PD_capsule_compression \
+    --config tests/3d_examples/extra_3d_PD_capsule_compression/configs/full_capsule.cfg \
+    --run-dir build/peri_runs/my_unique_run
+Use --no-states only when snapshots are unnecessary. --run-root chooses a unique
+subdirectory automatically. Existing run directories are refused.
+The launcher records executable/source/config hashes, Git revision and changes when
+available, a source snapshot, log, return code, and output verification.
+A source archive without Git is supported. Rebuild after changing C++ source;
+the launcher rejects source files newer than the executable.
+
+Verification covers finite diagnostics, completion, exact time/stroke, positive liquid
+mass and its conservation, density/Mach limits, damage range, numerical-failure count,
+and reconciliation of reaction components. It is not a quantitative physical-validation verdict.
+
+Evidence from this revision
+Exploratory CFL comparisons below were made during stabilization, before the final
+wall-surface friction correction. Final regression metrics are stated separately.
+The short coupled case with c=25 m/s failed at ~0.8-0.95 us when the fluid-solid
+exchange step followed the fluid CFL alone. Disabling the additional acoustic damper
+or reducing plate speed alone did not fix it.
+Keeping c=25 and material parameters fixed, acoustic CFL 0.06 and 0.03 both completed
+20 us. Their maximum recorded density deviations were 0.887% and 0.517%; peak forces
+were 9.482 and 9.491 uN. This is short-case evidence about temporal sensitivity only.
+The final wall-surface-friction revision completed 20 us with density deviation
+0.662%, maximum recorded fluid speed 0.0788 m/s, and unchanged total particle mass.
+The low-threshold dry fracture control developed damage while NumericalFailureReason
+remained zero. Injected NaN stopped the run, saved a failure snapshot, and returned 1.
+
+Remaining work before declaring the framework physically validated
+1. Original 1-mm, 20-um-shell capsule over the full loading schedule with stable metrics.
+2. Time increment, fluid-solid exchange ratio, particle spacing, horizon, shell-layer,
+   contact stiffness, and fracture-check interval convergence.
+3. Independent elastic beam frequency/deflection and fracture-energy benchmarks.
+4. Closed-cavity and moving-wall FSI tests with work/energy and interface momentum budgets.
+5. Damage-aware stabilization, objectivity after bond breaking, and post-fracture support.
+6. Full restart serialization, reference-bond integrity, and compatibility tests for other cases.
+7. Align measured size, shell thickness, core composition and loading rate; fit shell
+   elastic, yield, viscous, hardening and fracture parameters, then validate independently.
+8. Define released mass with a moving boundary or control surface and a mass-flux balance.
+Do not interpret disappeared or invalid particles as released liquid. The historical B3
+run contains invalid liquid coordinates and is not an accepted calibration result.

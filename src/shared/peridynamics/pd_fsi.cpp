@@ -11,6 +11,7 @@
  */
 
 #include "pd_fsi.h"
+#include "pd_numerics.h"
 
 #include "base_particles.hpp"
 #include "cell_linked_list.hpp"
@@ -76,7 +77,7 @@ VelocityDivergenceWithWallforPD::
     for (size_t k = 0; k != contact_particles_.size(); ++k)
     {
         contact_Vol_.push_back(contact_particles_[k]->getVariableDataByName<Real>("VolumetricMeasure"));
-        contact_vel_ave_.push_back(contact_particles_[k]->getVariableDataByName<Vecd>("AverageVelocity"));
+        contact_vel_ave_.push_back(DynamicCast<Solid>(this, contact_bodies_[k]->getMatterMaterial()).AverageVelocity(contact_particles_[k]));
     }
 }
 //=================================================================================================//
@@ -103,7 +104,9 @@ AcousticDamperInnerforPD::
       Vol_(particles_->getVariableDataByName<Real>("VolumetricMeasure")),
       rho_(particles_->getVariableDataByName<Real>("Density")),
       u_div_(particles_->getVariableDataByName<Real>("VelocityDivergence")),
-      force_(particles_->registerStateVariableData<Vecd>("Force")) {}
+      mass_(particles_->getVariableDataByName<Real>("Mass")),
+      force_(particles_->registerStateVariableData<Vecd>("AcousticDampingForceInner")),
+      vel_(particles_->getVariableDataByName<Vecd>("Velocity")) {}
 //=================================================================================================//
 void AcousticDamperInnerforPD::interaction(size_t index_i, Real dt)
 {
@@ -115,7 +118,10 @@ void AcousticDamperInnerforPD::interaction(size_t index_i, Real dt)
         acoustic_damper += (u_div_[index_i] + u_div_[index_j]) *
                            inner_neighborhood.dW_ij_[n] * Vol_[index_j] * inner_neighborhood.e_ij_[n];
     }
-    force_[index_i] += coeff_acoustic_damper_ * acoustic_damper / rho_[index_i];
+    force_[index_i] = mass_[index_i] * coeff_acoustic_damper_ * acoustic_damper / rho_[index_i];
+    if (!force_[index_i].allFinite() || !std::isfinite(dt) || dt < 0.0)
+        peridynamics::numericalFailure(sph_body_->Name(), index_i, "AcousticDampingForce");
+    vel_[index_i] += dt * force_[index_i] / mass_[index_i];
 }
 //=================================================================================================//
 AcousticDamperWithWallforPD::
@@ -124,7 +130,9 @@ AcousticDamperWithWallforPD::
       Vol_(particles_->getVariableDataByName<Real>("VolumetricMeasure")),
       rho_(particles_->getVariableDataByName<Real>("Density")),
       u_div_(particles_->getVariableDataByName<Real>("VelocityDivergence")),
-      force_(particles_->registerStateVariableData<Vecd>("Force"))
+      mass_(particles_->getVariableDataByName<Real>("Mass")),
+      force_(particles_->registerStateVariableData<Vecd>("AcousticDampingForceWall")),
+      vel_(particles_->getVariableDataByName<Vecd>("Velocity"))
 {
     for (size_t k = 0; k != contact_particles_.size(); ++k)
     {
@@ -146,7 +154,10 @@ void AcousticDamperWithWallforPD::interaction(size_t index_i, Real dt)
                                contact_neighborhood.e_ij_[n];
         }
     }
-    force_[index_i] += coeff_acoustic_damper_ * acoustic_damper / rho_[index_i];
+    force_[index_i] = mass_[index_i] * coeff_acoustic_damper_ * acoustic_damper / rho_[index_i];
+    if (!force_[index_i].allFinite() || !std::isfinite(dt) || dt < 0.0)
+        peridynamics::numericalFailure(sph_body_->Name(), index_i, "AcousticDampingForce");
+    vel_[index_i] += dt * force_[index_i] / mass_[index_i];
 }
 //=================================================================================================//
 } // namespace fluid_dynamics
@@ -231,7 +242,7 @@ void PressureForceFromFluidforPD<RiemannSolverType>::interaction(size_t index_i,
     }
     else
     {
-        force_from_fluid_[index_i].setZero();
+        peridynamics::numericalFailure(sph_body_->Name(), index_i, "PressureForceFromFluid");
     }
     sum_w = (sum_w == 0.0 ? 1.0 : sum_w);
     pressure_from_fluid_[index_i] = p_from_f / sum_w;

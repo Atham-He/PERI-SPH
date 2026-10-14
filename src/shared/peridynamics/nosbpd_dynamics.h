@@ -168,7 +168,7 @@ class BondBreakByPrinStress : public NosbPDCheckBondLive
     explicit BondBreakByPrinStress(BaseInnerRelation &inner_relation, Real critical_value);
     virtual ~BondBreakByPrinStress() {};
 
-    bool checkBondLive(Matd &stress_eq, Real &stretch_rate);
+    virtual bool checkBondLive(Matd &stress_eq, Real &stretch_rate);
     void interaction(size_t index_i, Real dt = 0.0);
 
   protected:
@@ -188,7 +188,7 @@ class BondBreakBySigma1andSigma3 : public BondBreakByPrinStress
                                         Real max_tension, Real max_shear);
     virtual ~BondBreakBySigma1andSigma3() {};
 
-    bool checkBondLive(Matd &stress_eq, Real &stretch_rate);
+    virtual bool checkBondLive(Matd &stress_eq, Real &stretch_rate);
 
   protected:
     Real max_tension_, max_shear_;
@@ -205,7 +205,7 @@ class BondBreakBySigma1andNorm1 : public BondBreakByPrinStress
                                        Real max_tension, Real max_pressure);
     virtual ~BondBreakBySigma1andNorm1() {};
 
-    bool checkBondLive(Matd &stress_eq, Real &stretch_rate);
+    virtual bool checkBondLive(Matd &stress_eq, Real &stretch_rate);
 
   protected:
     Real max_tension_, max_pressure_;

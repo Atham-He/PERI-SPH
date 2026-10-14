@@ -1,0 +1,5 @@
+add_executable(extra_3d_PD_framework_tests framework_tests.cpp)
+target_link_libraries(extra_3d_PD_framework_tests PRIVATE sphinxsys_3d GTest::gtest_main)
+set_target_properties(extra_3d_PD_framework_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin")
+add_test(NAME extra_3d_PD_framework_tests COMMAND extra_3d_PD_framework_tests)
+set_tests_properties(extra_3d_PD_framework_tests PROPERTIES TIMEOUT 120 LABELS peri_fast)

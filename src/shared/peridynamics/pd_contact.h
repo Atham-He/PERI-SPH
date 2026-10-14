@@ -23,11 +23,32 @@
 #include "base_local_dynamics.h"
 #include "base_particle_dynamics.h"
 #include "pd_materials.h"
+#include <cmath>
+#include <stdexcept>
 
 namespace SPH
 {
 namespace solid_dynamics
 {
+inline Vecd pdContactPairForce(const Vecd &normal_force, const Vecd &relative_velocity,
+                               const Vecd &wall_normal, Real mu, Real veps)
+{
+    if (normal_force.squaredNorm() == 0.0 || mu == 0.0) return normal_force;
+    Real length = wall_normal.norm();
+    if (!wall_normal.allFinite() || length <= 0.0)
+        throw std::runtime_error("PD friction requires initialized wall NormalDirection");
+    Vecd normal = wall_normal / length;
+    Real magnitude = std::abs(normal_force.dot(normal));
+    Vecd tangent = relative_velocity - normal * relative_velocity.dot(normal);
+    Real speed = tangent.norm();
+    if (speed == 0.0) return normal_force;
+    return normal_force - mu * magnitude * std::tanh(speed / veps) * tangent / speed;
+}
+inline Vecd pdContactPairForce(const Vecd &normal_force, const Vecd &relative_velocity, Real mu, Real veps)
+{
+    return pdContactPairForce(normal_force, relative_velocity, normal_force, mu, veps);
+}
+
 /**
  * @class ContactRepulsionFactorforPD
  * @brief Kernel-summation contact factor sigma in [0, ~1] for PD particles,
@@ -44,7 +65,7 @@ class ContactRepulsionFactorforPD : public LocalDynamics, public DataDelegateCon
     void interaction(size_t index_i, Real dt = 0.0);
 
   protected:
-    Real offset_W_ij_;
+    StdVec<Real> offset_W_ij_;
     Real *repulsion_factor_;
     StdVec<Real *> contact_Vol_;
 };
@@ -70,6 +91,7 @@ class ContactRepulsionFromWallforPD : public LocalDynamics, public DataDelegateC
 
   protected:
     HughesWingetSolid &hw_solid_;
+    StdVec<Vecd *> contact_velocity_, contact_normal_;
     Real contact_stiffness_;
     Real friction_mu_, friction_veps_;
     Vecd *vel_;
@@ -92,14 +114,16 @@ class ContactRepulsionFromWallforPD : public LocalDynamics, public DataDelegateC
 class ContactRepulsionToWallforPD : public LocalDynamics, public DataDelegateContact
 {
   public:
-    explicit ContactRepulsionToWallforPD(BaseContactRelation &contact_relation);
+    explicit ContactRepulsionToWallforPD(BaseContactRelation &contact_relation, Real friction_mu = 0.0, Real friction_veps = 1.0e-3);
     virtual ~ContactRepulsionToWallforPD() {};
 
     void interaction(size_t index_i, Real dt = 0.0);
 
   protected:
     Real *Vol_; ///< volumetric measure of wall particles
-    Vecd *repulsion_force_;
+    Vecd *repulsion_force_, *velocity_, *normal_;
+    Real friction_mu_, friction_veps_;
+    StdVec<Vecd *> contact_velocity_;
     StdVec<Solid *> contact_solids_;
     StdVec<Real *> contact_Vol_;
     StdVec<Real *> contact_repulsion_factor_;

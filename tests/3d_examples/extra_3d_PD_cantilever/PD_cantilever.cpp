@@ -91,7 +91,7 @@ int main(int ac, char *av[])
     /** calculate the shape matrix once in the reference configuration. */
     InteractionWithUpdate<solid_dynamics::NosbPDShapeMatrix> cantilever_shape_matrix(cantilever_body_inner);
     /** Time step size calculation. */
-    ReduceDynamics<solid_dynamics::AcousticTimeStep> computing_time_step_size(cantilever_body);
+    ReduceDynamics<solid_dynamics::PDTimeStep> computing_time_step_size(cantilever_body, 0.085);
     /** NOSB-PD position-Verlet steps with hourglass control and numerical damping. */
     SimpleDynamics<solid_dynamics::NosbPDFirstStep> nosbpd_first_step(cantilever_body);
     InteractionWithUpdate<solid_dynamics::NosbPDSecondStep> nosbpd_second_step(cantilever_body_inner);
@@ -134,7 +134,7 @@ int main(int ac, char *av[])
     while (physical_time < end_time)
     {
         Real integration_time = 0.0;
-        while (integration_time < output_period)
+        while (integration_time < output_period && physical_time < end_time)
         {
             if (ite % 100 == 0)
             {
@@ -142,7 +142,7 @@ int main(int ac, char *av[])
                           << physical_time << "	dt: "
                           << dt << "\n";
             }
-            dt = 0.1 * computing_time_step_size.exec();
+            dt = peridynamics::boundedTimeStep(computing_time_step_size.exec(), {output_period - integration_time, end_time - physical_time});
             initialize_a_pd_step.exec(dt);
             nosbpd_first_step.exec(dt);
             nosbpd_second_step.exec(dt);
@@ -153,8 +153,8 @@ int main(int ac, char *av[])
             constraint_holder.exec(dt);
 
             ite++;
-            integration_time += dt;
-            physical_time += dt;
+            integration_time = dt == output_period - integration_time ? output_period : integration_time + dt;
+            physical_time = dt == end_time - physical_time ? end_time : physical_time + dt;
         }
         write_displacement.writeToFile(ite);
         TickCount t2 = TickCount::now();

@@ -119,8 +119,9 @@ class VelocityDivergenceWithWallforPD : public LocalDynamics, public DataDelegat
 /**
  * @class AcousticDamperInnerforPD
  * @brief Acoustic damper on fluid particles from inner interactions,
- * acc_i += coeff * sum_j (u_div_i + u_div_j) dW_ij V_j e_ij / rho_i.
- * Execute after the fluid 1st half step.
+ * v_i += dt * coeff * sum_j (u_div_i + u_div_j) dW_ij V_j e_ij / rho_i.
+ * Explicit velocity kick after the fluid 1st half step. The diagnostic force
+ * is stored separately and never written into the upstream Force accumulator.
  */
 class AcousticDamperInnerforPD : public LocalDynamics, public DataDelegateInner
 {
@@ -137,14 +138,16 @@ class AcousticDamperInnerforPD : public LocalDynamics, public DataDelegateInner
   protected:
     Real coeff_acoustic_damper_ = 0.0;
     Real *Vol_, *rho_, *u_div_;
-    Vecd *force_;
+    Real *mass_;
+    Vecd *force_, *vel_;
 };
 
 /**
  * @class AcousticDamperWithWallforPD
  * @brief Acoustic damper on fluid particles from wall (PD body) interactions,
- * acc_i += coeff * sum_j (2 * u_div_i) dW_ij V_j e_ij / rho_i.
- * Execute after the fluid 1st half step.
+ * v_i += dt * coeff * sum_j (2 * u_div_i) dW_ij V_j e_ij / rho_i.
+ * Explicit velocity kick after the fluid 1st half step. The diagnostic force
+ * is stored separately and never written into the upstream Force accumulator.
  */
 class AcousticDamperWithWallforPD : public LocalDynamics, public DataDelegateContact
 {
@@ -161,7 +164,8 @@ class AcousticDamperWithWallforPD : public LocalDynamics, public DataDelegateCon
   protected:
     Real coeff_acoustic_damper_ = 0.0;
     Real *Vol_, *rho_, *u_div_;
-    Vecd *force_;
+    Real *mass_;
+    Vecd *force_, *vel_;
     StdVec<Real *> contact_Vol_;
 };
 } // namespace fluid_dynamics
@@ -173,10 +177,9 @@ namespace solid_dynamics
  * @brief Pressure force from the fluid acting on PD particles.
  * @details Riemann-type wall interaction with an external-acceleration
  * corrected wall pressure, plus an acoustic damper driven by the fluid
- * velocity divergence. The resulting force is assigned to
- * "PDAccelerationPrior" (overwrite semantics, as in the reference code;
- * combine with gravity by applying gravity initialization BEFORE this
- * class and note that this class overwrites the prior acceleration).
+ * velocity divergence. Force / reference mass is added to
+ * "PDAccelerationPrior" after PDTimeStepInitialization; gravity and
+ * other external loads are preserved.
  * The interface pressure is recorded in "PressureFromFluid" for output.
  */
 template <class RiemannSolverType = NoRiemannSolver>

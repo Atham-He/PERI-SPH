@@ -134,6 +134,7 @@ int main(int ac, char *av[])
     InteractionDynamics<solid_dynamics::PairNumericalDampingforPD> numerical_damping(disc_inner);
     InteractionDynamics<solid_dynamics::NosbPDThirdStep> nosbpd_third_step(disc_inner);
     SimpleDynamics<solid_dynamics::NosbPDFourthStep> nosbpd_fourth_step(disc);
+    ReduceDynamics<solid_dynamics::PDTimeStep> pd_time_step(disc, 0.085);
     std::cout << "pd methods done" << std::endl;
     //----------------------------------------------------------------------
     //	Plate contact with friction and reaction recording.
@@ -142,13 +143,13 @@ int main(int ac, char *av[])
      * contact force classes reading "RepulsionFactor". */
     InteractionDynamics<solid_dynamics::ContactRepulsionFactorforPD> disc_contact_factor(disc_plates_contact);
     InteractionDynamics<solid_dynamics::ContactRepulsionFromWallforPD> plate_contact_on_disc(disc_plates_contact, plate_friction_mu, plate_friction_veps);
-    InteractionDynamics<solid_dynamics::ContactRepulsionToWallforPD> disc_reaction_on_lower(lower_plate_disc_contact);
-    InteractionDynamics<solid_dynamics::ContactRepulsionToWallforPD> disc_reaction_on_upper(upper_plate_disc_contact);
+    InteractionDynamics<solid_dynamics::ContactRepulsionToWallforPD> disc_reaction_on_lower(lower_plate_disc_contact, plate_friction_mu, plate_friction_veps);
+    InteractionDynamics<solid_dynamics::ContactRepulsionToWallforPD> disc_reaction_on_upper(upper_plate_disc_contact, plate_friction_mu, plate_friction_veps);
     //----------------------------------------------------------------------
     //	Plate kinematics: upper plate driven, lower plate fixed.
     //----------------------------------------------------------------------
-    Vecd upper_plate_center_end(0.0, upper_plate_bottom + 0.5 * plate_thickness - compression_distance, 0.0);
-    SimpleDynamics<solid_dynamics::PositionSolidBody> drive_upper_plate(upper_plate, 0.0, end_time, upper_plate_center_end);
+    SimpleDynamics<solid_dynamics::PrescribedTranslation> drive_upper_plate(upper_plate, 0.0, end_time, Vecd(0.0, -compression_distance, 0.0));
+    SimpleDynamics<NormalDirectionFromBodyShape> lower_normal(lower_plate), upper_normal(upper_plate);
     //----------------------------------------------------------------------
     //	Output.
     //----------------------------------------------------------------------
@@ -166,6 +167,7 @@ int main(int ac, char *av[])
     sph_system.initializeSystemConfigurations();
     std::cout << "configurations done" << std::endl;
     disc_shape_matrix.exec();
+    lower_normal.exec(); upper_normal.exec(); drive_upper_plate.exec();
     std::cout << "shape matrix done" << std::endl;
     //----------------------------------------------------------------------
     //	Setup for time-stepping control.
@@ -177,7 +179,7 @@ int main(int ac, char *av[])
     /** fixed PD step derived from the wave-speed limit with a conservative
      * margin (ice-jet practice): at E = 5 GPa the Littlewood hourglass term
      * is stiff, and a margin of ~0.1 x dx/c is required for a clean start. */
-    Real dt_s = 0.085 * resolution_s / sqrt(youngs_s / rho0_s);
+    Real dt_s = pd_time_step.exec();
     //----------------------------------------------------------------------
     //	First output before the main loop.
     //----------------------------------------------------------------------
@@ -188,28 +190,26 @@ int main(int ac, char *av[])
     while (physical_time < end_time)
     {
         Real integration_time = 0.0;
-        while (integration_time < output_interval)
+        while (integration_time < output_interval && physical_time < end_time)
         {
+            dt_s = peridynamics::boundedTimeStep(pd_time_step.exec(), {end_time - physical_time, output_interval - integration_time});
             /** external loads (plate contact) accumulate onto PDAccelerationPrior. */
             initialize_a_pd_step.exec(dt_s);
             disc_contact_factor.exec(dt_s);
             plate_contact_on_disc.exec(dt_s);
+            disc_reaction_on_lower.exec(dt_s); disc_reaction_on_upper.exec(dt_s);
             /** NOSB-PD integration chain. */
             nosbpd_first_step.exec(dt_s);
-            /** bond breaking checked sparsely (eigen solve per bond is expensive). */
-            if (number_of_iterations % 10 == 0) check_bond_live.exec(dt_s);
             nosbpd_second_step.exec(dt_s);
+            /** Check the updated stress with a PD-substep counter. */
+            if (number_of_iterations % 10 == 0) check_bond_live.exec(dt_s);
             hourglass_control.exec(dt_s);
             numerical_damping.exec(dt_s);
             nosbpd_third_step.exec(dt_s);
             nosbpd_fourth_step.exec(dt_s);
-            /** plate kinematics (dt-dependent) and contact reactions. */
-            drive_upper_plate.exec(dt_s);
-            disc_reaction_on_lower.exec(dt_s);
-            disc_reaction_on_upper.exec(dt_s);
-
-            physical_time += dt_s;
-            integration_time += dt_s;
+            physical_time = dt_s == end_time - physical_time ? end_time : physical_time + dt_s;
+            integration_time = dt_s == output_interval - integration_time ? output_interval : integration_time + dt_s;
+            drive_upper_plate.exec();
             number_of_iterations++;
 
             if (number_of_iterations % screen_output_interval == 0)
@@ -226,6 +226,10 @@ int main(int ac, char *av[])
                 upper_plate_disc_contact.updateConfiguration();
             }
         }
+        disc.updateCellLinkedList(); upper_plate.updateCellLinkedList();
+        disc_plates_contact.updateConfiguration(); lower_plate_disc_contact.updateConfiguration(); upper_plate_disc_contact.updateConfiguration();
+        initialize_a_pd_step.exec(); disc_contact_factor.exec(); plate_contact_on_disc.exec();
+        disc_reaction_on_lower.exec(); disc_reaction_on_upper.exec();
         write_upper_plate_reaction.writeToFile(number_of_iterations);
         write_body_states.writeToFile();
     }

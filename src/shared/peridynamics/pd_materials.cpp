@@ -13,13 +13,36 @@
 #include "pd_materials.h"
 
 #include "base_particles.hpp"
+#include "pd_numerics.h"
+#include <functional>
 
 namespace SPH
 {
+namespace
+{
+Real solvePlasticMultiplier(const std::function<Real(Real)> &residual, Real lower, Real upper, Real scale)
+{
+    for (int i = 0; residual(upper) > 0.0 && i < 64; ++i) upper = 2.0 * upper + 1e-16;
+    if (!std::isfinite(residual(upper)) || residual(upper) > 0.0)
+        throw std::runtime_error("PD constitutive return mapping: failed to bracket plastic multiplier");
+    for (int i = 0; i < 100; ++i)
+    {
+        Real mid = 0.5 * (lower + upper);
+        Real value = residual(mid);
+        if (!std::isfinite(value)) throw std::runtime_error("PD constitutive return mapping: non-finite residual");
+        if (std::abs(value) <= 1e-11 * std::max(scale, Real(1))) return mid;
+        if (value > 0.0) lower = mid; else upper = mid;
+    }
+    throw std::runtime_error("PD constitutive return mapping: local solve did not converge");
+}
+} // namespace
 //=================================================================================================//
 HughesWingetSolid::HughesWingetSolid(Real rho0, Real youngs_modulus, Real poisson_ratio)
     : LinearElasticSolid(rho0, youngs_modulus, poisson_ratio)
 {
+    if (!std::isfinite(rho0) || rho0 <= 0 || !std::isfinite(youngs_modulus) || youngs_modulus <= 0 ||
+        !std::isfinite(poisson_ratio) || poisson_ratio <= -1 || poisson_ratio >= 0.5)
+        throw std::invalid_argument("HughesWingetSolid: positive density/modulus and -1 < Poisson ratio < 0.5 required");
     material_type_name_ = "HughesWingetSolid";
 }
 //=================================================================================================//
@@ -43,6 +66,9 @@ void HughesWingetSolid::initializeLocalParameters(BaseParticles *base_particles)
 {
     LinearElasticSolid::initializeLocalParameters(base_particles);
 
+    base_particles->registerStateVariableData<int>("NumericalFailureReason", 0);
+    base_particles->addVariableToWrite<int>("NumericalFailureReason");
+    base_particles->addEvolvingVariable<int>("NumericalFailureReason");
     /** bond state: 1 = particle effective, 0 = free particle (all bonds broken) */
     base_particles->registerStateVariableData<int>("ParticleLive", [&](size_t i) -> int
                                                    { return 1; });
@@ -50,6 +76,8 @@ void HughesWingetSolid::initializeLocalParameters(BaseParticles *base_particles)
                                                    { return 0; });
     base_particles->registerStateVariableData<Real>("Damage", [&](size_t i) -> Real
                                                     { return 0.0; });
+    base_particles->addVariableToWrite<int>("ParticleLive");
+    base_particles->addVariableToWrite<int>("BondNumber");
     /** shape tensor and its inverse in the reference configuration */
     base_particles->registerStateVariableData<Matd>("ShapeTensorK");
     base_particles->registerStateVariableData<Matd>("ShapeTensorKInv", IdentityMatrix<Matd>::value);
@@ -115,6 +143,10 @@ PlasticSolidforPD::
       kinematic_hardening_modulus_(kinematic_hardening_modulus),
       iso_hardening_ISV1_(nullptr), kin_hardening_ISV2_(nullptr)
 {
+    if (!std::isfinite(yield_stress) || yield_stress <= 0.0 ||
+        !std::isfinite(isotropic_hardening_modulus) || isotropic_hardening_modulus < 0.0 ||
+        !std::isfinite(kinematic_hardening_modulus) || kinematic_hardening_modulus < 0.0)
+        throw std::invalid_argument("PlasticSolidforPD: yield stress must be positive and hardening non-negative");
     material_type_name_ = "PlasticSolidforPD";
 }
 //=================================================================================================//
@@ -152,12 +184,14 @@ J2PlasticityforPD::
 //=================================================================================================//
 Real J2PlasticityforPD::YieldFunc(const Matd &stress, const Real &iso_q, const Matd &kin_q)
 {
-    return 0.0;
+    Matd relative = stress - kin_q;
+    Matd deviator = relative - relative.trace() * OneOverDimensions * Matd::Identity();
+    return deviator.norm() - sqrt_2_over_3_ * (yield_stress_ + iso_q);
 }
 //=================================================================================================//
 Real J2PlasticityforPD::J2FlowResistance(Real dt) const
 {
-    return G0_ + (isotropic_hardening_modulus_ + kinematic_hardening_modulus_) / 3.0;
+    return G0_ + isotropic_hardening_modulus_ / 3.0 + kinematic_hardening_modulus_ / 2.0;
 }
 //=================================================================================================//
 Matd J2PlasticityforPD::PlasticConstitutiveRelation(const Matd &G, const Matd &stress_old_const,
@@ -194,7 +228,14 @@ Matd J2PlasticityforPD::PlasticConstitutiveRelation(const Matd &G, const Matd &s
     if (trial_function > TinyReal)
     {
         /** plastic corrector */
-        Real relax_increment = 0.5 * trial_function / J2FlowResistance(dt);
+        Real linear_resistance = 2.0 * J2FlowResistance(dt) - 2.0 * isotropic_hardening_modulus_ / 3.0;
+        auto residual = [&](Real gamma)
+        {
+            return dev_eta_norm - linear_resistance * gamma - sqrt_2_over_3_ *
+                   (yield_stress_ + IsoHardeningFunc(trial_isoHardening_ISV1 + sqrt_2_over_3_ * gamma));
+        };
+        Real relax_increment = solvePlasticMultiplier(residual, 0.0, trial_function / linear_resistance,
+                                                       std::max(dev_eta_norm, yield_stress_));
         Matd flow_direction = dev_eta / dev_eta_norm;
         trial_sigma -= 2.0 * G0_ * relax_increment * flow_direction;
         trial_epsilon_p += relax_increment * flow_direction;
@@ -217,14 +258,18 @@ ViscoPlasticSolidforPD::
                         isotropic_hardening_modulus, kinematic_hardening_modulus),
       viscosity_(viscosity)
 {
+    if (!std::isfinite(viscosity) || viscosity < 0.0)
+        throw std::invalid_argument("ViscoPlasticSolidforPD: viscosity must be finite and non-negative");
     material_type_name_ = "ViscoPlasticSolidforPD";
 }
 //=================================================================================================//
 Real ViscoPlasticSolidforPD::J2FlowResistance(Real dt) const
 {
-    /** Perzyna overstress, backward Euler: d_gamma = 0.5 f / (G + H/3 + eta/(3 dt)).
-     * dt <= 0 (rate information unavailable) falls back to rate-independent J2. */
-    Real viscous_resistance = (viscosity_ > 0.0 && dt > 0.0) ? viscosity_ / (3.0 * dt) : 0.0;
+    /** The viscous resistance enters the nonlinear consistency residual.
+     * A rate-dependent plastic update always requires a positive time increment. */
+    if (viscosity_ > 0.0 && (!std::isfinite(dt) || dt <= 0.0))
+        throw std::invalid_argument("ViscoPlasticSolidforPD requires a positive time increment");
+    Real viscous_resistance = viscosity_ > 0.0 ? viscosity_ / (3.0 * dt) : 0.0;
     return J2PlasticityforPD::J2FlowResistance(dt) + viscous_resistance;
 }
 //=================================================================================================//
@@ -237,12 +282,15 @@ DruckerPragerPlasticityforPD::
       k_phi_(yield_stress), alpha_phi_(alpha_phi),
       sigmaY_infinite_(1.589 * yield_stress), sigmaY_0_(yield_stress), index_kesi_(16.93)
 {
+    if (!std::isfinite(alpha_phi) || alpha_phi < 0.0 || kinematic_hardening_modulus != 0.0)
+        throw std::invalid_argument("DruckerPragerPlasticityforPD: non-negative alpha and isotropic hardening only");
     material_type_name_ = "DruckerPragerPlasticityforPD";
 }
 //=================================================================================================//
 Real DruckerPragerPlasticityforPD::YieldFunc(const Matd &stress, const Real &iso_q, const Matd &kin_q)
 {
-    return 0.0;
+    Matd deviator = stress - stress.trace() * OneOverDimensions * Matd::Identity();
+    return alpha_phi_ * stress.trace() + deviator.norm() / sqrt2_ - (k_phi_ + iso_q);
 }
 //=================================================================================================//
 Matd DruckerPragerPlasticityforPD::PlasticConstitutiveRelation(const Matd &G, const Matd &stress_old_const,
@@ -274,13 +322,36 @@ Matd DruckerPragerPlasticityforPD::PlasticConstitutiveRelation(const Matd &G, co
 
     if (trial_function > TinyReal)
     {
-        /** plastic corrector */
-        Real relax_increment = trial_function /
-                               (9.0 * K0_ * alpha_phi_ * alpha_phi_ + G0_ + isotropic_hardening_modulus_);
-        Matd eta = dev_sigma / dev_sigma_norm;
-        Matd flow_direction = alpha_phi_ * Matd::Identity() + eta / sqrt2_;
-        trial_sigma -= relax_increment * (3.0 * K0_ * alpha_phi_ * Matd::Identity() + sqrt2_ * G0_ * eta);
-        trial_epsilon_p += relax_increment * flow_direction;
+        Real q_trial = dev_sigma_norm / sqrt2_;
+        Real gamma_apex = q_trial / G0_;
+        auto smooth_residual = [&](Real gamma)
+        {
+            return alpha_phi_ * norm1 + q_trial - (9.0 * K0_ * alpha_phi_ * alpha_phi_ + G0_) * gamma -
+                   k_phi_ - IsoHardeningFunc(trial_isoHardening_ISV1 + gamma);
+        };
+        Real relax_increment;
+        if (smooth_residual(gamma_apex) <= 0.0)
+        {
+            relax_increment = solvePlasticMultiplier(smooth_residual, 0.0, gamma_apex,
+                                                      std::max(std::abs(alpha_phi_ * norm1) + q_trial, k_phi_));
+            Matd eta = dev_sigma / dev_sigma_norm;
+            trial_sigma -= relax_increment * (3.0 * K0_ * alpha_phi_ * Matd::Identity() + sqrt2_ * G0_ * eta);
+            trial_epsilon_p += relax_increment * (alpha_phi_ * Matd::Identity() + eta / sqrt2_);
+        }
+        else
+        {
+            // Cone apex: deviatoric stress is exhausted. Continue on the hydrostatic branch.
+            auto apex_residual = [&](Real gamma)
+            {
+                return alpha_phi_ * norm1 - 9.0 * K0_ * alpha_phi_ * alpha_phi_ * gamma -
+                       k_phi_ - IsoHardeningFunc(trial_isoHardening_ISV1 + gamma);
+            };
+            Real upper = gamma_apex + trial_function / (9.0 * K0_ * alpha_phi_ * alpha_phi_);
+            relax_increment = solvePlasticMultiplier(apex_residual, gamma_apex, upper,
+                                                      std::max(std::abs(alpha_phi_ * norm1), k_phi_));
+            trial_sigma = (norm1 * OneOverDimensions - 3.0 * K0_ * alpha_phi_ * relax_increment) * Matd::Identity();
+            trial_epsilon_p += dev_sigma / (2.0 * G0_) + alpha_phi_ * relax_increment * Matd::Identity();
+        }
         trial_isoHardening_ISV1 += relax_increment;
     }
 

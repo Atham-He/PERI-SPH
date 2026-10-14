@@ -14,6 +14,7 @@
 #define ALL_PERIDYNAMICS_H
 
 #include "pd_body.h"
+#include "pd_numerics.h"
 #include "pd_contact.h"
 #include "pd_fsi.h"
 #include "pd_kernel.h"

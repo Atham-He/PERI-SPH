@@ -11,6 +11,7 @@
  */
 
 #include "nosbpd_dynamics.h"
+#include "pd_numerics.h"
 
 #include "adaptation.h"
 #include "base_particles.hpp"
@@ -19,6 +20,18 @@ namespace SPH
 {
 namespace solid_dynamics
 {
+namespace
+{
+Vecd principalValues(const Matd &tensor)
+{
+    if (!tensor.allFinite()) throw std::runtime_error("PD fracture criterion received a non-finite tensor");
+    Eigen::SelfAdjointEigenSolver<Matd> solver;
+    solver.computeDirect(0.5 * (tensor + tensor.transpose()), Eigen::EigenvaluesOnly);
+    if (solver.info() != Eigen::Success) throw std::runtime_error("PD principal-value calculation failed");
+    return solver.eigenvalues();
+}
+}
+
 //=================================================================================================//
 PDTimeStepInitialization::
     PDTimeStepInitialization(SPHBody &sph_body, SharedPtr<Gravity> gravity_ptr)
@@ -56,6 +69,10 @@ void NosbPDShapeMatrix::interaction(size_t index_i, Real dt)
 //=================================================================================================//
 void NosbPDShapeMatrix::update(size_t index_i, Real dt)
 {
+    Eigen::SelfAdjointEigenSolver<Matd> eig(shape_K_[index_i]);
+    if (!shape_K_[index_i].allFinite() || eig.info() != Eigen::Success ||
+        eig.eigenvalues().minCoeff() <= 1e-12 * eig.eigenvalues().maxCoeff())
+        peridynamics::numericalFailure(sph_body_->Name(), index_i, "singular ShapeTensorK");
     shape_K_1_[index_i] = shape_K_[index_i].inverse();
 }
 //=================================================================================================//
@@ -84,11 +101,8 @@ void NosbPDFirstStep::update(size_t index_i, Real dt)
      * the bond network (and into the fluid via AverageVelocity). */
     if (!vel_[index_i].allFinite())
     {
-        std::cout << "Particle_index = " << index_i << " disabled (non-finite velocity)\n";
-        particleLive_[index_i] = 0;
-        vel_[index_i].setZero();
-        acc_[index_i].setZero();
-        return;
+        particles_->getVariableDataByName<int>("NumericalFailureReason")[index_i] = 1;
+        peridynamics::numericalFailure(sph_body_->Name(), index_i, "non-finite Velocity");
     }
     pos_[index_i] += vel_[index_i] * dt * 0.5;
 }
@@ -170,26 +184,18 @@ void NosbPDSecondStep::update(size_t index_i, Real dt)
          * the neighbors through the bond forces. */
         if (!F_[index_i].allFinite() || !F_half_[index_i].allFinite())
         {
-            std::cout << "Particle_index = " << index_i << " disabled (non-finite F)\n";
-            particleLive_[index_i] = 0;
-            stress_[index_i] = Matd::Zero();
-            T0_[index_i] = Matd::Zero();
-            return;
+            particles_->getVariableDataByName<int>("NumericalFailureReason")[index_i] = 2;
+            peridynamics::numericalFailure(sph_body_->Name(), index_i, "non-finite DeformationGradient");
         }
         Real detF = F_[index_i].determinant();
         Real detF_half = F_half_[index_i].determinant();
         /** guard BEFORE inverting: a nearly singular F (volume collapsed to a
          * few percent, beyond the resolution limit) produces an exploding
          * inverse and NaN contamination through the bond network. */
-        if (detF < 0.05 || detF_half < 0.05)
+        if (!std::isfinite(detF) || !std::isfinite(detF_half) || detF < 0.05 || detF_half < 0.05)
         {
-            /** disable the particle instead of aborting the whole run */
-            std::cout << "Particle_index = " << index_i << " has been disabled since det F < 0.05"
-                      << "\n dt: " << dt << "\n";
-            particleLive_[index_i] = 0;
-            stress_[index_i] = Matd::Zero();
-            T0_[index_i] = Matd::Zero();
-            return;
+            particles_->getVariableDataByName<int>("NumericalFailureReason")[index_i] = 3;
+            peridynamics::numericalFailure(sph_body_->Name(), index_i, "DeformationGradient determinant below 0.05");
         }
         F_1_[index_i] = F_[index_i].inverse();
         F_1_half_[index_i] = F_half_[index_i].inverse();
@@ -285,24 +291,16 @@ void NosbPDSecondStepPlastic::update(size_t index_i, Real dt)
         /** NaN isolation: see NosbPDSecondStep::update. */
         if (!F_[index_i].allFinite() || !F_half_[index_i].allFinite())
         {
-            std::cout << "Particle_index = " << index_i << " disabled (non-finite F)\n";
-            particleLive_[index_i] = 0;
-            stress_[index_i] = Matd::Zero();
-            T0_[index_i] = Matd::Zero();
-            return;
+            particles_->getVariableDataByName<int>("NumericalFailureReason")[index_i] = 2;
+            peridynamics::numericalFailure(sph_body_->Name(), index_i, "non-finite DeformationGradient");
         }
         Real detF = F_[index_i].determinant();
         Real detF_half = F_half_[index_i].determinant();
         /** guard BEFORE inverting: see NosbPDSecondStep::update. */
-        if (detF < 0.05 || detF_half < 0.05)
+        if (!std::isfinite(detF) || !std::isfinite(detF_half) || detF < 0.05 || detF_half < 0.05)
         {
-            /** disable the particle instead of aborting the whole run */
-            std::cout << "Particle_index = " << index_i << " has been disabled since det F < 0.05"
-                      << "\n dt: " << dt << "\n";
-            particleLive_[index_i] = 0;
-            stress_[index_i] = Matd::Zero();
-            T0_[index_i] = Matd::Zero();
-            return;
+            particles_->getVariableDataByName<int>("NumericalFailureReason")[index_i] = 3;
+            peridynamics::numericalFailure(sph_body_->Name(), index_i, "DeformationGradient determinant below 0.05");
         }
         F_1_[index_i] = F_[index_i].inverse();
         F_1_half_[index_i] = F_half_[index_i].inverse();
@@ -346,7 +344,7 @@ BondBreakByPrinStress::
 //=================================================================================================//
 bool BondBreakByPrinStress::checkBondLive(Matd &stress_eq, Real &stretch_rate)
 {
-    Real val_eq = stress_eq.eigenvalues().real().maxCoeff();
+    Real val_eq = principalValues(stress_eq).maxCoeff();
     return !(val_eq > critical_value_ || stretch_rate > 0.5);
 }
 //=================================================================================================//
@@ -387,7 +385,7 @@ BondBreakBySigma1andSigma3::
 //=================================================================================================//
 bool BondBreakBySigma1andSigma3::checkBondLive(Matd &stress_eq, Real &stretch_rate)
 {
-    Vecd prin_stress = stress_eq.eigenvalues().real();
+    Vecd prin_stress = principalValues(stress_eq);
     Real sigma1 = prin_stress.maxCoeff();
     Real sigma3 = prin_stress.minCoeff();
     Real max_shear = (sigma1 - sigma3) / 2.0;
@@ -402,7 +400,7 @@ BondBreakBySigma1andNorm1::
 //=================================================================================================//
 bool BondBreakBySigma1andNorm1::checkBondLive(Matd &stress_eq, Real &stretch_rate)
 {
-    Real sigma1 = stress_eq.eigenvalues().real().maxCoeff();
+    Real sigma1 = principalValues(stress_eq).maxCoeff();
     Real pressure = -OneOverDimensions * stress_eq.trace();
 
     return !(sigma1 > max_tension_ || pressure > max_pressure_ || stretch_rate > 0.5);
@@ -422,7 +420,7 @@ BondBreakByPlasticStrain::
 //=================================================================================================//
 bool BondBreakByPlasticStrain::checkBondLive(Matd &plastic_strain_eq, Real &stretch_rate)
 {
-    Real val_eq = plastic_strain_eq.eigenvalues().real().maxCoeff();
+    Real val_eq = principalValues(plastic_strain_eq).maxCoeff();
     return !(val_eq > critical_value_ || stretch_rate > 1.0);
 }
 //=================================================================================================//
@@ -507,11 +505,8 @@ void NosbPDFourthStep::update(size_t index_i, Real dt)
      * AverageVelocity read by the fluid side. */
     if (!vel_[index_i].allFinite())
     {
-        std::cout << "Particle_index = " << index_i << " disabled (non-finite velocity)\n";
-        particleLive_[index_i] = 0;
-        vel_[index_i].setZero();
-        acc_[index_i].setZero();
-        return;
+        particles_->getVariableDataByName<int>("NumericalFailureReason")[index_i] = 1;
+        peridynamics::numericalFailure(sph_body_->Name(), index_i, "non-finite Velocity");
     }
     pos_[index_i] += vel_[index_i] * dt * 0.5;
 }

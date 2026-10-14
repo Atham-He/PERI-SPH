@@ -98,3 +98,10 @@ to `./output`. Command-line options (`--help`): `--state_recording`,
 Note: `tests/3d_examples/extra_3d_PD_ice_jet/` is a third-party case
 (SJTU ice-breaking group) kept only for local regression and is **not part of
 this distribution** (see `.gitignore`).
+
+## PERI-SPH stabilization workflow
+
+Read `PERI_SPH_FRAMEWORK.txt` for the current tested scope, reusable interfaces,
+case configurations, isolated-run launcher, and validation limits. Build
+`extra_3d_PD_framework_tests` and run `ctest --test-dir build -L peri_fast --output-on-failure`. Full-resolution capsule CTest execution is opt-in through
+`PERI_ENABLE_LONG_TESTS=ON`; direct executable runs are unaffected.

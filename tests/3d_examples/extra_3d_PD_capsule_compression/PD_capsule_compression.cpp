@@ -1,480 +1,345 @@
-/*-----------------------------------------------------------------------------*
- *       SPHinXsys: 3D single capsule compression (PD shell + SPH core)        *
- *-----------------------------------------------------------------------------*
- * A liquid-filled capsule is compressed between two rigid plates.             *
- * The capsule shell is discretized by NOSB-PD particles (brittle or           *
- * visco-plastic, bond breaking), the liquid core by WCSPH particles,          *
- * and the plates are rigid bodies driven by prescribed motion.                *
- * Generic placeholder parameters are used; replace with measured values       *
- * for production runs.                                                        *
- *-----------------------------------------------------------------------------*/
+/** Single capsule between prescribed rigid plates. SI units throughout.
+ * PD shell + WCSPH core. Parameters and numerical diagnostics are saved per run.
+ * Reference PD neighborhoods remain fixed; contact neighborhoods evolve.
+ */
 #include "sphinxsys.h"
+#include "pd_case_config.h"
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+
 using namespace SPH;
 
-//----------------------------------------------------------------------
-//	Geometry parameters (generic: diameter 1 mm, shell ratio 2%).
-//----------------------------------------------------------------------
-Real capsule_radius_out = 0.5e-3;                                ///< capsule outer radius [m]
-Real shell_thickness = 0.02e-3;                                  ///< shell thickness (2% of diameter) [m]
-Real capsule_radius_in = capsule_radius_out - shell_thickness;   ///< capsule inner radius [m]
-Real resolution_shell = shell_thickness / 3.0;                   ///< 3 particles through the thickness
-Real resolution_ref = resolution_shell;                          ///< system reference spacing
-Real plate_radius = 0.75e-3;                                     ///< rigid plate radius [m]
-Real plate_thickness = 0.06e-3;                                  ///< rigid plate thickness [m]
-Real initial_gap = 1.5 * resolution_shell;                       ///< initial plate-capsule gap, beyond the contact activation range [m]
-//----------------------------------------------------------------------
-//	Layout along the compression (y) axis.
-//----------------------------------------------------------------------
-Real lower_plate_bottom = 0.0;
-Real lower_plate_top = lower_plate_bottom + plate_thickness;
-Real capsule_center_y = lower_plate_top + initial_gap + capsule_radius_out;
-Real upper_plate_bottom = capsule_center_y + capsule_radius_out + initial_gap;
-//----------------------------------------------------------------------
-//	Material parameters of the shell (generic brittle polymer).
-//----------------------------------------------------------------------
-Real rho0_shell = 1000.0;      ///< density [kg/m^3]
-Real youngs_shell = 1.0e7;     ///< Young's modulus (10 MPa) [Pa]
-Real poisson_shell = 0.4;      ///< Poisson ratio
-Real max_tension_stress = 1.0e5; ///< bond-breaking critical principal stress
-                                 ///< (generic low value for functional fracture test; replace with measured strength) [Pa]
-//----------------------------------------------------------------------
-//	Shell constitutive route.
-//	false: brittle HughesWingetSolid + principal-stress bond breaking
-//	       (ethyl-cellulose type shell).
-//	true:  alginate-type ViscoPlasticSolidforPD (Perzyna rate-dependent J2)
-//	       + plastic-strain bond breaking.
-//----------------------------------------------------------------------
-bool shell_viscoplastic = true;        ///< constitutive route switch
-Real yield_stress_shell = 5.0e5;       ///< alginate initial yield stress (generic) [Pa]
-Real hardening_shell = 5.0e6;          ///< alginate isotropic hardening modulus
-                                       ///< (calibration B3: 5x, post-yield stiffness for mid-range force) [Pa]
-Real viscosity_shell = 5.0e2;          ///< Perzyna viscosity (calibration B3: mid-point;
-                                       ///< friction now prevents squirt-out, so less plastic softening) [Pa s]
-Real critical_plastic_strain = 1.0;    ///< bond-breaking critical equivalent plastic strain
-                                       ///< (calibration B1: ductile squash like hydrated alginate
-                                       ///<  experiments - no premature catastrophic puncture) [-]
-Real plate_friction_mu = 0.3;          ///< smooth-Coulomb plate-shell friction coefficient
-                                       ///< (B2: hold the soft shell between plates, no squirt-out) [-]
-Real plate_friction_veps = 5.0e-3;     ///< friction regularization velocity [m/s]
-//----------------------------------------------------------------------
-//	Material parameters of the liquid core.
-//----------------------------------------------------------------------
-Real rho0_f = 935.0;           ///< reference density of the tung-oil core [kg/m^3]
-Real gravity_g = 9.8;          ///< gravity [m/s^2]
-Real compression_speed = 0.1;  ///< plate speed (debug value; still low Mach) [m/s]
-Real U_ref = 0.5;              ///< reference (outflow) velocity scale [m/s]
-Real c_f = 25.0;               ///< sound speed -> K_f = rho0_f*c_f^2 ~ 0.58 MPa [m/s]
-                               ///< reduced from 50 m/s to compensate the acoustic-CFL
-                               ///< tightening caused by the fluid refinement below
-                               ///< (dt_acoustic ~ 0.6*h_f/c_f, h_f halves -> c_f halves)
-Real mu_f = 2.5e-1;            ///< tung-oil dynamic viscosity (~0.25 Pa s at 25 C; the
-                               ///< experimental core liquid is tung oil, confirmed by user) [Pa s]
-//----------------------------------------------------------------------
-//	Dry-compression control.
-//	When false the liquid core is omitted entirely: no fluid particles,
-//	no fluid dynamics and no fluid->shell pressure load. The shell is
-//	then loaded only by the plates (contact + prescribed motion), which
-//	decouples the shell/contact response from the fluid coupling.
-//----------------------------------------------------------------------
-bool with_liquid = true;       ///< true: liquid-filled capsule (production); false: dry control
-//----------------------------------------------------------------------
-//	Compression schedule.
-//----------------------------------------------------------------------
-Real compression_distance = 0.58e-3;                        ///< total plate stroke (58% diameter: cover experimental d/D range) [m]
-Real end_time = compression_distance / compression_speed;   ///< 0.0058 s
-//----------------------------------------------------------------------
-//	Boundary width for the system domain.
-//----------------------------------------------------------------------
-Real BW = resolution_ref * 4.0;
+Real capsule_radius_out = 0.5e-3, shell_thickness = 0.02e-3, shell_layers = 3;
+Real plate_radius = 0.75e-3, plate_thickness = 0.06e-3, initial_gap = 1e-5;
+Real rho0_shell = 1000, youngs_shell = 1e7, poisson_shell = 0.4;
+Real max_tension_stress = 1e5, yield_stress_shell = 5e5, hardening_shell = 5e6;
+Real viscosity_shell = 500, critical_plastic_strain = 1;
+Real plate_friction_mu = 0.3, plate_friction_veps = 0.005;
+Real rho0_f = 935, c_f = 25, mu_f = 0.25, fluid_spacing_ratio = 1.5;
+Real gravity_g = 9.8, compression_speed = 0.1, compression_distance = 0.58e-3;
+Real U_ref = 0.5, pd_cfl = 0.1, acoustic_cfl = 0.3, acoustic_damping_factor = 0.3;
+Real max_density_error = 0.1, max_fluid_mach = 0.3;
+bool shell_viscoplastic = true, with_liquid = true, reinitialize_density = false;
+int output_frames = 50, bond_check_interval = 1, inject_nan_step = -1, max_pd_substeps = 6;
+Real capsule_radius_in, resolution_ref, capsule_center_y, upper_plate_bottom, end_time;
 
-//----------------------------------------------------------------------
-//	Capsule shell: hollow sphere by boolean operations.
-//----------------------------------------------------------------------
 class CapsuleShellShape : public ComplexShape
 {
   public:
-    explicit CapsuleShellShape(const std::string &shape_name) : ComplexShape(shape_name)
+    explicit CapsuleShellShape(const std::string &name) : ComplexShape(name)
     {
-        Vecd center(0.0, capsule_center_y, 0.0);
+        Vecd center(0, capsule_center_y, 0);
         add<GeometricShapeBall>(center, capsule_radius_out);
         subtract<GeometricShapeBall>(center, capsule_radius_in);
     }
 };
-//----------------------------------------------------------------------
-//	Rigid plate: brick centered at the plate mid-plane.
-//----------------------------------------------------------------------
+
 class PlateShape : public ComplexShape
 {
   public:
-    PlateShape(const std::string &shape_name, Real mid_plane_y) : ComplexShape(shape_name)
+    PlateShape(const std::string &name, Real center_y) : ComplexShape(name)
     {
-        Vecd halfsize(plate_radius, 0.5 * plate_thickness, plate_radius);
-        add<GeometricShapeBox>(Transform(Vecd(0.0, mid_plane_y, 0.0)), halfsize);
+        add<GeometricShapeBox>(Transform(Vecd(0, center_y, 0)), Vecd(plate_radius, 0.5 * plate_thickness, plate_radius));
     }
 };
 
-//----------------------------------------------------------------------
-//	Rigid-plate wall material.
-//
-//	The two fluid-wall paths must impose the SAME mirror wall velocity
-//	2*v_wall - v_i on the fluid:
-//	  (a) the standard SPHinXsys wall classes (InteractionWithWall ->
-//	      Integration1stHalf/2ndHalfWithWallRiemann) obtain the wall velocity
-//	      through the material's VIRTUAL AverageVelocity();
-//	  (b) the PD wall class VelocityDivergenceWithWallforPD reads the LITERAL
-//	      state variable "AverageVelocity".
-//	The base Solid material returns "Velocity" from AverageVelocity(), and
-//	PositionSolidBody resets "Velocity" to zero on every step.  Registering
-//	"AverageVelocity" only for the PD class therefore makes the driven piston
-//	look like a stationary wall to (a) but like a moving wall to (b): the two
-//	wall treatments disagree at the coupling surface and pump net energy into
-//	the fluid, which destabilises the run within the first ~45 steps.
-//
-//	This material closes that gap by returning "AverageVelocity" from the
-//	virtual AverageVelocity() as well, so both paths read the same variable
-//	holding the prescribed rigid-body velocity (zero for the stationary lower
-//	plate, piston speed downwards for the driven upper plate).
-//----------------------------------------------------------------------
-class MovingWallSolid : public Solid
+static peridynamics::CaseParameters parameters()
 {
-  public:
-    MovingWallSolid(Real rho0, Real youngs, const Vecd &ave_velocity)
-        : Solid(rho0, youngs), ave_velocity_(ave_velocity) {}
+    peridynamics::CaseParameters p;
+#define BIND(x) p.bind(#x, x)
+    BIND(capsule_radius_out); BIND(shell_thickness); BIND(shell_layers);
+    BIND(plate_radius); BIND(plate_thickness); BIND(initial_gap);
+    BIND(rho0_shell); BIND(youngs_shell); BIND(poisson_shell); BIND(max_tension_stress);
+    BIND(yield_stress_shell); BIND(hardening_shell); BIND(viscosity_shell); BIND(critical_plastic_strain);
+    BIND(plate_friction_mu); BIND(plate_friction_veps); BIND(rho0_f); BIND(c_f); BIND(mu_f);
+    BIND(fluid_spacing_ratio); BIND(gravity_g); BIND(compression_speed); BIND(compression_distance);
+    BIND(reinitialize_density); BIND(U_ref); BIND(pd_cfl); BIND(acoustic_cfl); BIND(acoustic_damping_factor);
+    BIND(max_density_error); BIND(max_fluid_mach); BIND(shell_viscoplastic); BIND(with_liquid);
+    BIND(max_pd_substeps); BIND(output_frames); BIND(bond_check_interval); BIND(inject_nan_step);
+#undef BIND
+    return p;
+}
 
-    Vecd *AverageVelocity(BaseParticles *base_particles) override
+static void validateParameters()
+{
+    if (capsule_radius_out <= shell_thickness || shell_thickness <= 0 || shell_layers < 3 ||
+        plate_radius <= capsule_radius_out || plate_thickness <= 0 || initial_gap < 0 ||
+        compression_distance <= 0 || compression_distance >= 2 * capsule_radius_out || compression_speed <= 0 ||
+        rho0_shell <= 0 || youngs_shell <= 0 || poisson_shell <= -1 || poisson_shell >= 0.5 ||
+        rho0_f <= 0 || c_f <= 0 || mu_f < 0 || fluid_spacing_ratio <= 0 ||
+        output_frames < 1 || bond_check_interval < 1 || max_pd_substeps < 1 || pd_cfl <= 0 || pd_cfl > 0.2 ||
+        acoustic_cfl <= 0 || acoustic_cfl > 0.6 || acoustic_damping_factor < 0 ||
+        max_density_error <= 0 || max_density_error >= 1 || max_fluid_mach <= 0 ||
+        plate_friction_mu < 0 || plate_friction_veps <= 0)
+        throw std::invalid_argument("invalid capsule geometry, material, schedule or numerical controls");
+    capsule_radius_in = capsule_radius_out - shell_thickness;
+    resolution_ref = shell_thickness / shell_layers;
+    capsule_center_y = plate_thickness + initial_gap + capsule_radius_out;
+    upper_plate_bottom = capsule_center_y + capsule_radius_out + initial_gap;
+    end_time = compression_distance / compression_speed;
+}
+
+static Vecd sumVector(SPHBody &body, const std::string &name)
+{
+    auto &p = body.getBaseParticles();
+    const Vecd *values = p.getVariableDataByName<Vecd>(name);
+    Vecd total = Vecd::Zero();
+    for (size_t i = 0; i < p.TotalRealParticles(); ++i) total += values[i];
+    return total;
+}
+
+int main(int argc, char **argv)
+{
+    auto config = parameters();
+    try {config.parse(argc, argv); validateParameters();}
+    catch (const std::exception &e) {std::cerr << e.what() << std::endl; return 2;}
+    Real extent = 6 * capsule_radius_out;
+    SPHSystem system(BoundingBoxd(Vecd(-extent, -extent, -extent), Vecd(extent, 2 * extent, extent)), resolution_ref);
+    system.handleCommandlineOptions(argc, argv);
+    if (system.RestartStep() != 0)
     {
-        return base_particles->registerStateVariableData<Vecd>("AverageVelocity", ave_velocity_);
+        std::cerr << "PD restart is unsupported until reference bonds and all internal variables are serialized.\n";
+        return 2;
     }
+    std::filesystem::create_directories("output");
+    config.save("output/effective_parameters.cfg");
 
-  protected:
-    Vecd ave_velocity_;
-};
-
-// the main program with commandline options
-int main(int ac, char *av[])
-{
-    //----------------------------------------------------------------------
-    //	Build up an SPHSystem.
-    //	Domain enlarged to contain the outflow jet: fluid particles escaping
-    //	the capsule must keep valid neighborhoods inside the domain, instead
-    //	of crowding into boundary cells (which blows up the density summation
-    //	and eventually NaN-poisons the whole particle field).
-    //----------------------------------------------------------------------
-    BoundingBoxd system_domain_bounds(
-        Vecd(-3.0e-3, -4.0e-3, -3.0e-3),
-        Vecd(3.0e-3, 6.0e-3, 3.0e-3));
-    SPHSystem sph_system(system_domain_bounds, resolution_ref);
-    sph_system.handleCommandlineOptions(ac, av);
-    //----------------------------------------------------------------------
-    //	Creating bodies with corresponding materials and particles.
-    //----------------------------------------------------------------------
-    FluidBody liquid_core(sph_system, makeShared<GeometricShapeBall>(
-                                          Vecd(0.0, capsule_center_y, 0.0), capsule_radius_in, "LiquidCore"));
-    /** RESOLUTION MISMATCH FIX: the fluid spacing must NOT equal the shell
-     * thickness (which would make the shell only one fluid particle thick and
-     * let unresolved fluid pressure penetrate it). 1/2 refinement (relative to
-     * resolution_ref = resolution_shell) gives spacing = 1.5 * resolution_shell
-     * = 1e-5 m = shell_thickness / 2, i.e. several fluid particles across the
-     * shell thickness. The acoustic CFL is compensated by lowering c_f. */
-    liquid_core.defineAdaptationRatios(1.3, 2.0 / 3.0); ///< spacing = 1.5 * resolution_shell = 1e-5
-    liquid_core.defineMatterMaterial<WeaklyCompressibleFluid>(rho0_f, c_f);
-    /** NOTE: the fluid body must always carry particles (SPHinXsys raises
-     * "base_particles_ is nullptr" on an empty body). In the dry control the
-     * particles are generated but never integrated and never coupled to the
-     * shell, so they stay frozen and exert no load. */
-    liquid_core.generateParticles<BaseParticles, Lattice>();
-    std::cout << "liquid generated" << std::endl;
-
-    PDBody capsule_shell(sph_system, makeShared<CapsuleShellShape>("CapsuleShell"));
+    FluidBody liquid(system, makeShared<GeometricShapeBall>(Vecd(0, capsule_center_y, 0), capsule_radius_in, "LiquidCore"));
+    liquid.defineAdaptationRatios(1.3, 1 / fluid_spacing_ratio);
+    liquid.defineMatterMaterial<WeaklyCompressibleFluid>(rho0_f, c_f);
+    liquid.addMaterialProperty<Viscosity>(mu_f);
+    liquid.generateParticles<BaseParticles, Lattice>();
+    PDBody shell(system, makeShared<CapsuleShellShape>("CapsuleShell"));
     if (shell_viscoplastic)
-        capsule_shell.defineMatterMaterial<ViscoPlasticSolidforPD>(
-            rho0_shell, youngs_shell, poisson_shell, yield_stress_shell, viscosity_shell, hardening_shell);
-    else
-        capsule_shell.defineMatterMaterial<HughesWingetSolid>(rho0_shell, youngs_shell, poisson_shell);
-    capsule_shell.generateParticles<BaseParticles, Lattice>();
-    std::cout << "shell generated" << std::endl;
-    capsule_shell.getBaseParticles().addVariableToWrite<Real>("Damage");
+        shell.defineMatterMaterial<ViscoPlasticSolidforPD>(rho0_shell, youngs_shell, poisson_shell, yield_stress_shell, viscosity_shell, hardening_shell);
+    else shell.defineMatterMaterial<HughesWingetSolid>(rho0_shell, youngs_shell, poisson_shell);
+    shell.generateParticles<BaseParticles, Lattice>();
+    SolidBody lower(system, makeShared<PlateShape>("LowerPlate", 0.5 * plate_thickness));
+    lower.defineAdaptationRatios(1.3, 1.0 / 3.0);
+    lower.defineMatterMaterial<Solid>(rho0_shell, youngs_shell);
+    lower.generateParticles<BaseParticles, Lattice>();
+    SolidBody upper(system, makeShared<PlateShape>("UpperPlate", upper_plate_bottom + 0.5 * plate_thickness));
+    upper.defineAdaptationRatios(1.3, 1.0 / 3.0);
+    upper.defineMatterMaterial<Solid>(rho0_shell, youngs_shell);
+    upper.generateParticles<BaseParticles, Lattice>();
 
-    SolidBody lower_plate(sph_system, makeShared<PlateShape>("LowerPlate", 0.5 * (lower_plate_bottom + lower_plate_top)));
-    lower_plate.defineAdaptationRatios(1.3, 1.0 / 3.0);
-    lower_plate.defineMatterMaterial<MovingWallSolid>(rho0_shell, youngs_shell, Vecd::Zero());
-    lower_plate.generateParticles<BaseParticles, Lattice>();
-    std::cout << "lower generated" << std::endl;
+    InnerRelation fluid_inner(liquid), shell_inner(shell);
+    ContactRelationSelectKernel fluid_walls(liquid, {&shell, &lower, &upper}, true);
+    ContactRelationSelectKernel shell_fluid(shell, {&liquid}, false);
+    ContactRelationSelectKernel upper_fluid(upper, {&liquid}, false), lower_fluid(lower, {&liquid}, false);
+    ContactRelation shell_plates(shell, {&lower, &upper}), lower_shell(lower, {&shell}), upper_shell(upper, {&shell});
+    ComplexRelation fluid_complex(fluid_inner, fluid_walls);
 
-    SolidBody upper_plate(sph_system, makeShared<PlateShape>("UpperPlate", upper_plate_bottom + 0.5 * plate_thickness));
-    upper_plate.defineAdaptationRatios(1.3, 1.0 / 3.0);
-    upper_plate.defineMatterMaterial<MovingWallSolid>(rho0_shell, youngs_shell, Vecd(0.0, -compression_speed, 0.0));
-    upper_plate.generateParticles<BaseParticles, Lattice>();
-    std::cout << "upper generated" << std::endl;
-    //----------------------------------------------------------------------
-    //	Define body relation map.
-    //	The fluid kernel is always used for fluid-involving neighbor search.
-    //----------------------------------------------------------------------
-    InnerRelation liquid_inner(liquid_core);
-    InnerRelation shell_inner(capsule_shell);
-    ContactRelationSelectKernel liquid_contact(liquid_core, {&capsule_shell, &lower_plate, &upper_plate}, true);
-    ContactRelationSelectKernel shell_liquid_contact(capsule_shell, {&liquid_core}, false);
-    ContactRelation shell_plates_contact(capsule_shell, {&lower_plate, &upper_plate});
-    ContactRelation lower_plate_shell_contact(lower_plate, {&capsule_shell});
-    ContactRelation upper_plate_shell_contact(upper_plate, {&capsule_shell});
-    ComplexRelation liquid_complex(liquid_inner, liquid_contact);
-    std::cout << "relations done" << std::endl;
-    //----------------------------------------------------------------------
-    //	Numerical methods: fluid.
-    //----------------------------------------------------------------------
-    Gravity gravity(Vecd(0.0, -gravity_g, 0.0));
-    SimpleDynamics<GravityForce<Gravity>> constant_gravity(liquid_core, gravity);
-    SimpleDynamics<NormalDirectionFromBodyShape> shell_normal_direction(capsule_shell);
-    /** wall normals for fluid-wall interaction (plates are translated, not rotated,
-     * so a one-time initialization is sufficient). */
-    SimpleDynamics<NormalDirectionFromBodyShape> lower_plate_normal_direction(lower_plate);
-    SimpleDynamics<NormalDirectionFromBodyShape> upper_plate_normal_direction(upper_plate);
+    SimpleDynamics<NormalDirectionFromBodyShape> shell_normals(shell), lower_normals(lower), upper_normals(upper);
+    Dynamics1Level<fluid_dynamics::Integration1stHalfWithWallRiemann> pressure(fluid_inner, fluid_walls);
+    Dynamics1Level<fluid_dynamics::Integration2ndHalfWithWallRiemann> density(fluid_inner, fluid_walls);
+    InteractionWithUpdate<fluid_dynamics::DensitySummationComplexFreeSurface> density_sum(fluid_inner, fluid_walls);
+    InteractionWithUpdate<fluid_dynamics::ViscousForceWithWall> fluid_viscosity(fluid_inner, fluid_walls);
+    SimpleDynamics<fluid_dynamics::ContinuumVolumeUpdate> update_fluid_volume(liquid);
+    ReduceDynamics<fluid_dynamics::AdvectionViscousTimeStep> advection_step(liquid, U_ref);
+    ReduceDynamics<fluid_dynamics::AcousticTimeStep> acoustic_step(liquid, acoustic_cfl);
+    SimpleDynamics<GravityForce<Gravity>> fluid_gravity(liquid, Gravity(Vecd(0, -gravity_g, 0)));
+    SimpleDynamics<solid_dynamics::PDTimeStepInitialization> initialize_shell(shell, makeShared<Gravity>(Vecd(0, -gravity_g, 0)));
+    InteractionDynamics<fluid_dynamics::VelocityDivergenceInner> divergence(fluid_inner);
+    InteractionDynamics<fluid_dynamics::VelocityDivergenceWithWallforPD> wall_divergence(fluid_walls);
+    InteractionDynamics<fluid_dynamics::AcousticDamperInnerforPD> inner_damping(fluid_inner);
+    InteractionDynamics<fluid_dynamics::AcousticDamperWithWallforPD> wall_damping(fluid_walls);
+    Real damping_c = c_f * acoustic_damping_factor / 0.3;
+    Real fluid_horizon = liquid.getSPHAdaptation().getKernel()->CutOffRadius();
+    inner_damping.setCoeffAcousticDamper(rho0_f, damping_c, fluid_horizon);
+    wall_damping.setCoeffAcousticDamper(rho0_f, damping_c, fluid_horizon);
+    InteractionDynamics<solid_dynamics::PressureForceFromFluidforPD<AcousticRiemannSolver>> shell_pressure(shell_fluid);
+    shell_pressure.setCoeffAcousticDamper(rho0_f, damping_c, fluid_horizon);
+    InteractionWithUpdate<solid_dynamics::ViscousForceFromFluid> shell_viscosity(shell_fluid);
+    InteractionWithUpdate<solid_dynamics::PressureForceFromFluid<decltype(density)>> upper_pressure(upper_fluid), lower_pressure(lower_fluid);
+    InteractionWithUpdate<solid_dynamics::ViscousForceFromFluid> upper_viscosity(upper_fluid), lower_viscosity(lower_fluid);
 
-    Dynamics1Level<fluid_dynamics::Integration1stHalfWithWallRiemann> pressure_relaxation(liquid_inner, liquid_contact);
-    Dynamics1Level<fluid_dynamics::Integration2ndHalfWithWallRiemann> density_relaxation(liquid_inner, liquid_contact);
-    InteractionWithUpdate<fluid_dynamics::DensitySummationComplexFreeSurface> update_density_by_summation(liquid_inner, liquid_contact);
-    ReduceDynamics<fluid_dynamics::AdvectionTimeStep> get_fluid_advection_time_step_size(liquid_core, U_ref);
-    ReduceDynamics<fluid_dynamics::AcousticTimeStep> get_fluid_time_step_size(liquid_core);
-    /** DampingPairwiseWithWall resolves the literal state variable "Velocity" on
-     * every contact body of liquid_contact (shell + both plates). The shell only
-     * registers "Velocity" inside its NOSB-PD dynamics, and the MovingWallSolid
-     * plates register "AverageVelocity" instead, so neither is present yet at this
-     * point. Register a "Velocity" state on all three here (idempotent; the later
-     * dynamics reuse the same storage, as already done throughout nosbpd_dynamics)
-     * to make the damping operator well-defined. */
-    capsule_shell.getBaseParticles().registerStateVariableData<Vecd>("Velocity");
-    lower_plate.getBaseParticles().registerStateVariableData<Vecd>("Velocity");
-    upper_plate.getBaseParticles().registerStateVariableData<Vecd>("Velocity");
-    /** Tung-oil viscous damping of the liquid core: this is the intended use of
-     * mu_f, which so far was defined but never applied. It mirrors the library
-     * fluid-shell benchmark test_2d_hydrostatic_fluid_shell, where the same
-     * DampingPairwiseWithWall / FixedDampingRate pair damps the inner fluid and
-     * its wall contact with the physical dynamic viscosity. Without it the core
-     * has no viscous dissipation at all, so the pole-region fluid velocity
-     * fluctuations feed the shell-liquid pressure coupling unchecked. */
-    DampingWithRandomChoice<InteractionSplit<DampingPairwiseWithWall<Vecd, FixedDampingRate>>>
-        fluid_damping(0.2, DynamicsArgs(liquid_inner, "Velocity", mu_f), DynamicsArgs(liquid_contact, "Velocity", mu_f));
-    /** velocity divergence must be constructed before the acoustic damper,
-     * and before PressureForceFromFluidforPD which reads it from the fluid. */
-    InteractionDynamics<fluid_dynamics::VelocityDivergenceInner> velocity_divergence_inner(liquid_inner);
-    /** constructed before the wall velocity divergence so that the shell's
-     * AverageVelocity is registered in time. */
-    SimpleDynamics<solid_dynamics::PDTimeStepInitialization> initialize_a_pd_step(capsule_shell, makeShared<Gravity>(Vecd(0.0, -gravity_g, 0.0)));
-    /** Interface dissipation: the shell-liquid coupling force uses an acoustic
-     * Riemann solver instead of NoRiemannSolver, so the fluid-solid interface
-     * (the exact location of the pole hotspot, where the shell-plate-liquid gap
-     * closes) carries a numerical dissipation term instead of relying on the
-     * central pressure difference alone. */
-    InteractionDynamics<solid_dynamics::PressureForceFromFluidforPD<AcousticRiemannSolver>> fluid_pressure_force_on_shell(shell_liquid_contact);
-    fluid_pressure_force_on_shell.setCoeffAcousticDamper(rho0_f, c_f, liquid_core.getSPHAdaptation().getKernel()->CutOffRadius());
-    /** The rigid plates carry their prescribed wall velocity in "AverageVelocity"
-     * (registered by MovingWallSolid::AverageVelocity, i.e. already set up when the
-     * standard wall classes above were constructed): the lower plate is stationary,
-     * the upper plate moves downwards at the piston speed. VelocityDivergenceWithWallforPD
-     * reads the same "AverageVelocity", so both wall paths agree. */
-    InteractionDynamics<fluid_dynamics::VelocityDivergenceWithWallforPD> velocity_divergence_wall(liquid_contact);
-    InteractionDynamics<fluid_dynamics::AcousticDamperInnerforPD> acoustic_damper_inner(liquid_inner);
-    acoustic_damper_inner.setCoeffAcousticDamper(rho0_f, c_f, liquid_core.getSPHAdaptation().getKernel()->CutOffRadius());
-    InteractionDynamics<fluid_dynamics::AcousticDamperWithWallforPD> acoustic_damper_wall(liquid_contact);
-    acoustic_damper_wall.setCoeffAcousticDamper(rho0_f, c_f, liquid_core.getSPHAdaptation().getKernel()->CutOffRadius());
-    /** No-penetration is provided by the standard SPHinXsys fluid-wall treatment
-     * already present here: Integration1stHalf/2ndHalfWithWallRiemann plus
-     * VelocityDivergenceWithWallforPD and AcousticDamperWithWallforPD, which impose
-     * the mirror wall velocity 2*v_wall - v_i at the shell and thereby drive the
-     * continuity/pressure response that repels fluid from the surface. The former
-     * BoundingFromWall hard clamp is removed: it was a position snap-back acting on
-     * a stale shell surface, and at the bottom pole it ejected fluid particles
-     * (including across the lower plate) instead of preventing penetration. */
-    std::cout << "fluid methods done" << std::endl;
-    //----------------------------------------------------------------------
-    //	Numerical methods: FSI (fluid -> shell).
-    //	The PD time-step initialization and fluid pressure force are
-    //	constructed above, next to the fluid wall methods (registration order).
-    //----------------------------------------------------------------------
-    solid_dynamics::AverageVelocityAndAcceleration average_velocity_and_acceleration(capsule_shell);
-    //----------------------------------------------------------------------
-    //	Numerical methods: shell-plate contact.
-    //----------------------------------------------------------------------
-    /** the repulsion factor must be constructed (and executed) before the
-     * contact force classes reading "RepulsionFactor". */
-    InteractionDynamics<solid_dynamics::ContactRepulsionFactorforPD> shell_contact_factor(shell_plates_contact);
-    InteractionDynamics<solid_dynamics::ContactRepulsionFromWallforPD> plate_contact_on_shell(shell_plates_contact, plate_friction_mu, plate_friction_veps);
-    InteractionDynamics<solid_dynamics::ContactRepulsionToWallforPD> shell_reaction_on_lower(lower_plate_shell_contact);
-    InteractionDynamics<solid_dynamics::ContactRepulsionToWallforPD> shell_reaction_on_upper(upper_plate_shell_contact);
-    std::cout << "contact methods done" << std::endl;
-    //----------------------------------------------------------------------
-    //	Numerical methods: NOSB-PD dynamics of the shell.
-    //----------------------------------------------------------------------
-    InteractionWithUpdate<solid_dynamics::NosbPDShapeMatrix> shell_shape_matrix(shell_inner);
-    SimpleDynamics<solid_dynamics::NosbPDFirstStep> nosbpd_first_step(capsule_shell);
-    /** constitutive update and bond-breaking criterion follow the shell route. */
-    UniquePtr<BaseDynamics<void>> nosbpd_second_step, check_bondLive;
+    InteractionDynamics<solid_dynamics::ContactRepulsionFactorforPD> contact_factor(shell_plates);
+    InteractionDynamics<solid_dynamics::ContactRepulsionFromWallforPD> contact_force(shell_plates, plate_friction_mu, plate_friction_veps);
+    InteractionDynamics<solid_dynamics::ContactRepulsionToWallforPD> lower_reaction(lower_shell, plate_friction_mu, plate_friction_veps);
+    InteractionDynamics<solid_dynamics::ContactRepulsionToWallforPD> upper_reaction(upper_shell, plate_friction_mu, plate_friction_veps);
+    InteractionWithUpdate<solid_dynamics::NosbPDShapeMatrix> shape_matrix(shell_inner);
+    SimpleDynamics<solid_dynamics::NosbPDFirstStep> first(shell);
+    UniquePtr<BaseDynamics<void>> second, fracture;
     if (shell_viscoplastic)
     {
-        nosbpd_second_step = makeUnique<InteractionWithUpdate<solid_dynamics::NosbPDSecondStepPlastic>>(shell_inner);
-        check_bondLive = makeUnique<InteractionDynamics<solid_dynamics::BondBreakByPlasticStrain>>(shell_inner, critical_plastic_strain);
+        second = makeUnique<InteractionWithUpdate<solid_dynamics::NosbPDSecondStepPlastic>>(shell_inner);
+        fracture = makeUnique<InteractionDynamics<solid_dynamics::BondBreakByPlasticStrain>>(shell_inner, critical_plastic_strain);
     }
     else
     {
-        nosbpd_second_step = makeUnique<InteractionWithUpdate<solid_dynamics::NosbPDSecondStep>>(shell_inner);
-        /** bond breaking by the maximum principal stress criterion (brittle shell);
-         * evaluated right after the stress update. */
-        check_bondLive = makeUnique<InteractionDynamics<solid_dynamics::BondBreakByPrinStress>>(shell_inner, max_tension_stress);
+        second = makeUnique<InteractionWithUpdate<solid_dynamics::NosbPDSecondStep>>(shell_inner);
+        fracture = makeUnique<InteractionDynamics<solid_dynamics::BondBreakByPrinStress>>(shell_inner, max_tension_stress);
     }
-    InteractionDynamics<solid_dynamics::LittleWoodHourGlassControl> hourglass_control(shell_inner);
-    InteractionDynamics<solid_dynamics::PairNumericalDampingforPD> numerical_damping(shell_inner);
-    InteractionDynamics<solid_dynamics::NosbPDThirdStep> nosbpd_third_step(shell_inner);
-    SimpleDynamics<solid_dynamics::NosbPDFourthStep> nosbpd_fourth_step(capsule_shell);
-    /** normal direction updated from the PD deformation gradient;
-     * constructed after the NOSB-PD dynamics registering DeformationGradient. */
-    SimpleDynamics<solid_dynamics::UpdateElasticNormalDirection> shell_update_normal(capsule_shell);
-    std::cout << "pd methods done" << std::endl;
-    //----------------------------------------------------------------------
-    //	Plate kinematics: upper plate driven, lower plate fixed.
-    //----------------------------------------------------------------------
-    Vecd upper_plate_center_end(0.0, upper_plate_bottom + 0.5 * plate_thickness - compression_distance, 0.0);
-    SimpleDynamics<solid_dynamics::PositionSolidBody> drive_upper_plate(upper_plate, 0.0, end_time, upper_plate_center_end);
-    //----------------------------------------------------------------------
-    //	Output.
-    //----------------------------------------------------------------------
-    BodyStatesRecordingToVtp write_body_states(sph_system);
-    ReducedQuantityRecording<QuantitySummation<Vecd>> write_upper_plate_reaction(upper_plate, "ContactRepulsionToWall");
-    //----------------------------------------------------------------------
-    //	Prepare the simulation.
-    //----------------------------------------------------------------------
-    std::cout << "particle generation done\n"
-              << " liquid: " << liquid_core.getBaseParticles().TotalRealParticles()
-              << " shell: " << capsule_shell.getBaseParticles().TotalRealParticles()
-              << " lower: " << lower_plate.getBaseParticles().TotalRealParticles()
-              << " upper: " << upper_plate.getBaseParticles().TotalRealParticles() << std::endl;
-    sph_system.initializeSystemCellLinkedLists();
-    std::cout << "cell linked lists done" << std::endl;
-    sph_system.initializeSystemConfigurations();
-    std::cout << "configurations done" << std::endl;
-    if (with_liquid) constant_gravity.exec();
-    shell_normal_direction.exec();
-    lower_plate_normal_direction.exec();
-    upper_plate_normal_direction.exec();
-    std::cout << "normal direction done" << std::endl;
-    shell_shape_matrix.exec();
-    std::cout << "shape matrix done" << std::endl;
-    //----------------------------------------------------------------------
-    //	Setup for time-stepping control.
-    //----------------------------------------------------------------------
-    Real &physical_time = *sph_system.getSystemVariableDataByName<Real>("PhysicalTime");
-    int number_of_iterations = 0;
-    int screen_output_interval = 100;
-    Real output_interval = end_time / 50.0;
-    Real dt = 0.0;
-    /** PD subcycling step. The shell acoustic CFL limit is
-     *  dt_CFL = 0.6 * h_shell / c0 ~= 0.6 * 1.3 * resolution_shell / sqrt(K/rho)
-     *         ~= 4.0e-8 s (c0 ~= 129 m/s, h_shell ~= 8.67e-6 m).
-     *  The previous fixed 6.0e-8 exceeded this limit by ~1.5x, leaving the
-     *  shell time integration marginally unstable and producing the det F
-     *  compaction -> bond-break -> non-finite-velocity cascade. Use a step
-     *  safely below the CFL limit. */
-    Real dt_s_0 = 3.0e-8;
-    /** dry control has no fluid CFL: use a fixed step matching the fluid run (~3e-7) so the
-     * physical-time progression is comparable to the liquid-filled case. */
-    Real dt_dry = 3.0e-7;
-    //----------------------------------------------------------------------
-    //	First output before the main loop.
-    //----------------------------------------------------------------------
-    write_body_states.writeToFile(0);
-    //----------------------------------------------------------------------
-    //	Main time-stepping loop.
-    //----------------------------------------------------------------------
-    while (physical_time < end_time)
+    InteractionDynamics<solid_dynamics::LittleWoodHourGlassControl> hourglass(shell_inner);
+    InteractionDynamics<solid_dynamics::PairNumericalDampingforPD> pd_damping(shell_inner);
+    InteractionDynamics<solid_dynamics::NosbPDThirdStep> third(shell_inner);
+    SimpleDynamics<solid_dynamics::NosbPDFourthStep> fourth(shell);
+    ReduceDynamics<solid_dynamics::PDTimeStep> shell_step(shell, pd_cfl);
+    SimpleDynamics<solid_dynamics::UpdateElasticNormalDirection> update_normals(shell);
+    solid_dynamics::AverageVelocityAndAcceleration averages(shell);
+    SimpleDynamics<solid_dynamics::PrescribedTranslation> move_upper(upper, 0, end_time, Vecd(0, -compression_distance, 0));
+
+    SimpleDynamics<peridynamics::ParticleStateCheck> fluid_check(liquid), shell_check(shell);
+    fluid_check.addScalar("Density", 0); fluid_check.addScalar("Pressure");
+    fluid_check.addVector("Force"); fluid_check.addVector("ForcePrior");
+    shell_check.addMatrix("DeformationGradient"); shell_check.addMatrix("PDStress");
+    shell_check.addVector("PDAcceleration"); shell_check.addVector("PDAccelerationPrior");
+    for (const auto &name : {"Mass", "Density", "Pressure"}) liquid.getBaseParticles().addVariableToWrite<Real>(name);
+    for (const auto &name : {"Velocity", "AverageVelocity", "AverageAcceleration", "PDAcceleration", "PDAccelerationPrior"}) shell.getBaseParticles().addVariableToWrite<Vecd>(name);
+    for (const auto &name : {"PDStress", "DeformationGradient"}) shell.getBaseParticles().addVariableToWrite<Matd>(name);
+    if (shell_viscoplastic)
     {
-        Real integration_time = 0.0;
-        while (integration_time < output_interval)
+        shell.getBaseParticles().addVariableToWrite<Matd>("PlasticStrain");
+        shell.getBaseParticles().addVariableToWrite<Real>("IsotropicHardeningParam");
+    }
+    BodyStatesRecordingToVtp states(system);
+    Real &time = *system.getSystemVariableDataByName<Real>("PhysicalTime");
+    Real pd_dt = pd_cfl * resolution_ref / DynamicCast<HughesWingetSolid>(&shell, shell.getMatterMaterial()).ReferenceSoundSpeed();
+    std::ofstream diagnostics("output/diagnostics.csv"), reaction("output/UpperPlate_TotalReaction.dat");
+    diagnostics << std::setprecision(17) << "time_s,stroke_m,acoustic_steps,pd_steps,liquid_mass_kg,fluid_speed_max_m_s,fluid_density_error_max,damage_mean,damage_max,numerical_failures,shell_kinetic_J,liquid_kinetic_J,contact_Fy_N,fluid_Fy_N,total_Fy_N\n";
+    reaction << std::setprecision(17) << "time_s stroke_m contact_Fy_N fluid_Fy_N total_Fy_N\n";
+    size_t acoustic_count = 0, pd_count = 0;
+    std::string phase = "initialization";
+
+    auto check_fluid = [&]()
+    {
+        if (!with_liquid) return;
+        fluid_check.exec();
+        auto &p = liquid.getBaseParticles();
+        auto *rho = p.getVariableDataByName<Real>("Density");
+        auto *v = p.getVariableDataByName<Vecd>("Velocity");
+        for (size_t i = 0; i < p.TotalRealParticles(); ++i)
         {
-            Real Dt = with_liquid ? get_fluid_advection_time_step_size.exec() : dt_dry;
-            if (with_liquid) update_density_by_summation.exec();
-
-            Real relaxation_time = 0.0;
-            while (relaxation_time < Dt)
-            {
-                /** Refresh the shell surface (NormalDirection / SignedDistance from the
-                 * current DeformationGradient) every fluid sub-step, so the fluid-wall
-                 * interaction always sees the current shell instead of the surface left
-                 * over from the previous output interval. This aligns the shell update
-                 * with the fluid sub-step cadence. */
-                shell_update_normal.exec();
-                /** fluid relaxation and force computation (skipped in the dry control). */
-                if (with_liquid)
-                {
-                    fluid_damping.exec(dt);
-                    pressure_relaxation.exec(dt);
-                    acoustic_damper_inner.exec(dt);
-                    acoustic_damper_wall.exec(dt);
-                }
-                /** external loads on the shell accumulate onto PDAccelerationPrior. */
-                initialize_a_pd_step.exec(dt);
-                if (with_liquid) fluid_pressure_force_on_shell.exec(dt);
-                shell_contact_factor.exec(dt);
-                plate_contact_on_shell.exec(dt);
-                if (with_liquid)
-                {
-                    density_relaxation.exec(dt);
-                    velocity_divergence_inner.exec(dt);
-                    velocity_divergence_wall.exec(dt);
-                }
-                /** NOSB-PD subcycling. */
-                Real dt_s_sum = 0.0;
-                average_velocity_and_acceleration.initialize_displacement_.exec();
-                while (dt_s_sum < dt)
-                {
-                    Real dt_s = dt_s_0;
-                    if (dt - dt_s_sum < dt_s) dt_s = dt - dt_s_sum;
-
-                    nosbpd_first_step.exec(dt_s);
-                    nosbpd_second_step->exec(dt_s);
-                    hourglass_control.exec(dt_s);
-                    numerical_damping.exec(dt_s);
-                    nosbpd_third_step.exec(dt_s);
-                    nosbpd_fourth_step.exec(dt_s);
-
-                    dt_s_sum += dt_s;
-                }
-                /** bond breaking checked sparsely (eigen solve per bond is
-                 * expensive); every 10 fluid steps is ample for fracture. */
-                if (number_of_iterations % 10 == 0) check_bondLive->exec(dt);
-                average_velocity_and_acceleration.update_averages_.exec(dt);
-
-                dt = with_liquid ? get_fluid_time_step_size.exec() : dt_dry;
-                relaxation_time += dt;
-                integration_time += dt;
-                physical_time += dt;
-
-                /** plate kinematics (dt-dependent) and contact reactions. */
-                drive_upper_plate.exec(dt);
-                shell_reaction_on_lower.exec(dt);
-                shell_reaction_on_upper.exec(dt);
-            }
-
-            number_of_iterations++;
-            if (number_of_iterations % screen_output_interval == 0 || number_of_iterations <= 200)
-            {
-                std::cout << std::scientific << "N=" << number_of_iterations
-                          << " Time: " << physical_time << "	dt = " << dt << "\n";
-            }
-
-            capsule_shell.updateCellLinkedList();
-            upper_plate.updateCellLinkedList();
-            if (with_liquid)
-            {
-                liquid_core.updateCellLinkedList();
-                liquid_complex.updateConfiguration();
-                shell_liquid_contact.updateConfiguration();
-            }
-            shell_plates_contact.updateConfiguration();
-            lower_plate_shell_contact.updateConfiguration();
-            upper_plate_shell_contact.updateConfiguration();
+            if (std::abs(rho[i] / rho0_f - 1) > max_density_error)
+                peridynamics::numericalFailure(liquid.Name(), i, "density deviation limit: rho/rho0=" + std::to_string(rho[i] / rho0_f));
+            if (v[i].norm() > max_fluid_mach * c_f)
+                peridynamics::numericalFailure(liquid.Name(), i, "Mach-number limit: speed=" + std::to_string(v[i].norm()));
         }
+    };
+    auto update_contacts = [&]()
+    {
+        shell.updateCellLinkedList(); upper.updateCellLinkedList();
+        if (with_liquid)
+        {
+            liquid.updateCellLinkedList(); fluid_complex.updateConfiguration(); shell_fluid.updateConfiguration();
+            upper_fluid.updateConfiguration(); lower_fluid.updateConfiguration();
+        }
+        shell_plates.updateConfiguration(); lower_shell.updateConfiguration(); upper_shell.updateConfiguration();
+    };
+    auto measure = [&](int frame)
+    {
+        contact_factor.exec(); initialize_shell.exec(); contact_force.exec(); upper_reaction.exec(); lower_reaction.exec();
+        Real contact_y = sumVector(upper, "ContactRepulsionToWall")[1], fluid_y = 0;
+        if (with_liquid)
+        {
+            upper_pressure.exec(); upper_viscosity.exec();
+            fluid_y = (sumVector(upper, "PressureForceFromFluid") + sumVector(upper, "ViscousForceFromFluid"))[1];
+        }
+        auto &sp = shell.getBaseParticles(); auto &fp = liquid.getBaseParticles();
+        auto *d = sp.getVariableDataByName<Real>("Damage");
+        auto *sv = sp.getVariableDataByName<Vecd>("Velocity"); auto *sm = sp.getVariableDataByName<Real>("Mass");
+        auto *failure = sp.getVariableDataByName<int>("NumericalFailureReason");
+        Real dsum = 0, dmax = 0, shell_ke = 0, fluid_ke = 0, mass = 0, vmax = 0, rho_error = 0;
+        int failures = 0;
+        for (size_t i = 0; i < sp.TotalRealParticles(); ++i)
+        {dsum += d[i]; dmax = std::max(dmax, d[i]); shell_ke += 0.5 * sm[i] * sv[i].squaredNorm(); failures += failure[i] != 0;}
+        if (with_liquid)
+        {
+            auto *fm = fp.getVariableDataByName<Real>("Mass"); auto *fv = fp.getVariableDataByName<Vecd>("Velocity");
+            auto *frho = fp.getVariableDataByName<Real>("Density");
+            for (size_t i = 0; i < fp.TotalRealParticles(); ++i)
+            {mass += fm[i]; vmax = std::max(vmax, fv[i].norm()); rho_error = std::max(rho_error, std::abs(frho[i] / rho0_f - 1)); fluid_ke += 0.5 * fm[i] * fv[i].squaredNorm();}
+        }
+        Real stroke = std::min(time / end_time, Real(1)) * compression_distance;
+        diagnostics << time << ',' << stroke << ',' << acoustic_count << ',' << pd_count << ',' << mass << ',' << vmax << ',' << rho_error << ',' << dsum / sp.TotalRealParticles() << ',' << dmax << ',' << failures << ',' << shell_ke << ',' << fluid_ke << ',' << contact_y << ',' << fluid_y << ',' << contact_y + fluid_y << '\n';
+        reaction << time << ' ' << stroke << ' ' << contact_y << ' ' << fluid_y << ' ' << contact_y + fluid_y << '\n';
+        diagnostics.flush(); reaction.flush(); states.writeToFile(frame);
+        std::cout << "frame=" << frame << " time=" << time << " stroke=" << stroke << " F=" << contact_y + fluid_y << " rho_error=" << rho_error << " vmax=" << vmax << std::endl;
+    };
 
-        write_body_states.writeToFile(number_of_iterations);
-        write_upper_plate_reaction.writeToFile(number_of_iterations);
+    try
+    {
+        system.initializeSystemCellLinkedLists(); system.initializeSystemConfigurations();
+        shell_normals.exec(); lower_normals.exec(); upper_normals.exec(); shape_matrix.exec(); move_upper.exec();
+        if (with_liquid) fluid_gravity.exec();
+        shell_check.exec(); check_fluid(); measure(0);
+        std::cout << "particles shell=" << shell.getBaseParticles().TotalRealParticles()
+                  << " liquid=" << (with_liquid ? liquid.getBaseParticles().TotalRealParticles() : 0)
+                  << " PD_dt=" << pd_dt << " end_time=" << end_time << std::endl;
+        for (int frame = 1; frame <= output_frames; ++frame)
+        {
+            Real target_time = frame == output_frames ? end_time : end_time * Real(frame) / output_frames;
+            while (time < target_time)
+            {
+                phase = "density summation";
+                if (with_liquid && reinitialize_density) {density_sum.exec(); check_fluid();}
+                Real Dt = peridynamics::boundedTimeStep(with_liquid ? advection_step.exec() : pd_dt * 20, {target_time - time});
+                Real advection_end = time + Dt;
+                while (time < advection_end)
+                {
+                    Real solid_dt = shell_step.exec();
+                    // Bound the explicit fluid-solid exchange as well as the fluid acoustic CFL.
+                    Real candidate_dt = with_liquid ? std::min(acoustic_step.exec(), max_pd_substeps * solid_dt) : 20 * solid_dt;
+                    Real dt = peridynamics::boundedTimeStep(candidate_dt, {advection_end - time, target_time - time});
+                    phase = "fluid first half"; move_upper.exec(); update_normals.exec();
+                    if (with_liquid)
+                    {
+                        fluid_viscosity.exec(); divergence.exec(); wall_divergence.exec();
+                        pressure.exec(dt); inner_damping.exec(dt); wall_damping.exec(dt); check_fluid();
+                    }
+                    phase = "external shell loads";
+                    initialize_shell.exec();
+                    if (with_liquid)
+                    {
+                        shell_pressure.exec(dt); shell_viscosity.exec();
+                        auto &p = shell.getBaseParticles();
+                        auto *a = p.getVariableDataByName<Vecd>("PDAccelerationPrior");
+                        auto *f = p.getVariableDataByName<Vecd>("ViscousForceFromFluid");
+                        auto *v = p.getVariableDataByName<Real>("VolumetricMeasure");
+                        for (size_t i = 0; i < p.TotalRealParticles(); ++i) a[i] += f[i] / (rho0_shell * v[i]);
+                    }
+                    contact_factor.exec(); contact_force.exec();
+                    phase = "fluid second half";
+                    if (with_liquid) {density.exec(dt); update_fluid_volume.exec(); check_fluid();}
+                    phase = "PD subcycling";
+                    Real elapsed = 0; averages.initialize_displacement_.exec();
+                    while (elapsed < dt)
+                    {
+                        Real ds = peridynamics::boundedTimeStep(shell_step.exec(), {dt - elapsed});
+                        first.exec(ds); second->exec(ds);
+                        if (pd_count % size_t(bond_check_interval) == 0) fracture->exec(ds);
+                        hourglass.exec(ds); pd_damping.exec(ds); third.exec(ds); fourth.exec(ds);
+                        shell_check.exec(); ++pd_count;
+                        elapsed = ds == dt - elapsed ? dt : elapsed + ds;
+                    }
+                    averages.update_averages_.exec(dt);
+                    ++acoustic_count;
+                    if (with_liquid && inject_nan_step >= 0 && acoustic_count == size_t(inject_nan_step))
+                        liquid.getBaseParticles().getVariableDataByName<Vecd>("Velocity")[0][0] = std::numeric_limits<Real>::quiet_NaN();
+                    phase = "accepted step checks"; check_fluid(); shell_check.exec();
+                    time = dt == advection_end - time ? advection_end : time + dt;
+                    move_upper.exec();
+                }
+                if (advection_end == target_time) time = target_time;
+                phase = "contact neighborhood refresh"; update_contacts();
+            }
+            phase = "output"; measure(frame);
+        }
+        std::ofstream("output/run_status.txt") << "completed\ntime_s=" << std::setprecision(17) << time << '\n';
+    }
+    catch (const std::exception &e)
+    {
+        std::ofstream failure("output/run_status.txt");
+        failure << std::setprecision(17) << "failed\ntime_s=" << time << "\nphase=" << phase
+                << "\nacoustic_steps=" << acoustic_count << "\npd_steps=" << pd_count << "\nreason=" << e.what() << '\n';
+        failure.close();
+        try {states.writeToFile(1000000000 + acoustic_count);} catch (...) {}
+        std::cerr << "FAILED at t=" << time << " phase=" << phase << ": " << e.what() << std::endl;
+        return 1;
     }
     return 0;
 }

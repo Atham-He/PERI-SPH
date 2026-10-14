@@ -107,7 +107,7 @@ class J2PlasticityforPD : public PlasticSolidforPD
 
   protected:
     /** denominator of the J2 plastic corrector (flow resistance).
-     * Rate-independent J2: G + (H_iso + H_kin)/3. Rate-dependent
+     * Rate-independent J2: G + H_iso/3 + H_kin/2. Rate-dependent
      * extensions (e.g. Perzyna) add a viscosity term. */
     virtual Real J2FlowResistance(Real dt) const;
     Real sigmaY_infinite_, sigmaY_0_, index_kesi_;
@@ -116,10 +116,11 @@ class J2PlasticityforPD : public PlasticSolidforPD
 /**
  * @class ViscoPlasticSolidforPD
  * @brief Perzyna-type visco-plastic solid for PD (rate-dependent J2).
- * @details The plastic corrector is identical to the rate-independent J2
- * cutting plane except that the flow resistance carries an extra viscosity
- * term eta/(3 dt), i.e. the backward-Euler discretization of the Perzyna
- * overstress law d_gamma = 0.5 f / (G + H/3 + eta/(3 dt)).
+ * @details A scalar bracketed solve enforces the nonlinear consistency relation
+ * with saturation hardening. Viscosity adds 2*eta*gamma/(3*dt) to the
+ * J2 overstress residual. The kinematic variable is defined by backstress
+ * = H_kin * internal_strain, giving resistance G + H_iso/3 + H_kin/2
+ * in the linear-hardening limit.
  * The model reduces to rate-independent J2 as viscosity -> 0 and to
  * purely elastic response as viscosity -> inf; the characteristic
  * overstress relaxation time is eta/(3G). Suitable for alginate-type

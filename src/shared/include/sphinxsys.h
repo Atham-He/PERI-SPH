@@ -47,6 +47,7 @@
 #include "all_materials.h"
 #include "all_particle_generators.h"
 #include "all_particles.h"
+#include "all_peridynamics.h"
 #include "all_physical_dynamics.h"
 #include "all_regression_test_methods.h"
 #include "all_simbody.h"

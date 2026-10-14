@@ -1052,3 +1052,4 @@ build_wasm_debug
 # CodeQL
 _codeql_detected_source_root
 build_test/
+tests/3d_examples/extra_3d_PD_ice_jet/

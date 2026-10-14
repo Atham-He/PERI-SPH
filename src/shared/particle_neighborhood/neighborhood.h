@@ -57,6 +57,10 @@ class Neighborhood
     StdVec<Real> dW_ij_; /**< derivative of kernel function or inter-particle surface contribution */
     StdVec<Real> r_ij_;  /**< distance between j and i. */
     StdVec<Vecd> e_ij_;  /**< unit vector pointing from j to i or inter-particle surface direction */
+    /** bond state for peridynamics: true if the bond between i and j is alive.
+     * Note that the bond state is defined in the reference configuration;
+     * the peridynamic inner configuration must NOT be updated after initialization. */
+    StdVec<bool> bondLive_;
 
     Neighborhood() : current_size_(0), allocated_size_(0) {};
     ~Neighborhood() {};

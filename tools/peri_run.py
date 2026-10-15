@@ -28,7 +28,8 @@ def parameters(path):
         line = line.split("#", 1)[0].strip()
         if line:
             key, value = line.split("=", 1)
-            result[key.strip()] = float(value.strip())
+            token = value.strip()
+            result[key.strip()] = float(token == "true") if token in ("true", "false") else float(token)
     return result
 
 

@@ -5,9 +5,16 @@ import unittest
 from unittest.mock import patch
 
 from peri_study import compare_group, relative_curve_error
+from peri_run import parameters
 
 
 class StudyAnalysisTests(unittest.TestCase):
+    def test_full_case_inputs_accept_boolean_tokens(self):
+        config = parameters(Path(__file__).resolve().parents[1] / "tests/3d_examples/extra_3d_PD_capsule_compression/configs/full_capsule.cfg")
+        self.assertEqual(config["with_liquid"], 1)
+        self.assertEqual(config["reinitialize_density"], 0)
+        self.assertEqual(config["capsule_radius_out"], 0.0005)
+
     def test_curve_norm_matches_known_scale_error(self):
         reference = [{"stroke_m": x, "total_Fy_N": 2*x} for x in (0, 0.25, 0.5, 1)]
         coarse = [{"stroke_m": x, "total_Fy_N": 3*x} for x in (0, 0.5, 1)]

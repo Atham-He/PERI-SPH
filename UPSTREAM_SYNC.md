@@ -48,3 +48,16 @@ order of increasing scope:
 
 Contributing back shrinks our patch surface and lets the paper cite the
 upstream repository directly.
+
+## Explicit core I/O extension (2026-10-15)
+
+`src/shared/io_system/io_vtk.{h,hpp,cpp}` adds the opt-in
+`setFullPrecisionOutput(true)` setting. Fixed nine-decimal ASCII output rounded
+the 1 mm capsule's particle masses (~9.35e-13 kg) and small forces to zero.
+The setting writes scientific notation with `Real::max_digits10`, Float64
+declarations and double VTK arrays/points. It changes no dynamics or default
+upstream output behavior. Capsule snapshots opt in; scalar, vector, matrix,
+coordinate and physical-time serialization have round-trip regression tests.
+Keep this I/O fix separate from the PD physics when syncing upstream. The
+current workstation validates the ASCII build; VTK-library builds require
+their own build check.

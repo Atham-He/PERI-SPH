@@ -80,11 +80,11 @@ void BodyStatesRecordingToVtp::writeParticlesToVtk(OutStreamType &output_stream,
         for (UnsignedInt k = 0; k != variable->getWidth(); ++k)
         {
             std::string name = variable->Name() + variable->getEntryName(k);
-            output_stream << "    <DataArray Name=\"" << name << "\" type=\"Float32\" format=\"ascii\">\n";
+            output_stream << "    <DataArray Name=\"" << name << "\" type=\"" << floatingPointVtkType() << "\" format=\"ascii\">\n";
             output_stream << "    ";
             for (size_t i = 0; i != total_real_particles; ++i)
             {
-                output_stream << std::fixed << std::setprecision(9) << variable->getEntryValueWithScalingRef(i, k) << " ";
+                configureRealOutput(output_stream) << variable->getEntryValueWithScalingRef(i, k) << " ";
             }
             output_stream << std::endl;
             output_stream << "    </DataArray>\n";
@@ -98,12 +98,12 @@ void BodyStatesRecordingToVtp::writeParticlesToVtk(OutStreamType &output_stream,
         for (UnsignedInt k = 0; k != variable->getWidth(); ++k)
         {
             std::string name = variable->Name() + variable->getEntryName(k);
-            output_stream << "    <DataArray Name=\"" << name << "\" type=\"Float32\"  NumberOfComponents=\"3\" format=\"ascii\">\n";
+            output_stream << "    <DataArray Name=\"" << name << "\" type=\"" << floatingPointVtkType() << "\"  NumberOfComponents=\"3\" format=\"ascii\">\n";
             output_stream << "    ";
             for (size_t i = 0; i != total_real_particles; ++i)
             {
                 Vec3d vector_value = upgradeToVec3d(variable->getEntryValueWithScalingRef(i, k));
-                output_stream << std::fixed << std::setprecision(9) << vector_value[0] << " " << vector_value[1] << " " << vector_value[2] << " ";
+                configureRealOutput(output_stream) << vector_value[0] << " " << vector_value[1] << " " << vector_value[2] << " ";
             }
             output_stream << std::endl;
             output_stream << "    </DataArray>\n";
@@ -114,7 +114,7 @@ void BodyStatesRecordingToVtp::writeParticlesToVtk(OutStreamType &output_stream,
     constexpr int type_index_Matd = DataTypeIndex<Matd>::value;
     for (DiscreteVariable<Matd> *variable : std::get<type_index_Matd>(variables_to_write))
     {
-        output_stream << "    <DataArray Name=\"" << variable->Name() << "\" type=\"Float32\"  NumberOfComponents=\"9\" format=\"ascii\">\n";
+        output_stream << "    <DataArray Name=\"" << variable->Name() << "\" type=\"" << floatingPointVtkType() << "\"  NumberOfComponents=\"9\" format=\"ascii\">\n";
         output_stream << "    ";
         for (size_t i = 0; i != total_real_particles; ++i)
         {
@@ -122,7 +122,7 @@ void BodyStatesRecordingToVtp::writeParticlesToVtk(OutStreamType &output_stream,
             for (int k = 0; k != 3; ++k)
             {
                 Vec3d col_vector = matrix_value.col(k);
-                output_stream << std::fixed << std::setprecision(9) << col_vector[0] << " " << col_vector[1] << " " << col_vector[2] << " ";
+                configureRealOutput(output_stream) << col_vector[0] << " " << col_vector[1] << " " << col_vector[2] << " ";
             }
         }
         output_stream << std::endl;

@@ -45,6 +45,23 @@ class StudyAnalysisTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "uncontrolled parameter"):
                     compare_group(root, data, names, "time")
 
+    def test_accidental_coarse_fine_agreement_is_not_convergence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); names=["baseline","dt_half","dt_quarter"]
+            data={"executable":"frozen_source/bin/solver","source_sha256":{"bin/solver":"same"},
+                  "force_relative_tolerance":0.5,"energy_monitoring_tolerance":0.05}
+            for i,(name,factor) in enumerate(zip(names,(1,0.8,1))):
+                output=root/"runs"/name/"output";output.mkdir(parents=True)
+                (output.parent/"run_manifest.json").write_text(json.dumps({"executable_sha256":"same"}))
+                (output/"effective_parameters.cfg").write_text(f"youngs_shell=10000000\npd_cfl={0.1/2**i}\nacoustic_cfl={0.3/2**i}\n")
+                (output/"diagnostics.csv").write_text(f"stroke_m,total_Fy_N,damage_mean\n0,0,0\n1,{2*factor},0\n")
+                (output/"energy_budget.csv").write_text(f"plate_contact_work_J,plate_fluid_pressure_work_J,plate_fluid_viscous_work_J\n{factor},0,0\n")
+            with patch("peri_study.verify",return_value={"mechanical_energy_residual_max_relative":0.001}):
+                result=compare_group(root,data,names,"time")
+            self.assertTrue(result["adjacent_difference_within_tolerance"])
+            self.assertFalse(result["refinement_difference_trend"]["reaction_curve_relative_L2"])
+            self.assertFalse(result["accepted"])
+
 
 if __name__ == "__main__":
     unittest.main()

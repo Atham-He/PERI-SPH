@@ -50,7 +50,7 @@ def verify(run_dir, require_damage=False, energy_tolerance=None):
     config = parameters(output / "effective_parameters.cfg")
     with (output / "diagnostics.csv").open(newline="", encoding="utf-8") as stream:
         rows = [{key: float(value) for key, value in row.items()} for row in csv.DictReader(stream)]
-    if len(rows) != int(config["output_frames"]) + 1:
+    if len(rows) != int(config.get("diagnostic_frames", config["output_frames"])) + 1:
         raise ValueError("incomplete diagnostic output")
     if not all(math.isfinite(value) for row in rows for value in row.values()):
         raise ValueError("diagnostics contain non-finite data")
@@ -189,7 +189,32 @@ def launch(args):
     (run_dir / "run_manifest.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     command = [str(frozen_executable), "--case-config", "case.cfg", "--state_recording=" + ("false" if args.no_states else "true")]
     with (run_dir / "run.log").open("w", encoding="utf-8") as log:
-        process = subprocess.run(command, cwd=run_dir, stdout=log, stderr=subprocess.STDOUT)
+        process = subprocess.Popen(command, cwd=run_dir, stdout=log, stderr=subprocess.STDOUT)
+        metadata["solver_pid"] = process.pid
+        if sys.platform.startswith("linux"):
+            proc_stat = Path("/proc") / str(process.pid) / "stat"
+            if proc_stat.exists():
+                metadata["linux_process_start_ticks"] = proc_stat.read_text().rsplit(")", 1)[1].split()[19]
+            metadata["linux_boot_id"] = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        (run_dir / "run_manifest.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+        while True:
+            try:
+                process.wait(timeout=30)
+                break
+            except subprocess.TimeoutExpired:
+                if (run_dir / "output/effective_parameters.cfg").exists():
+                    from peri_audit import inspect
+                    try:
+                        live = inspect(run_dir)
+                    except (OSError, ValueError, KeyError) as error:
+                        live = {"status": "failed", "reason": str(error)}
+                    live["checked_at_utc"] = datetime.now(timezone.utc).isoformat()
+                    (run_dir / "live_audit.json").write_text(json.dumps(live, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+                    if live["status"] == "failed":
+                        metadata["live_audit_failure"] = live["reason"]
+                        process.terminate()
+                        process.wait()
+                        break
     metadata.update(finished_at_utc=datetime.now(timezone.utc).isoformat(), return_code=process.returncode)
     (run_dir / "run_manifest.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     if args.command == "fault-test":
@@ -204,6 +229,9 @@ def launch(args):
         print((run_dir / "run.log").read_text(encoding="utf-8")[-2000:], file=sys.stderr)
         return process.returncode
     verify(run_dir, energy_tolerance=args.energy_tolerance)
+    from peri_audit import inspect
+    final_audit = inspect(run_dir, snapshots=not args.no_states)
+    (run_dir / "live_audit.json").write_text(json.dumps(final_audit, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     return 0
 
 

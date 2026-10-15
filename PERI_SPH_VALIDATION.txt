@@ -106,7 +106,43 @@ while smoke tests shared the CPU; the timed integration/output portion was
 The full trajectory is a many-hour to multi-day calculation on this workstation;
 the 2 us pilot is not evidence of large-compression stability. Updated cost
 pilots and logs remain in build/peri_validation. progress.csv is flushed about
-every 30 seconds during accepted increments. Full fields and budget rows are
-written at the configured output frames. PD bond/internal-variable restart is
+every 30 seconds during accepted increments. Full fields are written at output_frames; budget rows use diagnostic_frames,
+a positive multiple of output_frames (0 selects the same count). The original-
+size configuration uses 1000 diagnostic intervals and 50 VTP intervals. PD bond/internal-variable restart is
 not yet implemented: an interrupted simulation cannot resume from its VTP.
 A completed case may be reused by the study queue; a partial one is rejected.
+
+Snapshot precision correction and live audits (2026-10-15)
+The first original-size run was manually superseded at 0.1324955 ms (2.2844%).
+Its last complete budget at 0.116 ms had zero inventory mass error and a
+0.01764% mechanical residual, but its fixed-nine-decimal VTP writer rounded
+particle masses (~9.35e-13 kg) and small forces to zero. This was an output
+precision defect, not numerical particle mass loss. The old frozen directory
+and interruption_record.json are retained; it is not a completed baseline.
+
+The capsule now opts into BodyStatesRecordingToVtp::setFullPrecisionOutput(true).
+It writes Float64 scientific ASCII with max_digits10 for scalars, vectors,
+matrices, coordinates and time. Other cases retain the upstream default unless
+they opt in. The explicit I/O core patch is documented in UPSTREAM_SYNC.md.
+The current tested build uses the ASCII backend; the optional VTK-library build
+needs a separate build check. Shell Mass/Density/reference volume and fluid
+Mass/Density/current volume are included. Direct mass sums from Float64 VTPs
+must match the CSV inventory within floating summation tolerance. Mass formed
+from density times current volume is checked for the fluid; shell volume is a
+reference measure and must not be treated as current volume.
+
+The run wrapper saves solver PID, Linux start ticks and boot ID, and writes
+live_audit.json every 30 seconds while running. It checks committed samples
+of inventory, density/volume, density/Mach limits, actual kinetic-work identities
+and signed losses. Partial final lines and not-yet-common output timestamps
+are not mistaken for accepted samples. Hard accounting/non-finite failures
+stop the solver; mechanical closure and negative signed-loss warnings remain
+visible for diagnosis. They are not relabelled as physical convergence.
+
+Manual read-only check:
+  python3 tools/peri_audit.py --run-dir RUN_DIRECTORY --snapshots
+The streaming snapshot check bounds memory usage and verifies all fields are
+finite, array lengths, Float64 declarations, positive particle masses and
+fluid density-volume mass. It reads the latest complete common shell/core
+frame and reports its own time separately from the latest accepted progress.
+A live audit never creates a full-run verification.json or a convergence claim.

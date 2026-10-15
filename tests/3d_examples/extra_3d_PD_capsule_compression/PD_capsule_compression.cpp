@@ -25,7 +25,7 @@ Real pd_horizon = 0, pd_pressure_acceleration_factor = 0;
 Real U_ref = 0.5, pd_cfl = 0.1, acoustic_cfl = 0.3, acoustic_damping_factor = 0.3;
 Real max_density_error = 0.1, max_fluid_mach = 0.3, hourglass_coefficient = 0.5, hourglass_damage_cutoff = 0.1;
 bool shell_viscoplastic = true, with_liquid = true, reinitialize_density = false, analytic_plate_contact = true;
-int output_frames = 50, bond_check_interval = 1, inject_nan_step = -1, max_pd_substeps = 6;
+int output_frames = 50, diagnostic_frames = 0, bond_check_interval = 1, inject_nan_step = -1, max_pd_substeps = 6;
 Real capsule_radius_in, resolution_ref, capsule_center_y, upper_plate_bottom, end_time;
 
 class CapsuleShellShape : public ComplexShape
@@ -60,7 +60,7 @@ static peridynamics::CaseParameters parameters()
     BIND(fluid_spacing_ratio); BIND(gravity_g); BIND(compression_speed); BIND(compression_distance);
     BIND(pd_pressure_acceleration_factor); BIND(pd_horizon); BIND(analytic_plate_contact); BIND(reinitialize_density); BIND(U_ref); BIND(pd_cfl); BIND(acoustic_cfl); BIND(acoustic_damping_factor);
     BIND(hourglass_coefficient); BIND(hourglass_damage_cutoff); BIND(max_density_error); BIND(max_fluid_mach); BIND(shell_viscoplastic); BIND(with_liquid);
-    BIND(max_pd_substeps); BIND(output_frames); BIND(bond_check_interval); BIND(inject_nan_step);
+    BIND(max_pd_substeps); BIND(output_frames); BIND(diagnostic_frames); BIND(bond_check_interval); BIND(inject_nan_step);
 #undef BIND
     return p;
 }
@@ -72,7 +72,7 @@ static void validateParameters()
         compression_distance <= 0 || compression_distance >= 2 * capsule_radius_out || compression_speed <= 0 ||
         rho0_shell <= 0 || youngs_shell <= 0 || poisson_shell <= -1 || poisson_shell >= 0.5 ||
         rho0_f <= 0 || c_f <= 0 || mu_f < 0 || fluid_spacing_ratio <= 0 ||
-        output_frames < 1 || bond_check_interval < 1 || max_pd_substeps < 1 || pd_cfl <= 0 || pd_cfl > 0.2 ||
+        diagnostic_frames < 0 || output_frames < 1 || bond_check_interval < 1 || max_pd_substeps < 1 || pd_cfl <= 0 || pd_cfl > 0.2 ||
         acoustic_cfl <= 0 || acoustic_cfl > 0.6 || acoustic_damping_factor < 0 ||
         max_density_error <= 0 || max_density_error >= 1 || max_fluid_mach <= 0 ||
         plate_friction_mu < 0 || plate_friction_veps <= 0 ||
@@ -88,6 +88,9 @@ static void validateParameters()
     if (pd_horizon == 0) pd_horizon = 3.015 * resolution_ref;
     if (pd_horizon < 2 * resolution_ref) throw std::invalid_argument("PD horizon must span at least two particle spacings");
     end_time = compression_distance / compression_speed;
+    if (diagnostic_frames == 0) diagnostic_frames = output_frames;
+    if (diagnostic_frames < output_frames || diagnostic_frames % output_frames != 0)
+        throw std::invalid_argument("diagnostic_frames must be a positive multiple of output_frames");
 }
 
 static Vecd sumVector(SPHBody &body, const std::string &name)
@@ -205,7 +208,7 @@ int main(int argc, char **argv)
     fluid_check.addVector("Force"); fluid_check.addVector("ForcePrior");
     shell_check.addMatrix("DeformationGradient"); shell_check.addMatrix("PDStress");
     shell_check.addVector("PDAcceleration"); shell_check.addVector("PDAccelerationPrior");
-    for (const auto &name : {"Mass", "Density", "Pressure"}) liquid.getBaseParticles().addVariableToWrite<Real>(name);
+    for (const auto &name : {"Mass", "Density", "Pressure", "VolumetricMeasure"}) liquid.getBaseParticles().addVariableToWrite<Real>(name);
     for (const auto &name : {"Velocity", "AverageVelocity", "AverageAcceleration", "PDAcceleration", "PDAccelerationPrior"}) shell.getBaseParticles().addVariableToWrite<Vecd>(name);
     for (const auto &name : {"PDStress", "DeformationGradient"}) shell.getBaseParticles().addVariableToWrite<Matd>(name);
     if (shell_viscoplastic)
@@ -213,7 +216,9 @@ int main(int argc, char **argv)
         shell.getBaseParticles().addVariableToWrite<Matd>("PlasticStrain");
         shell.getBaseParticles().addVariableToWrite<Real>("IsotropicHardeningParam");
     }
+    for (const auto &name : {"Mass", "Density", "VolumetricMeasure"}) shell.getBaseParticles().addVariableToWrite<Real>(name);
     BodyStatesRecordingToVtp states(system);
+    states.setFullPrecisionOutput(true);
     Real &time = *system.getSystemVariableDataByName<Real>("PhysicalTime");
     Real pd_dt = pd_cfl * resolution_ref / DynamicCast<HughesWingetSolid>(&shell, shell.getMatterMaterial()).ReferenceSoundSpeed();
     std::ofstream diagnostics("output/diagnostics.csv"), reaction("output/UpperPlate_TotalReaction.dat");
@@ -381,7 +386,9 @@ int main(int argc, char **argv)
         budget.flush(); mass_record.flush();
         diagnostics << time << ',' << stroke << ',' << acoustic_count << ',' << pd_count << ',' << mass << ',' << vmax << ',' << rho_error << ',' << dsum / sp.TotalRealParticles() << ',' << dmax << ',' << failures << ',' << shell_ke << ',' << fluid_ke << ',' << contact_y << ',' << fluid_y << ',' << contact_y + fluid_y << '\n';
         reaction << time << ' ' << stroke << ' ' << contact_y << ' ' << fluid_y << ' ' << contact_y + fluid_y << '\n';
-        diagnostics.flush(); reaction.flush(); states.writeToFile(frame);
+        diagnostics.flush(); reaction.flush();
+        int snapshot_stride = diagnostic_frames / output_frames;
+        if (frame % snapshot_stride == 0) states.writeToFile(frame / snapshot_stride);
         std::cout << "frame=" << frame << " time=" << time << " stroke=" << stroke << " F=" << contact_y + fluid_y << " rho_error=" << rho_error << " vmax=" << vmax
                   << " energy_residual=" << residual / energy_scale << " wall_s="
                   << std::chrono::duration<Real>(std::chrono::steady_clock::now() - start_wall_clock).count() << std::endl;
@@ -396,9 +403,9 @@ int main(int argc, char **argv)
         std::cout << "particles shell=" << shell.getBaseParticles().TotalRealParticles()
                   << " liquid=" << (with_liquid ? liquid.getBaseParticles().TotalRealParticles() : 0)
                   << " PD_dt=" << pd_dt << " end_time=" << end_time << std::endl;
-        for (int frame = 1; frame <= output_frames; ++frame)
+        for (int frame = 1; frame <= diagnostic_frames; ++frame)
         {
-            Real target_time = frame == output_frames ? end_time : end_time * Real(frame) / output_frames;
+            Real target_time = frame == diagnostic_frames ? end_time : end_time * Real(frame) / diagnostic_frames;
             while (time < target_time)
             {
                 phase = "density summation";

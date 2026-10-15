@@ -32,12 +32,16 @@
 #include "io_base.h"
 
 #include <map>
+#include <iomanip>
+#include <limits>
 
 #include "dynamics_algorithms.h"
 #include "general_reduce.h"
 
 #ifdef SPHINXSYS_USE_VTK
 #include <vtkCellArray.h>
+#include <vtkDataArray.h>
+#include <vtkSmartPointer.h>
 #include <vtkDoubleArray.h>
 #include <vtkFieldData.h>
 #include <vtkFloatArray.h>
@@ -73,9 +77,21 @@ class BodyStatesRecordingToVtp : public BodyStatesRecording
      *        Has no effect when SPHINXSYS_USE_VTK is not defined.
      */
     void setBinaryOutput(bool binary) { binary_output_ = binary; }
+    /** Preserve small SI quantities and round-trip Real values. Default output
+     * remains unchanged for upstream cases. Also selects double VTK arrays. */
+    void setFullPrecisionOutput(bool enabled) { full_precision_output_ = enabled; }
 
   protected:
     bool binary_output_ = false;
+    bool full_precision_output_ = false;
+    const char *floatingPointVtkType() const { return full_precision_output_ ? "Float64" : "Float32"; }
+    template <typename Stream> Stream &configureRealOutput(Stream &stream) const
+    {
+        if (full_precision_output_)
+            stream << std::scientific << std::setprecision(std::numeric_limits<Real>::max_digits10);
+        else stream << std::fixed << std::setprecision(9);
+        return stream;
+    }
 
     virtual void writeWithFileName(const std::string &sequence) override;
     template <typename OutStreamType>

@@ -40,7 +40,7 @@ def plan(args):
     frozen.mkdir()
     for name in ("src", "cmake", "tests/3d_examples/extra_3d_PD_capsule_compression"):
         shutil.copytree(repo / name, frozen / name)
-    for name in ("CMakeLists.txt", "PERI_SPH_FRAMEWORK.txt", "PERI_SPH_VALIDATION.txt", "PERI_SPH_VERSION.txt"):
+    for name in ("CMakeLists.txt", "PERI_SPH_FRAMEWORK.txt", "PERI_SPH_VALIDATION.txt", "PERI_SPH_VERSION.txt", "UPSTREAM_SYNC.md"):
         shutil.copy2(repo / name, frozen / name)
     (frozen / "tools").mkdir()
     for script in (repo / "tools").glob("peri_*.py"):
@@ -141,7 +141,13 @@ def compare_group(root, data, names, group):
     result["adjacent_difference_within_tolerance"] = all(adjacent[key] <= threshold for key in
         ("reaction_curve_relative_L2", "peak_reaction_relative_error", "plate_work_relative_error", "final_damage_mean_absolute_error"))
     result["energy_monitoring_passed"] = all(v["mechanical_energy_residual_max_relative"] <= data["energy_monitoring_tolerance"] for v in verification.values())
-    result["accepted"] = result["adjacent_difference_within_tolerance"] and result["energy_monitoring_passed"]
+    coarse=result["comparisons"][0]
+    result["refinement_difference_trend"] = {
+        key: coarse[key] + 1e-10 >= adjacent[key]
+        for key in ("reaction_curve_relative_L2", "plate_work_relative_error")}
+    result["accepted"] = (result["adjacent_difference_within_tolerance"] and
+                          all(result["refinement_difference_trend"].values()) and
+                          result["energy_monitoring_passed"])
     result["limits"] = "three-level differences with a provisional tolerance; not a formal asymptotic order or experimental validation"
     save(root / (group + "_comparison.json"), result)
     return result

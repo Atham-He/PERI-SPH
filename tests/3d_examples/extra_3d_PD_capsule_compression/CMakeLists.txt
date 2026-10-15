@@ -18,16 +18,20 @@ add_test(NAME ${PROJECT_NAME}
     WORKING_DIRECTORY ${EXECUTABLE_OUTPUT_PATH})
 
 # Fast regressions run in separate directories and cannot overwrite production output.
-foreach(case IN ITEMS smoke_liquid smoke_dry smoke_brittle smoke_fracture)
+foreach(case IN ITEMS smoke_liquid smoke_dry smoke_brittle smoke_fracture smoke_diagnostic_cadence)
   file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${case}")
+  set(case_recording false)
+  if(case STREQUAL "smoke_diagnostic_cadence")
+    set(case_recording true)
+  endif()
   add_test(NAME peri_capsule_${case} COMMAND ${PROJECT_NAME}
-    --case-config "${CMAKE_CURRENT_SOURCE_DIR}/configs/${case}.cfg" --state_recording=false)
+    --case-config "${CMAKE_CURRENT_SOURCE_DIR}/configs/${case}.cfg" --state_recording=${case_recording})
   set_tests_properties(peri_capsule_${case} PROPERTIES
     WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${case}" TIMEOUT 180)
 endforeach()
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
-foreach(case IN ITEMS smoke_liquid smoke_dry smoke_brittle smoke_fracture)
+foreach(case IN ITEMS smoke_liquid smoke_dry smoke_brittle smoke_fracture smoke_diagnostic_cadence)
   set_tests_properties(peri_capsule_${case} PROPERTIES FIXTURES_SETUP ${case}_complete LABELS peri_fast)
   set(damage_check)
   if(case STREQUAL "smoke_fracture")
@@ -51,3 +55,7 @@ add_test(NAME peri_capsule_injected_nan COMMAND ${Python3_EXECUTABLE}
   --config "${CMAKE_CURRENT_SOURCE_DIR}/configs/inject_failure.cfg"
   --run-root "${CMAKE_CURRENT_BINARY_DIR}/fault_runs")
 set_tests_properties(peri_capsule_injected_nan PROPERTIES LABELS peri_fast TIMEOUT 30)
+
+add_test(NAME peri_capsule_snapshot_precision_audit COMMAND ${Python3_EXECUTABLE}
+  "${CMAKE_SOURCE_DIR}/tools/peri_audit.py" --run-dir "${CMAKE_CURRENT_BINARY_DIR}/smoke_diagnostic_cadence" --snapshots)
+set_tests_properties(peri_capsule_snapshot_precision_audit PROPERTIES FIXTURES_REQUIRED smoke_diagnostic_cadence_complete LABELS peri_fast TIMEOUT 30)

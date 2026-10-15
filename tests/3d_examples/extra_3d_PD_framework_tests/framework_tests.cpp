@@ -1,6 +1,9 @@
 #include "sphinxsys.h"
 #include <gtest/gtest.h>
 #include <limits>
+#include "io_vtk.hpp"
+#include <fstream>
+#include <sstream>
 
 using namespace SPH;
 
@@ -493,4 +496,47 @@ TEST(PDFSI, PressureTractionAndDensityFluxExchangeEnergyAndMomentumAtZeroExtrapo
     ASSERT_GT(scale,1);
     EXPECT_LT(resultant.norm(),1e-11*scale);
     EXPECT_LT(std::abs(power),1e-11*scale);
+}
+
+
+class VtpProbe : public BodyStatesRecordingToVtp
+{
+  public:
+    using BodyStatesRecordingToVtp::BodyStatesRecordingToVtp;
+    using BodyStatesRecordingToVtp::writeParticlesToVtk;
+};
+static std::pair<std::string,StdVec<Real>> vtkField(const std::string &xml,const std::string &name)
+{
+    size_t name_at=xml.find("Name=\""+name+"\"");
+    if(name_at==std::string::npos) throw std::runtime_error("missing VTK field "+name);
+    size_t begin=xml.rfind("<DataArray",name_at),end=xml.find('>',name_at),close=xml.find("</DataArray>",end);
+    std::istringstream values(xml.substr(end+1,close-end-1));
+    StdVec<Real> data; Real value;
+    while(values>>value) data.push_back(value);
+    return {xml.substr(begin,end-begin),data};
+}
+TEST(PDOutput, FullPrecisionRoundTripsSmallScalarVectorMatrixPositionAndTime)
+{
+    PDTestBody f(1e-3); f.generate<HughesWingetSolid>(1000,1e6,0.25);
+    auto &p=f.body.getBaseParticles();
+    auto *scalar=p.registerStateVariableData<Real>("TinyScalar"); scalar[0]=9.350000000000002e-13;
+    auto *vector=p.registerStateVariableData<Vecd>("TinyVector"); vector[0]=Vecd(1.234567890123456e-19,-5.43210987654321e-24,2.345678901234567e-11);
+    auto *matrix=p.registerStateVariableData<Matd>("TinyMatrix"); matrix[0]=Matd::Zero(); matrix[0](0,1)=-1.234567890123456e-25;
+    p.addVariableToWrite<Real>("TinyScalar"); p.addVariableToWrite<Vecd>("TinyVector"); p.addVariableToWrite<Matd>("TinyMatrix");
+    VtpProbe legacy(f.body); std::ostringstream rounded; legacy.writeParticlesToVtk(rounded,p);
+    EXPECT_EQ(vtkField(rounded.str(),"TinyScalar").second[0],0);
+    auto *position=p.getVariableDataByName<Vecd>("Position"); position[0][0]=1.234567890123456e-9;
+    Real &time=*f.system.getSystemVariableDataByName<Real>("PhysicalTime"); time=1.234567890123456e-11;
+    f.system.setStateRecording(true); f.body.setNewlyUpdated();
+    VtpProbe precise(f.body); precise.setFullPrecisionOutput(true); precise.writeToFile(9876543);
+    std::ifstream stream("output/TestSolid_ite_0009876543.vtp");
+    ASSERT_TRUE(stream.good()); std::string xml((std::istreambuf_iterator<char>(stream)),{});
+    for(const auto &name : {"TinyScalar","TinyVector","TinyMatrix","Position","TimeValue"})
+        EXPECT_NE(vtkField(xml,name).first.find("Float64"),std::string::npos);
+    auto sv=vtkField(xml,"TinyScalar").second; ASSERT_GT(sv.size(),0); EXPECT_DOUBLE_EQ(sv[0],scalar[0]);
+    auto vv=vtkField(xml,"TinyVector").second; ASSERT_GE(vv.size(),3);
+    for(int d=0;d<3;++d) EXPECT_DOUBLE_EQ(vv[d],vector[0][d]);
+    auto mv=vtkField(xml,"TinyMatrix").second; ASSERT_GE(mv.size(),9); EXPECT_DOUBLE_EQ(mv[3],matrix[0](0,1));
+    EXPECT_DOUBLE_EQ(vtkField(xml,"Position").second[0],position[0][0]);
+    EXPECT_DOUBLE_EQ(vtkField(xml,"TimeValue").second[0],time);
 }

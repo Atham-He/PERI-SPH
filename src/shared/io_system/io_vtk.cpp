@@ -23,8 +23,10 @@ void BodyStatesRecordingToVtp::writeWithFileName(const std::string &sequence)
 
                 // Build points
                 vtkNew<vtkPoints> points;
-                points->SetDataTypeToFloat();
+                if (full_precision_output_) points->SetDataTypeToDouble();
+                else points->SetDataTypeToFloat();
                 DiscreteVariable<Vecd> *dv_pos = base_particles.dvParticlePosition();
+                if (full_precision_output_) configureRealOutput(out_file);
                 for (size_t i = 0; i != total_real_particles; ++i)
                 {
                     Vec3d pos = upgradeToVec3d(dv_pos->getValueWithScalingRef(i));
@@ -112,11 +114,13 @@ void BodyStatesRecordingToVtp::addParticlesToVtkPolyData(vtkPolyData *polydata, 
     constexpr int type_index_Real = DataTypeIndex<Real>::value;
     for (DiscreteVariable<Real> *variable : std::get<type_index_Real>(variables_to_write))
     {
-        vtkNew<vtkFloatArray> arr;
+        vtkSmartPointer<vtkDataArray> arr;
+        if (full_precision_output_) arr = vtkSmartPointer<vtkDoubleArray>::New();
+        else arr = vtkSmartPointer<vtkFloatArray>::New();
         arr->SetName(variable->Name().c_str());
-        arr->SetNumberOfValues(static_cast<vtkIdType>(total_real_particles));
+        arr->SetNumberOfTuples(static_cast<vtkIdType>(total_real_particles));
         for (size_t i = 0; i < total_real_particles; ++i)
-            arr->SetValue(static_cast<vtkIdType>(i), static_cast<float>(variable->getValueWithScalingRef(i)));
+            arr->SetTuple1(static_cast<vtkIdType>(i), variable->getValueWithScalingRef(i));
         polydata->GetPointData()->AddArray(arr);
     }
 
@@ -124,14 +128,16 @@ void BodyStatesRecordingToVtp::addParticlesToVtkPolyData(vtkPolyData *polydata, 
     constexpr int type_index_Vecd = DataTypeIndex<Vecd>::value;
     for (DiscreteVariable<Vecd> *variable : std::get<type_index_Vecd>(variables_to_write))
     {
-        vtkNew<vtkFloatArray> arr;
+        vtkSmartPointer<vtkDataArray> arr;
+        if (full_precision_output_) arr = vtkSmartPointer<vtkDoubleArray>::New();
+        else arr = vtkSmartPointer<vtkFloatArray>::New();
         arr->SetName(variable->Name().c_str());
         arr->SetNumberOfComponents(3);
         arr->SetNumberOfTuples(static_cast<vtkIdType>(total_real_particles));
         for (size_t i = 0; i < total_real_particles; ++i)
         {
             Vec3d vec = upgradeToVec3d(variable->getValueWithScalingRef(i));
-            float tuple[3] = {static_cast<float>(vec[0]), static_cast<float>(vec[1]), static_cast<float>(vec[2])};
+            double tuple[3] = {vec[0], vec[1], vec[2]};
             arr->SetTuple(static_cast<vtkIdType>(i), tuple);
         }
         polydata->GetPointData()->AddArray(arr);
@@ -141,20 +147,22 @@ void BodyStatesRecordingToVtp::addParticlesToVtkPolyData(vtkPolyData *polydata, 
     constexpr int type_index_Matd = DataTypeIndex<Matd>::value;
     for (DiscreteVariable<Matd> *variable : std::get<type_index_Matd>(variables_to_write))
     {
-        vtkNew<vtkFloatArray> arr;
+        vtkSmartPointer<vtkDataArray> arr;
+        if (full_precision_output_) arr = vtkSmartPointer<vtkDoubleArray>::New();
+        else arr = vtkSmartPointer<vtkFloatArray>::New();
         arr->SetName(variable->Name().c_str());
         arr->SetNumberOfComponents(9);
         arr->SetNumberOfTuples(static_cast<vtkIdType>(total_real_particles));
         for (size_t i = 0; i < total_real_particles; ++i)
         {
             Mat3d mat = upgradeToMat3d(variable->getValueWithScalingRef(i));
-            float tuple[9];
+            double tuple[9];
             for (int k = 0; k < 3; ++k)
             {
                 Vec3d col = mat.col(k);
-                tuple[3 * k + 0] = static_cast<float>(col[0]);
-                tuple[3 * k + 1] = static_cast<float>(col[1]);
-                tuple[3 * k + 2] = static_cast<float>(col[2]);
+                tuple[3 * k + 0] = col[0];
+                tuple[3 * k + 1] = col[1];
+                tuple[3 * k + 2] = col[2];
             }
             arr->SetTuple(static_cast<vtkIdType>(i), tuple);
         }
@@ -188,7 +196,7 @@ void BodyStatesRecordingToVtp::writeWithFileName(const std::string &sequence)
                 {
                     out_file << "<FieldData>\n";
                     out_file << "<DataArray type=\"Float64\"  Name=\"TimeValue\" NumberOfTuples=\"1\" format=\"ascii\">\n";
-                    out_file << std::fixed << std::setprecision(9) << sv_physical_time_->getValueWithScalingRef() << "\n";
+                    configureRealOutput(out_file) << sv_physical_time_->getValueWithScalingRef() << "\n";
                     out_file << " </DataArray>\n";
                     out_file << "</FieldData>\n";
                 }
@@ -199,9 +207,10 @@ void BodyStatesRecordingToVtp::writeWithFileName(const std::string &sequence)
 
                 // write current/final particle positions first
                 out_file << "   <Points>\n";
-                out_file << "    <DataArray Name=\"Position\" type=\"Float32\"  NumberOfComponents=\"3\" format=\"ascii\">\n";
+                out_file << "    <DataArray Name=\"Position\" type=\"" << floatingPointVtkType() << "\"  NumberOfComponents=\"3\" format=\"ascii\">\n";
                 out_file << "    ";
                 DiscreteVariable<Vecd> *dv_pos = base_particles.dvParticlePosition();
+                if (full_precision_output_) configureRealOutput(out_file);
                 for (size_t i = 0; i != total_real_particles; ++i)
                 {
                     Vec3d particle_position = upgradeToVec3d(dv_pos->getValueWithScalingRef(i));

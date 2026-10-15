@@ -180,3 +180,8 @@ Energy and original-size validation extension (2026-10-15)
 Read PERI_SPH_VALIDATION.txt for contact/work corrections, mass/energy definitions,
 sealed sequential studies and the fixed-horizon spatial refinement policy.
 Full-run completion and convergence must be read from study artifacts.
+
+Precision/audit update (2026-10-15): capsule VTP opts into scientific Float64
+max_digits10 output; output_frames and diagnostic_frames are independent.
+Read tools/peri_audit.py live_audit.json for partial runs. Preserve superseded
+runs separately and never mix their binary hashes into convergence tables.

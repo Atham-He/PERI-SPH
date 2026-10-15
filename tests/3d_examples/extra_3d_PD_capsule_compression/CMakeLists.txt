@@ -18,7 +18,7 @@ add_test(NAME ${PROJECT_NAME}
     WORKING_DIRECTORY ${EXECUTABLE_OUTPUT_PATH})
 
 # Fast regressions run in separate directories and cannot overwrite production output.
-foreach(case IN ITEMS smoke_liquid smoke_dry smoke_brittle smoke_fracture smoke_diagnostic_cadence)
+foreach(case IN ITEMS smoke_liquid smoke_dry smoke_brittle smoke_fracture smoke_diagnostic_cadence smoke_freefall)
   file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${case}")
   set(case_recording false)
   if(case STREQUAL "smoke_diagnostic_cadence")
@@ -31,7 +31,7 @@ foreach(case IN ITEMS smoke_liquid smoke_dry smoke_brittle smoke_fracture smoke_
 endforeach()
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
-foreach(case IN ITEMS smoke_liquid smoke_dry smoke_brittle smoke_fracture smoke_diagnostic_cadence)
+foreach(case IN ITEMS smoke_liquid smoke_dry smoke_brittle smoke_fracture smoke_diagnostic_cadence smoke_freefall)
   set_tests_properties(peri_capsule_${case} PROPERTIES FIXTURES_SETUP ${case}_complete LABELS peri_fast)
   set(damage_check)
   if(case STREQUAL "smoke_fracture")
@@ -59,3 +59,7 @@ set_tests_properties(peri_capsule_injected_nan PROPERTIES LABELS peri_fast TIMEO
 add_test(NAME peri_capsule_snapshot_precision_audit COMMAND ${Python3_EXECUTABLE}
   "${CMAKE_SOURCE_DIR}/tools/peri_audit.py" --run-dir "${CMAKE_CURRENT_BINARY_DIR}/smoke_diagnostic_cadence" --snapshots)
 set_tests_properties(peri_capsule_snapshot_precision_audit PROPERTIES FIXTURES_REQUIRED smoke_diagnostic_cadence_complete LABELS peri_fast TIMEOUT 30)
+
+add_test(NAME peri_capsule_freefall_energy_audit COMMAND ${Python3_EXECUTABLE}
+  "${CMAKE_SOURCE_DIR}/tools/peri_audit.py" --run-dir "${CMAKE_CURRENT_BINARY_DIR}/smoke_freefall" --strict)
+set_tests_properties(peri_capsule_freefall_energy_audit PROPERTIES FIXTURES_REQUIRED smoke_freefall_complete LABELS peri_fast TIMEOUT 10)

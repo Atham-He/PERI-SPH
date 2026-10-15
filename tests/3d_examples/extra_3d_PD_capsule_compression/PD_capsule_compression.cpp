@@ -149,7 +149,7 @@ int main(int argc, char **argv)
     Dynamics1Level<fluid_dynamics::Integration1stHalfWithWallforPD> pressure(fluid_inner, fluid_walls, pd_pressure_acceleration_factor);
     Dynamics1Level<fluid_dynamics::Integration2ndHalfWithWallRiemann> density(fluid_inner, fluid_walls);
     InteractionWithUpdate<fluid_dynamics::DensitySummationComplexFreeSurface> density_sum(fluid_inner, fluid_walls);
-    InteractionWithUpdate<fluid_dynamics::ViscousForceWithWall> fluid_viscosity(fluid_inner, fluid_walls);
+    InteractionWithUpdate<fluid_dynamics::ViscousForceWithWallforPD> fluid_viscosity(fluid_inner, fluid_walls);
     SimpleDynamics<fluid_dynamics::ContinuumVolumeUpdate> update_fluid_volume(liquid);
     SimpleDynamics<peridynamics::FluidKineticWork> fluid_work(liquid);
     ReduceDynamics<fluid_dynamics::AdvectionViscousTimeStep> advection_step(liquid, U_ref);
@@ -167,7 +167,7 @@ int main(int argc, char **argv)
     InteractionDynamics<solid_dynamics::PressureForceFromFluidforPD<AcousticRiemannSolver>> shell_pressure(shell_fluid);
     shell_pressure.setCoeffAcousticDamper(rho0_f, damping_c, fluid_horizon);
     shell_pressure.setAccelerationPressureFactor(pd_pressure_acceleration_factor);
-    InteractionWithUpdate<solid_dynamics::ViscousForceFromFluid> shell_viscosity(shell_fluid);
+    InteractionWithUpdate<solid_dynamics::ViscousForceFromFluidforPD> shell_viscosity(shell_fluid);
     InteractionWithUpdate<solid_dynamics::PressureForceFromFluid<decltype(density)>> upper_pressure(upper_fluid), lower_pressure(lower_fluid);
     InteractionWithUpdate<solid_dynamics::ViscousForceFromFluid> upper_viscosity(upper_fluid), lower_viscosity(lower_fluid);
 
@@ -421,9 +421,12 @@ int main(int argc, char **argv)
                     phase = "fluid first half"; move_upper.exec(); update_normals.exec();
                     if (with_liquid)
                     {
-                        fluid_viscosity.exec(); divergence.exec(); wall_divergence.exec();
+                        // Both directions of explicit viscous traction sample the same
+                        // accepted-time velocities, before pressure changes the core.
+                        fluid_viscosity.exec(); shell_viscosity.exec(); upper_viscosity.exec();
+                        divergence.exec(); wall_divergence.exec();
                         pressure.exec(dt); fluid_work.exec(dt);
-                        upper_pressure.exec(); upper_viscosity.exec();
+                        upper_pressure.exec();
                         plate_fluid_pressure_work += dt * compression_speed * sumVector(upper, "PressureForceFromFluid")[1];
                         plate_fluid_viscous_work += dt * compression_speed * sumVector(upper, "ViscousForceFromFluid")[1];
                         inner_damping.exec(dt); wall_damping.exec(dt); check_fluid();
@@ -432,7 +435,7 @@ int main(int argc, char **argv)
                     initialize_shell.exec();
                     if (with_liquid)
                     {
-                        shell_pressure.exec(dt); shell_viscosity.exec();
+                        shell_pressure.exec(dt);
                         auto &p = shell.getBaseParticles();
                         auto *a = p.getVariableDataByName<Vecd>("PDAccelerationPrior");
                         auto *f = p.getVariableDataByName<Vecd>("ViscousForceFromFluid");

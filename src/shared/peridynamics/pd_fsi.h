@@ -32,6 +32,8 @@
 #include "riemann_solver.h"
 #include "adaptation.h"
 #include "fluid_integration.hpp"
+#include "viscous_dynamics.hpp"
+#include "fluid_structure_interaction.hpp"
 
 namespace SPH
 {
@@ -82,6 +84,29 @@ namespace fluid_dynamics
  * factor=0 omits it on PD walls without altering wall motion. Rigid
  * non-PD walls retain the upstream factor=1.
  */
+/** Explicit interface viscosity uses actual accepted-time PD velocities.
+ * Pressure/density coupling keeps the original average velocity fields. */
+class ViscousWallTermsforPD : public ViscousForce<Contact<Wall>, FixedViscosity, NoKernelCorrection>
+{
+  public:
+    explicit ViscousWallTermsforPD(BaseContactRelation &walls)
+        : ViscousForce<Contact<Wall>, FixedViscosity, NoKernelCorrection>(walls)
+    {
+        for (size_t k=0;k<contact_bodies_.size();++k)
+            if (dynamic_cast<HughesWingetSolid *>(&contact_bodies_[k]->getMatterMaterial()))
+                wall_vel_ave_[k]=contact_particles_[k]->registerStateVariableData<Vecd>("Velocity");
+    }
+};
+class ViscousForceWithWallforPD : public ViscousForceInner
+{
+  public:
+    ViscousForceWithWallforPD(BaseInnerRelation &inner, BaseContactRelation &walls)
+        : ViscousForceInner(inner), walls_(walls) {}
+    void interaction(size_t i, Real dt=0)
+    {ViscousForceInner::interaction(i,dt); walls_.interaction(i,dt);}
+  protected:
+    ViscousWallTermsforPD walls_;
+};
 class PressureWallTermsforPD : public Integration1stHalf<Contact<Wall>, AcousticRiemannSolver, NoKernelCorrection>
 {
   public:
@@ -198,6 +223,14 @@ class AcousticDamperWithWallforPD : public LocalDynamics, public DataDelegateCon
 
 namespace solid_dynamics
 {
+class ViscousForceFromFluidforPD : public ViscousForceFromFluid
+{
+  public:
+    explicit ViscousForceFromFluidforPD(BaseContactRelation &relation)
+        : ViscousForceFromFluid(relation)
+    {vel_ave_=particles_->registerStateVariableData<Vecd>("Velocity");}
+};
+
 /**
  * @class PressureForceFromFluidforPD
  * @brief Pressure force from the fluid acting on PD particles.

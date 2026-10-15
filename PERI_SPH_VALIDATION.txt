@@ -146,3 +146,22 @@ finite, array lengths, Float64 declarations, positive particle masses and
 fluid density-volume mass. It reads the latest complete common shell/core
 frame and reports its own time separately from the latest accepted progress.
 A live audit never creates a full-run verification.json or a convergence claim.
+
+Synchronous viscous interface correction (2026-10-15)
+The dense diagnostic run then detected a negative viscous signed loss during
+common-gravity startup despite a small total residual. Previously the fluid
+viscosity used velocities before the pressure kick, while the reverse shell
+force was recomputed after that kick. Both also used a lagged PD displacement-
+averaged velocity rather than the accepted-time velocity for explicit viscosity.
+The corrected PD wrappers sample actual instantaneous wall/core velocities and
+both traction directions before pressure integration. AverageVelocity and
+AverageAcceleration used by pressure and density coupling remain unchanged.
+The upper-plate viscous work is sampled at the same pre-kick state as its force.
+
+A new unit test verifies equal/opposite interface forces, non-positive total
+viscous power, and zero traction for a common instantaneous translation even
+with deliberately different lagged average velocities. A controlled free-fall
+regression checks signed losses strictly. At 2 us, with identical parameters,
+the prior pairing produced -1.56756e-20 J viscous loss; the synchronous pairing
+produced +2.45090e-23 J. The prior diagnostic run is retained as superseded;
+all official full-stroke and refinement cases use the corrected sealed version.

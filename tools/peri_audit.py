@@ -244,6 +244,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir",type=Path,required=True)
     parser.add_argument("--snapshots",action="store_true")
+    parser.add_argument("--strict",action="store_true",help="fail on monitoring warnings, for controlled regression cases")
     parser.add_argument("--stale-seconds",type=float,default=180)
     args=parser.parse_args()
     try:
@@ -252,7 +253,7 @@ def main():
         result={"status":"failed","checked_at_utc":datetime.now(timezone.utc).isoformat(),"reason":str(exc)}
     (args.run_dir/"live_audit.json").write_text(json.dumps(result,indent=2,allow_nan=False)+"\n",encoding="utf-8")
     print(json.dumps(result,indent=2,allow_nan=False))
-    return 1 if result["status"]=="failed" else 0
+    return 1 if result["status"]=="failed" or (args.strict and result["status"]=="needs_attention") else 0
 
 
 if __name__=="__main__":

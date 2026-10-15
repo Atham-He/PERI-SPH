@@ -540,3 +540,41 @@ TEST(PDOutput, FullPrecisionRoundTripsSmallScalarVectorMatrixPositionAndTime)
     EXPECT_DOUBLE_EQ(vtkField(xml,"Position").second[0],position[0][0]);
     EXPECT_DOUBLE_EQ(vtkField(xml,"TimeValue").second[0],time);
 }
+
+
+TEST(PDFSI, ViscosityPairsBalanceDissipateAndIgnoreLaggedAverageVelocity)
+{
+    PDTestBody f; f.generate<HughesWingetSolid>(1000,1e6,0.25);
+    FluidBody fluid(f.system,makeShared<GeometricShapeBox>(Transform(Vecd(0,-0.6,0)),Vecd(0.3,0.3,0.3),"ViscousFluid"));
+    fluid.defineMatterMaterial<WeaklyCompressibleFluid>(935,25);
+    fluid.addMaterialProperty<Viscosity>(0.25); fluid.generateParticles<BaseParticles,Lattice>();
+    fluid.getBaseParticles().registerStateVariableData<Vecd>("Velocity");
+    ContactRelationSelectKernel walls(fluid,{&f.body},true),reverse(f.body,{&fluid},false);
+    InteractionWithUpdate<fluid_dynamics::ViscousWallTermsforPD> fluid_force(walls);
+    InteractionWithUpdate<solid_dynamics::ViscousForceFromFluidforPD> shell_force(reverse);
+    f.system.initializeSystemCellLinkedLists(); f.system.initializeSystemConfigurations();
+    auto &fp=fluid.getBaseParticles();auto &sp=f.body.getBaseParticles();
+    Vecd vf(0.3,0.2,-0.1),vs(-0.2,-0.1,0.1);
+    for(size_t i=0;i<fp.TotalRealParticles();++i) fp.getVariableDataByName<Vecd>("Velocity")[i]=vf;
+    for(size_t i=0;i<sp.TotalRealParticles();++i)
+    {
+        sp.getVariableDataByName<Vecd>("Velocity")[i]=vs;
+        sp.getVariableDataByName<Vecd>("AverageVelocity")[i]=Vecd(10,-30,50);
+    }
+    fluid_force.exec();shell_force.exec(); Vecd net=Vecd::Zero();Real power=0,scale=0;
+    for(size_t i=0;i<fp.TotalRealParticles();++i)
+    {Vecd force=fp.getVariableDataByName<Vecd>("ViscousForce")[i];net+=force;power+=force.dot(vf);scale+=force.norm();}
+    for(size_t i=0;i<sp.TotalRealParticles();++i)
+    {Vecd force=sp.getVariableDataByName<Vecd>("ViscousForceFromFluid")[i];net+=force;power+=force.dot(vs);}
+    ASSERT_GT(scale,1e-8);EXPECT_LT(net.norm(),1e-11*scale);EXPECT_LT(power,0);
+    // A common instantaneous translation must have no interface viscosity,
+    // even when the displacement-averaged wall velocity is one half step old.
+    for(size_t i=0;i<fp.TotalRealParticles();++i)
+    {
+        fp.getVariableDataByName<Vecd>("Velocity")[i]=vs;
+        fp.getVariableDataByName<Vecd>("ViscousForce")[i].setZero();
+    }
+    fluid_force.exec();shell_force.exec();
+    for(size_t i=0;i<fp.TotalRealParticles();++i) EXPECT_LT(fp.getVariableDataByName<Vecd>("ViscousForce")[i].norm(),1e-15);
+    for(size_t i=0;i<sp.TotalRealParticles();++i) EXPECT_LT(sp.getVariableDataByName<Vecd>("ViscousForceFromFluid")[i].norm(),1e-15);
+}

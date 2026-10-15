@@ -1,0 +1,43 @@
+Acoustic work audit: interpretation and limits (2026-10-16)
+
+Source evidence
+pd_fsi.cpp VelocityDivergence* computes one u_div from inner and wall
+velocity differences. AcousticDamperInnerforPD uses (u_div_i+u_div_j),
+while AcousticDamperWithWallforPD uses 2*u_div_i. Individual powers of
+these two forces have cross terms and need not each be non-positive.
+PD_capsule_compression.cpp records:
+  L_inner = -W_fluid_inner
+  L_wall  = -W_fluid_wall - W_PD_wall
+The rigid moving-plate acoustic reaction work is not separately included
+in these legacy columns. The total raw acoustic transfer can therefore
+be negative even when a prescribed boundary physically supplies energy.
+
+Controlled counterexample, using the production wall-pair algebra
+Take one fluid mass m=1, unit volume and density, scalar G=dW*e=1,
+coefficient C=0.1, fluid velocity v=0, prescribed wall velocity w=-0.1,
+and dt=0.01. Then:
+  div = -2*(v-w)*G = -0.2
+  F_fluid = 2*C*div*G = -0.04
+  W_fluid = dt*F_fluid*(v+dt*F_fluid/(2*m)) = 8e-8
+  W_boundary = dt*F_fluid*w = 4e-5
+  legacy L_wall = -W_fluid = -8e-8
+  dissipation = W_boundary-W_fluid = 3.992e-5 > 0
+This disproves an unconditional sign test on the legacy wall column. It
+is not a proof that every multi-particle explicit exchange is passive.
+
+Correct assessment
+With separately recorded boundary work, test the combined
+  L_acoustic = L_inner + L_wall + W_boundary.
+Without that measurement, retain raw signed work and negative-component
+observations, and report the dissipation sign as unverified. Do not turn
+that absence of measurement into a passivity claim. Moving a boundary
+term from net transfer to supplied work and dissipation on both sides
+leaves the total mechanical residual unchanged.
+
+The existing trajectory, binary, physical parameters, CSV values and 5%
+mechanical monitoring threshold are unchanged. A separately versioned
+controller may review the sealed monitor's legacy warning while keeping
+that monitor and its original output intact. Mechanical proxy closure,
+force convergence and acoustic passivity are distinct validation claims.
+The work identities remain necessary checks of bookkeeping, not sufficient
+proof of physically correct energy storage, impermeability or fracture.

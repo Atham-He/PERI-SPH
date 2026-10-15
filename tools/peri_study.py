@@ -16,7 +16,7 @@ from peri_run import digest, parameters, verify, require_completion_audit
 def save(path, value):
     path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     if path.name == "study.json":
-        fields = ("status", "active_case", "failed_case", "pending_case", "reason", "return_code", "source_git_head")
+        fields = ("status", "active_case", "failed_case", "pending_case", "reason", "return_code", "source_git_head", "audit_file", "audit_source_git_head", "controller_overlay_path")
         summary = {key: value[key] for key in fields if key in value}
         summary["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
         (path.parent / "status.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
@@ -40,7 +40,7 @@ def plan(args):
     frozen.mkdir()
     for name in ("src", "cmake", "tests/3d_examples/extra_3d_PD_capsule_compression"):
         shutil.copytree(repo / name, frozen / name)
-    for name in ("CMakeLists.txt", "PERI_SPH_FRAMEWORK.txt", "PERI_SPH_VALIDATION.txt", "PERI_SPH_VERSION.txt", "UPSTREAM_SYNC.md"):
+    for name in ("CMakeLists.txt", "PERI_SPH_FRAMEWORK.txt", "PERI_SPH_VALIDATION.txt", "PERI_SPH_VERSION.txt", "UPSTREAM_SYNC.md", "ACOUSTIC_WORK_AUDIT.txt"):
         shutil.copy2(repo / name, frozen / name)
     (frozen / "tools").mkdir()
     for script in (repo / "tools").glob("peri_*.py"):
@@ -149,7 +149,8 @@ def compare_group(root, data, names, group):
     result["accepted"] = (result["adjacent_difference_within_tolerance"] and
                           all(result["refinement_difference_trend"].values()) and
                           result["energy_monitoring_passed"])
-    result["limits"] = "three-level differences with a provisional tolerance; not a formal asymptotic order or experimental validation"
+    result["acoustic_passivity_certified"] = all(audit.get("acoustic_work_assessment",{}).get("dissipation_sign_checked",False) for audit in audits.values())
+    result["limits"] = "three-level differences and provisional mechanical proxy monitoring; not a formal asymptotic order, experimental validation or an acoustic passivity certificate for legacy budgets without separated boundary work"
     save(root / (group + "_comparison.json"), result)
     return result
 

@@ -134,6 +134,36 @@ def scan_vtp(path, require_full_precision=True):
     return result
 
 
+def acoustic_work_assessment(energy):
+    """Grad-div components share one divergence; their signs are not passivity tests.
+
+    Legacy wall work excludes prescribed rigid-wall input. Only a separately
+    recorded boundary work permits testing the combined acoustic dissipation.
+    Keep the raw signed work and every negative component visible for review.
+    """
+    observations, losses, flags = [], [], []
+    boundary_recorded = all("acoustic_boundary_work_J" in row for row in energy)
+    for row in energy:
+        scale = max(abs(row["kinetic_J"]), abs(row["gravity_potential_change_J"]),
+                    abs(sum(row[key] for key in ("plate_contact_work_J", "plate_fluid_pressure_work_J", "plate_fluid_viscous_work_J")) + row.get("acoustic_boundary_work_J",0)), 1e-30)
+        tolerance = max(1e-24, 1e-3*scale)
+        for key in ("acoustic_inner_signed_loss_J", "acoustic_wall_signed_loss_J"):
+            if row[key] < -tolerance:
+                observations.append({"time_s":row["time_s"],"term":key,"value_J":row[key]})
+        net = row["acoustic_inner_signed_loss_J"] + row["acoustic_wall_signed_loss_J"]
+        if boundary_recorded:
+            loss = net + row["acoustic_boundary_work_J"]
+            losses.append(loss)
+            if loss < -tolerance:
+                flags.append({"time_s":row["time_s"],"term":"acoustic_combined_dissipation_J","value_J":loss})
+    return {"boundary_work_recorded":boundary_recorded,
+            "dissipation_sign_checked":boundary_recorded,
+            "signed_net_transfer_last_J":energy[-1]["acoustic_inner_signed_loss_J"]+energy[-1]["acoustic_wall_signed_loss_J"],
+            "combined_dissipation_last_J":losses[-1] if losses else None,
+            "negative_component_observations":observations,
+            "interpretation":"legacy acoustic columns are signed work transfers; separate component signs do not establish energy injection; prescribed boundary work is required for a combined dissipation sign test"}, flags
+
+
 def inspect(run_dir, snapshots=False, stale_seconds=180):
     output = run_dir / "output"
     config = parameters(output / "effective_parameters.cfg")
@@ -169,11 +199,11 @@ def inspect(run_dir, snapshots=False, stale_seconds=180):
     closure = max(abs(row["mechanical_residual_relative"]) for row in energy)
     if closure > 0.05:
         warnings.append("mechanical residual exceeds provisional 5% monitoring level")
-    negative_losses = []
+    acoustic_assessment, negative_losses = acoustic_work_assessment(energy)
     for row in energy:
         row_scale = max(abs(row["kinetic_J"]),abs(row["gravity_potential_change_J"]),
-                        abs(row["plate_contact_work_J"]+row["plate_fluid_pressure_work_J"]+row["plate_fluid_viscous_work_J"]),1e-30)
-        for key in ("pd_damping_signed_loss_J","acoustic_inner_signed_loss_J","acoustic_wall_signed_loss_J","viscous_signed_loss_J","friction_signed_loss_J"):
+                        abs(row["plate_contact_work_J"]+row["plate_fluid_pressure_work_J"]+row["plate_fluid_viscous_work_J"]+row.get("acoustic_boundary_work_J",0)),1e-30)
+        for key in ("pd_damping_signed_loss_J","viscous_signed_loss_J","friction_signed_loss_J"):
             if row[key] < -max(1e-24,1e-3*row_scale):
                 negative_losses.append({"time_s":row["time_s"],"term":key,"value_J":row[key]})
     if negative_losses:
@@ -212,6 +242,7 @@ def inspect(run_dir, snapshots=False, stale_seconds=180):
               "density_error_max":max(row["fluid_density_error_max"] for row in diagnostic),
               "mechanical_residual_max_relative":closure,"mechanical_residual_last_J":energy[-1]["mechanical_residual_J"],
               "kinetic_identity_max_absolute_J":identity,"negative_loss_flags":negative_losses,"warnings":warnings,
+              "acoustic_work_assessment":acoustic_assessment,
               "scope":"sampled running diagnostics only; does not certify full-stroke completion, convergence, shell impermeability or calibrated fracture-energy closure"}
     if snapshots:
         body_specs=[("CapsuleShell","shell_mass_kg","shell_count")]
@@ -244,6 +275,7 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir",type=Path,required=True)
     parser.add_argument("--snapshots",action="store_true")
+    parser.add_argument("--output",type=Path,help="write a separate review without overwriting the sealed monitor's live audit")
     parser.add_argument("--strict",action="store_true",help="fail on monitoring warnings, for controlled regression cases")
     parser.add_argument("--stale-seconds",type=float,default=180)
     args=parser.parse_args()
@@ -251,7 +283,8 @@ def main():
         result=inspect(args.run_dir.resolve(),args.snapshots,args.stale_seconds)
     except (OSError,ValueError,KeyError,expat.ExpatError) as exc:
         result={"status":"failed","checked_at_utc":datetime.now(timezone.utc).isoformat(),"reason":str(exc)}
-    (args.run_dir/"live_audit.json").write_text(json.dumps(result,indent=2,allow_nan=False)+"\n",encoding="utf-8")
+    destination=args.output if args.output is not None else args.run_dir/"live_audit.json"
+    destination.write_text(json.dumps(result,indent=2,allow_nan=False)+"\n",encoding="utf-8")
     print(json.dumps(result,indent=2,allow_nan=False))
     return 1 if result["status"]=="failed" or (args.strict and result["status"]=="needs_attention") else 0
 

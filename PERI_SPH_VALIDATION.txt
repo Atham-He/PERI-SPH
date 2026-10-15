@@ -169,7 +169,7 @@ all official full-stroke and refinement cases use the corrected sealed version.
 Completion audit acceptance
 A completed solver process is only eligible for the next study case or for
 convergence comparison if require_completion_audit confirms full-stroke
-completion and sampled_checks_passed. Negative signed-loss or mechanical
+completion and sampled_checks_passed. Unambiguous negative dissipation or mechanical
 budget warnings are retained in completion_audit.json and stop the queue;
 they cannot be bypassed by a small total residual or matching force curves.
 Live warnings remain diagnostic so their cause can be assessed while the
@@ -177,3 +177,20 @@ current trajectory continues. A queue-controller update may adopt a running
 solver after checking process identity; it must retain the sealed physics
 source, binary, configuration and their hashes and record controller changes
 separately. An audit-only controller update does not restart integration.
+
+Acoustic work interpretation (2026-10-16)
+The legacy acoustic_inner_signed_loss_J and acoustic_wall_signed_loss_J
+columns are signed kinetic-work transfers, despite their historical names.
+They share the total velocity divergence; neither component is separately
+negative semidefinite. The wall column also omits prescribed rigid-wall
+boundary input. Its negative sign alone is not proof of artificial energy.
+The audit retains negative acoustic components as observations and explicitly
+reports dissipation_sign_checked=false when acoustic_boundary_work_J is
+absent. If that boundary work is recorded, the sign check applies to the
+combined inner + wall + boundary work, rather than either component.
+PD damping, viscosity, friction, non-finite state, mass, kinetic identities
+and the 5% mechanical proxy threshold keep their previous acceptance rules.
+A convergence result separately records acoustic_passivity_certified; this
+remains false for legacy budgets. Matching curves and a small proxy residual
+do not certify acoustic passivity or full thermodynamic closure. See
+ACOUSTIC_WORK_AUDIT.txt for equations and a controlled counterexample.

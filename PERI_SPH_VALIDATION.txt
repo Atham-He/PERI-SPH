@@ -1,0 +1,112 @@
+PERI-SPH original-size capsule validation workflow (2026-10-15)
+
+Current scope
+The original model is a 1 mm outer-diameter capsule with a 20 um shell,
+three shell particle layers, a 0.58 mm plate stroke and 0.1 m/s plate speed.
+The full physical duration is 5.8 ms. A completed smoke test does not validate
+this full trajectory. Full-run results and refinement acceptance are stored
+in the study directory, not inferred from a successful build or initialization.
+
+Corrections motivated by the energy audit
+The capsule now uses RigidBoxContactforPD for both finite translating plates.
+Its normal force is the negative gradient of the recorded penalty potential,
+including faces, edges and corners. The particle contact radius is dp/2,
+k_i = ContactStiffness * V_i / dp^2, and U_i = k_i*penetration^2/2.
+The same force gives the plate reaction and the boundary power. The contact
+is evaluated at every PD position midpoint, rather than held fixed across
+an entire fluid exchange. The old kernel contact remains available through
+analytic_plate_contact=false; it has no validated potential-energy closure.
+
+The default pd_pressure_acceleration_factor=0 removes acceleration pressure
+extrapolation on deforming PD walls in both directions. Motion, actual
+AverageVelocity and AverageAcceleration remain recorded. Non-PD rigid walls
+retain the upstream acceleration extrapolation. Factor=1 restores the old
+PD extrapolation for diagnosis. A constant-pressure interface unit test checks
+net force balance and pressure-work/density-flux conjugacy at factor=0.
+No material, density, viscosity, loading rate or physical size was changed.
+
+Mass budget
+mass_budget.csv records both particle inventories, per-particle mass changes,
+shell/fluid/total mass, sum(rho*V)-sum(m), fluid volume, and liquid mass outside
+the computational bounds. No escaping or disconnected particle is removed
+from this inventory. A constant global particle mass is not proof that the
+shell is impermeable. Dynamic shell leakage needs an independently defined
+geometric enclosure and must not be inferred from this mass test alone.
+
+Energy budget (all SI)
+energy_budget.csv records per-step contact boundary work, fluid pressure and
+viscous work on the upper plate, kinetic energy, gravity-potential change,
+linear-EOS compression storage, shell stress-compliance storage proxy,
+analytic contact penalty storage, total plastic work, physical viscous signed
+loss, regularized contact-friction signed loss, PD/acoustic signed losses,
+and hourglass signed transfer. Positive signed loss removes mechanical energy;
+negative values are retained as evidence of energy creation, never clipped.
+Acoustic wall loss includes the shell-side counterforce work.
+The shell stress-compliance proxy is J*V0*(dev(sigma):dev(sigma)/(4G)
++ tr(sigma)^2/(18K)). Hughes-Winget hypoelasticity has no general exact finite-
+strain potential here; the field is explicitly a proxy. Plastic work includes
+hardening and rate dependence and is not labelled as heat. No calibrated
+fracture energy has been implemented; changes from bond failure remain in the
+unclosed mechanical residual. Hourglass work is measured rather than assigned
+an invented storage potential. Riemann and splitting defects also remain in
+that residual. Thus a small residual is useful evidence, not a thermodynamic
+validation of the fracture model.
+
+The separate kinetic-work identities use every actual velocity kick and its
+midpoint velocity, including both additional acoustic kicks. These identities
+must close to roundoff. They verify accounting and force units independently
+of the mechanical storage proxy. A small kinetic identity error does not imply
+a small global mechanical residual.
+
+Original-size study
+1. Build extra_3d_PD_capsule_compression and extra_3d_PD_framework_tests.
+2. Run ctest --test-dir build -L peri_fast --output-on-failure.
+3. Run python3 -m unittest discover -s tools -p test_peri_study.py -v.
+4. Create a new sealed study directory:
+   python3 tools/peri_study.py plan --root build/peri_validation/STUDY_ID 
+     --config tests/3d_examples/extra_3d_PD_capsule_compression/configs/full_capsule.cfg
+     --executable build/tests/3d_examples/extra_3d_PD_capsule_compression/bin/extra_3d_PD_capsule_compression
+5. Run its sequential queue:
+   python3 tools/peri_study.py run --root build/peri_validation/STUDY_ID
+     --memory-limit-gib 15 --baseline-memory-gib 13
+
+The plan seals a complete source copy, executable, config hashes, Git HEAD and
+patch. It starts the full baseline first, then halves both solid/acoustic CFL
+at fixed particle geometry (dt_half, dt_quarter). It compares the full-stroke
+reaction-curve relative L2 difference, peak reaction, total plate work and
+final mean damage. A partial or failed run cannot be used as a reference.
+The provisional screening tolerance is 5%, including the energy monitoring
+level. This is an engineering gate, not a formal asymptotic error estimate.
+The three/four/five-layer spatial groups hold the physical PD horizon at
+20.1 um. Fluid and plate spacing refine with shell spacing. The spatial groups
+therefore test particle quadrature at a fixed nonlocal length; the code does
+not silently shrink the horizon and call that pure discretization convergence.
+The dt_quarter three-layer case is reused as the spatial baseline.
+
+Spatial runs require the time/energy gate to pass. A conservative memory screen
+uses measured baseline RSS times refinement ratio^6 because fixed-horizon
+neighborhood counts also grow with refinement. This is a screening upper
+estimate, not a measured refined-case requirement. Move the sealed study to
+a larger Linux node and profile refined initialization for an exact estimate.
+A moved frozen executable requires compatible runtime libraries. If the target
+node needs a rebuild, create a new study from the same source and rerun the
+group; different executable hashes are never mixed in one convergence table.
+The queue stops on numerical failure, a failed time/energy gate or the memory
+screen. It never silently coarsens the geometry, increases loading speed,
+relaxes density/Mach limits or starts concurrent large jobs.
+
+Runtime and interruption
+An original-size 2 us cost pilot used 203608 shell and 463051 fluid particles,
+about 12.9 GiB peak RSS, and 100.73 s wall time before these final corrections.
+An updated audit pilot completed 2 us with maximum density deviation 1.24e-8,
+zero inventory mass error, maximum mechanical residual 3.67e-5 and kinetic
+identity residual 4.70e-30 J. It used 13.0 GiB peak RSS and 134.42 s wall time
+while smoke tests shared the CPU; the timed integration/output portion was
+87.04 s. These are small-deformation data before plate contact.
+The full trajectory is a many-hour to multi-day calculation on this workstation;
+the 2 us pilot is not evidence of large-compression stability. Updated cost
+pilots and logs remain in build/peri_validation. progress.csv is flushed about
+every 30 seconds during accepted increments. Full fields and budget rows are
+written at the configured output frames. PD bond/internal-variable restart is
+not yet implemented: an interrupted simulation cannot resume from its VTP.
+A completed case may be reused by the study queue; a partial one is rejected.

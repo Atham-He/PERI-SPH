@@ -98,7 +98,8 @@ class ContactRepulsionFromWallforPD : public LocalDynamics, public DataDelegateC
     Real *Vol_;
     Real *repulsion_factor_;
     Vecd *acc_prior_;
-    Vecd *repulsion_force_;
+    Vecd *repulsion_force_, *friction_force_;
+    Real *boundary_power_, *friction_boundary_power_;
     StdVec<Real *> contact_Vol_;
 };
 
@@ -127,6 +128,50 @@ class ContactRepulsionToWallforPD : public LocalDynamics, public DataDelegateCon
     StdVec<Solid *> contact_solids_;
     StdVec<Real *> contact_Vol_;
     StdVec<Real *> contact_repulsion_factor_;
+};
+
+/** Signed distance and outward normal for an axis-aligned rigid box. */
+inline std::pair<Real, Vecd> rigidBoxDistance(const Vecd &position, const Vecd &center, const Vecd &half_size)
+{
+    Vecd local = position - center;
+    Vecd q = local.cwiseAbs() - half_size;
+    Vecd outside = q.cwiseMax(Vecd::Zero());
+    Real length = outside.norm();
+    Vecd normal = Vecd::Zero();
+    if (length > 0)
+    {
+        for (int d = 0; d < Dimensions; ++d) normal[d] = (local[d] >= 0 ? 1 : -1) * outside[d] / length;
+        return {length, normal};
+    }
+    Eigen::Index axis; Real distance = q.maxCoeff(&axis);
+    normal[axis] = local[axis] >= 0 ? 1 : -1;
+    return {distance, normal};
+}
+
+/** Conservative normal penalty against translating finite rigid boxes.
+ * The particle's contact radius is dp/2, k_i=ContactStiffness*V_i/dp^2.
+ * U_i=0.5*k_i*max(dp/2-signed_distance,0)^2. The force is -grad(U).
+ * The source acceleration, box reaction, boundary work and regularized
+ * Coulomb friction are computed from the same pair force. Rotating boxes
+ * require a separate motion implementation.
+ */
+class RigidBoxContactforPD : public LocalDynamics
+{
+  public:
+    RigidBoxContactforPD(SPHBody &body, Real friction_mu=0, Real friction_veps=1e-3);
+    size_t addBox(const std::string &name, const Vecd &center, const Vecd &half_size, const Vecd &velocity=Vecd::Zero());
+    void setKinematics(size_t box, const Vecd &center, const Vecd &velocity);
+    void applyToCurrentAcceleration(bool value) {current_acceleration_ = value;}
+    void applyAcceleration(bool value) {apply_acceleration_ = value;}
+    void update(size_t i, Real dt=0);
+  protected:
+    struct Box {Vecd center, half_size, velocity; Vecd *reaction;};
+    StdVec<Box> boxes_;
+    bool current_acceleration_ = false, apply_acceleration_ = true;
+    Real spacing_, stiffness_, rho0_, mu_, veps_;
+    Vecd *acceleration_;
+    Vecd *position_, *velocity_, *prior_, *force_, *friction_;
+    Real *volume_, *energy_, *boundary_power_, *friction_boundary_power_;
 };
 } // namespace solid_dynamics
 } // namespace SPH

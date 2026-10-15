@@ -235,7 +235,8 @@ NosbPDSecondStepPlastic::
       PK1_(particles_->getVariableDataByName<Matd>("PDPK1")),
       T0_(particles_->getVariableDataByName<Matd>("PDForceStateT0")),
       stress_(particles_->getVariableDataByName<Matd>("PDStress")),
-      plastic_strain_(particles_->registerStateVariableData<Matd>("PlasticStrain")) {}
+      plastic_strain_(particles_->registerStateVariableData<Matd>("PlasticStrain")),
+      plastic_work_(particles_->getVariableDataByName<Real>("PlasticWork")) {}
 //=================================================================================================//
 void NosbPDSecondStepPlastic::interaction(size_t index_i, Real dt)
 {
@@ -309,8 +310,15 @@ void NosbPDSecondStepPlastic::update(size_t index_i, Real dt)
         /** return-mapping (convex cutting-plane) with Hughes-Winget objectivity;
          * dt passed so that rate-dependent (visco-plastic) materials can
          * evaluate the overstress term. */
+        Matd skew = 0.5 * (G - G.transpose());
+        Matd Q = Matd::Identity() + (Matd::Identity() - 0.5 * skew).inverse() * skew;
+        Matd rotated_plastic = Q * plastic_strain_[index_i] * Q.transpose();
         stress_[index_i] = plastic_solid_.
             PlasticConstitutiveRelation(G, stress_[index_i], plastic_strain_[index_i], index_i, dt);
+        // End-point stress plastic work includes hardening and rate dependence;
+        // it is not labelled as heat or as a calibrated fracture energy.
+        plastic_work_[index_i] += Vol_[index_i] * detF *
+            stress_[index_i].cwiseProduct(plastic_strain_[index_i] - rotated_plastic).sum();
         /** PK1: the first Piola-Kirchhoff stress tensor */
         Matd PK1 = detF * F_1_[index_i] * stress_[index_i];
         PK1_[index_i] = PK1.transpose();
@@ -420,8 +428,9 @@ BondBreakByPlasticStrain::
 //=================================================================================================//
 bool BondBreakByPlasticStrain::checkBondLive(Matd &plastic_strain_eq, Real &stretch_rate)
 {
-    Real val_eq = principalValues(plastic_strain_eq).maxCoeff();
-    return !(val_eq > critical_value_ || stretch_rate > 1.0);
+    if (stretch_rate > 1.0) return false;
+    if (plastic_strain_eq.squaredNorm() <= critical_value_ * critical_value_) return true;
+    return principalValues(plastic_strain_eq).maxCoeff() <= critical_value_;
 }
 //=================================================================================================//
 void BondBreakByPlasticStrain::interaction(size_t index_i, Real dt)
@@ -461,13 +470,15 @@ NosbPDThirdStep::
       particleLive_(particles_->getVariableDataByName<int>("ParticleLive")),
       Vol_(particles_->getVariableDataByName<Real>("VolumetricMeasure")),
       acc_(particles_->registerStateVariableData<Vecd>("PDAcceleration")),
-      T0_(particles_->getVariableDataByName<Matd>("PDForceStateT0"))
+      T0_(particles_->getVariableDataByName<Matd>("PDForceStateT0")),
+      internal_force_(particles_->getVariableDataByName<Vecd>("PDInternalForce"))
 {
     rho0_ = hw_solid_.ReferenceDensity();
 }
 //=================================================================================================//
 void NosbPDThirdStep::interaction(size_t index_i, Real dt)
 {
+    internal_force_[index_i].setZero();
     if (particleLive_[index_i] == 1)
     {
         Vecd acceleration = Vecd::Zero();
@@ -487,6 +498,7 @@ void NosbPDThirdStep::interaction(size_t index_i, Real dt)
             }
         }
         acc_[index_i] += acceleration / rho0_;
+        internal_force_[index_i] = acceleration * Vol_[index_i];
     }
 }
 //=================================================================================================//
@@ -495,10 +507,37 @@ NosbPDFourthStep::NosbPDFourthStep(SPHBody &sph_body)
       particleLive_(particles_->getVariableDataByName<int>("ParticleLive")),
       pos_(particles_->getVariableDataByName<Vecd>("Position")),
       vel_(particles_->registerStateVariableData<Vecd>("Velocity")),
-      acc_(particles_->registerStateVariableData<Vecd>("PDAcceleration")) {}
+      acc_(particles_->registerStateVariableData<Vecd>("PDAcceleration")),
+      mass_(particles_->getVariableDataByName<Real>("Mass")),
+      prior_(particles_->getVariableDataByName<Vecd>("PDAccelerationPrior")),
+      internal_(particles_->getVariableDataByName<Vecd>("PDInternalForce")),
+      hg_(particles_->getVariableDataByName<Vecd>("HourglassForce")),
+      damping_(particles_->getVariableDataByName<Vecd>("PDNumericalDampingForce")),
+      viscous_(particles_->getVariableDataByName<Vecd>("ViscousForceFromFluid")),
+      friction_(particles_->getVariableDataByName<Vecd>("ContactFrictionForce")),
+      acoustic_(particles_->getVariableDataByName<Vecd>("AcousticDampingForceFromFluid")),
+      internal_work_(particles_->getVariableDataByName<Real>("PDInternalWork")),
+      external_work_(particles_->getVariableDataByName<Real>("PDExternalWork")),
+      hg_work_(particles_->getVariableDataByName<Real>("PDHourglassWork")),
+      damping_work_(particles_->getVariableDataByName<Real>("PDDampingWork")),
+      viscous_work_(particles_->getVariableDataByName<Real>("ShellViscousWork")),
+      acoustic_work_(particles_->getVariableDataByName<Real>("ShellAcousticWallWork")),
+      boundary_power_(particles_->getVariableDataByName<Real>("ContactBoundaryPower")),
+      friction_boundary_power_(particles_->getVariableDataByName<Real>("ContactFrictionBoundaryPower")),
+      boundary_work_(particles_->getVariableDataByName<Real>("ContactBoundaryWork")),
+      friction_loss_(particles_->getVariableDataByName<Real>("ContactFrictionLoss")) {}
 //=================================================================================================//
 void NosbPDFourthStep::update(size_t index_i, Real dt)
 {
+    Vecd displacement = dt * (vel_[index_i] + 0.5 * dt * acc_[index_i]);
+    internal_work_[index_i] += internal_[index_i].dot(displacement);
+    external_work_[index_i] += (mass_[index_i] * acc_[index_i] - internal_[index_i] - hg_[index_i] - damping_[index_i]).dot(displacement);
+    hg_work_[index_i] += hg_[index_i].dot(displacement);
+    damping_work_[index_i] += damping_[index_i].dot(displacement);
+    viscous_work_[index_i] += viscous_[index_i].dot(displacement);
+    acoustic_work_[index_i] += acoustic_[index_i].dot(displacement);
+    boundary_work_[index_i] += dt * boundary_power_[index_i];
+    friction_loss_[index_i] += dt * friction_boundary_power_[index_i] - friction_[index_i].dot(displacement);
     vel_[index_i] += acc_[index_i] * dt;
     /** NaN fuse (second fence): velocity is checked immediately after the
      * integration so a poisoned value can never reach the position or the
@@ -572,7 +611,8 @@ PairNumericalDampingforPD::
       pos_(particles_->getVariableDataByName<Vecd>("Position")),
       vel_(particles_->registerStateVariableData<Vecd>("Velocity")),
       acc_(particles_->registerStateVariableData<Vecd>("PDAcceleration")),
-      F_(particles_->registerStateVariableData<Matd>("DeformationGradient", IdentityMatrix<Matd>::value))
+      F_(particles_->registerStateVariableData<Matd>("DeformationGradient", IdentityMatrix<Matd>::value)),
+      damping_force_(particles_->getVariableDataByName<Vecd>("PDNumericalDampingForce"))
 {
     rho0_ = hw_solid_.ReferenceDensity();
     c0_ = hw_solid_.ReferenceSoundSpeed();
@@ -583,6 +623,7 @@ PairNumericalDampingforPD::
 //=================================================================================================//
 void PairNumericalDampingforPD::interaction(size_t index_i, Real dt)
 {
+    damping_force_[index_i].setZero();
     if (particleLive_[index_i] == 1)
     {
         Vecd damping_force = Vecd::Zero();
@@ -608,6 +649,7 @@ void PairNumericalDampingforPD::interaction(size_t index_i, Real dt)
             }
         }
         acc_[index_i] += damping_force / rho0_;
+        damping_force_[index_i] = damping_force * Vol_[index_i];
     }
 }
 //=================================================================================================//

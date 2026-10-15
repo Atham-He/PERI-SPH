@@ -140,6 +140,7 @@ class NosbPDSecondStepPlastic : public LocalDynamics, public DataDelegateInner
     Matd *N_, *N_deltaU_, *N_half_;
     Matd *F_half_, *F_delta_, *F_1_, *F_1_half_;
     Matd *PK1_, *T0_, *stress_, *plastic_strain_;
+    Real *plastic_work_;
 };
 
 /**
@@ -249,7 +250,7 @@ class NosbPDThirdStep : public LocalDynamics, public DataDelegateInner
     Real rho0_;
     int *particleLive_;
     Real *Vol_;
-    Vecd *acc_;
+    Vecd *acc_, *internal_force_;
     Matd *T0_;
 };
 
@@ -268,6 +269,10 @@ class NosbPDFourthStep : public LocalDynamics
   protected:
     int *particleLive_;
     Vecd *pos_, *vel_, *acc_;
+    Real *mass_;
+    Vecd *prior_, *internal_, *hg_, *damping_, *viscous_, *friction_, *acoustic_;
+    Real *internal_work_, *external_work_, *hg_work_, *damping_work_, *viscous_work_, *acoustic_work_;
+    Real *boundary_power_, *friction_boundary_power_, *boundary_work_, *friction_loss_;
 };
 
 /**
@@ -313,7 +318,7 @@ class PairNumericalDampingforPD : public LocalDynamics, public DataDelegateInner
     Real rho0_, c0_, numerical_dissipation_factor_, smoothing_length_, inv_W0_;
     int *particleLive_;
     Real *Vol_;
-    Vecd *pos_, *vel_, *acc_;
+    Vecd *pos_, *vel_, *acc_, *damping_force_;
     Matd *F_;
 };
 } // namespace solid_dynamics

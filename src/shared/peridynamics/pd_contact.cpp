@@ -68,7 +68,10 @@ ContactRepulsionFromWallforPD::
       Vol_(particles_->getVariableDataByName<Real>("VolumetricMeasure")),
       repulsion_factor_(particles_->getVariableDataByName<Real>("RepulsionFactor")),
       acc_prior_(particles_->registerStateVariableData<Vecd>("PDAccelerationPrior")),
-      repulsion_force_(particles_->registerStateVariableData<Vecd>("ContactRepulsionFromWall"))
+      repulsion_force_(particles_->registerStateVariableData<Vecd>("ContactRepulsionFromWall")),
+      friction_force_(particles_->getVariableDataByName<Vecd>("ContactFrictionForce")),
+      boundary_power_(particles_->getVariableDataByName<Real>("ContactBoundaryPower")),
+      friction_boundary_power_(particles_->getVariableDataByName<Real>("ContactFrictionBoundaryPower"))
 {
     if (!std::isfinite(friction_mu_) || friction_mu_ < 0.0 || !std::isfinite(friction_veps_) || friction_veps_ <= 0.0)
         throw std::invalid_argument("PD contact: finite non-negative friction and positive regularization speed required");
@@ -87,6 +90,8 @@ ContactRepulsionFromWallforPD::
 //=================================================================================================//
 void ContactRepulsionFromWallforPD::interaction(size_t index_i, Real dt)
 {
+    friction_force_[index_i].setZero();
+    boundary_power_[index_i] = friction_boundary_power_[index_i] = 0;
     Real pressure = repulsion_factor_[index_i] * contact_stiffness_;
     Vecd force = Vecd::Zero();
     for (size_t k = 0; k < contact_configuration_.size(); ++k)
@@ -96,7 +101,11 @@ void ContactRepulsionFromWallforPD::interaction(size_t index_i, Real dt)
         {
             size_t j = neighbors.j_[n];
             Vecd normal_force = -2.0 * pressure * Vol_[index_i] * neighbors.e_ij_[n] * neighbors.dW_ij_[n] * contact_Vol_[k][j];
-            force += pdContactPairForce(normal_force, vel_[index_i] - contact_velocity_[k][j], contact_normal_[k][j], friction_mu_, friction_veps_);
+            Vecd pair = pdContactPairForce(normal_force, vel_[index_i] - contact_velocity_[k][j], contact_normal_[k][j], friction_mu_, friction_veps_);
+            force += pair;
+            friction_force_[index_i] += pair - normal_force;
+            boundary_power_[index_i] += pair.dot(contact_velocity_[k][j]);
+            friction_boundary_power_[index_i] += (pair - normal_force).dot(contact_velocity_[k][j]);
         }
     }
     repulsion_force_[index_i] = force;
@@ -145,5 +154,64 @@ void ContactRepulsionToWallforPD::interaction(size_t index_i, Real dt)
     repulsion_force_[index_i] = force;
 }
 //=================================================================================================//
+
+RigidBoxContactforPD::RigidBoxContactforPD(SPHBody &body, Real friction_mu, Real friction_veps)
+    : LocalDynamics(body), spacing_(body.getSPHAdaptation().ReferenceSpacing()),
+      stiffness_(DynamicCast<HughesWingetSolid>(this, body.getMatterMaterial()).ContactStiffness()),
+      rho0_(DynamicCast<HughesWingetSolid>(this, body.getMatterMaterial()).ReferenceDensity()),
+      mu_(friction_mu), veps_(friction_veps),
+      position_(particles_->getVariableDataByName<Vecd>("Position")),
+      velocity_(particles_->registerStateVariableData<Vecd>("Velocity")),
+      prior_(particles_->registerStateVariableData<Vecd>("PDAccelerationPrior")),
+      force_(particles_->registerStateVariableData<Vecd>("ContactRepulsionFromWall")),
+      friction_(particles_->getVariableDataByName<Vecd>("ContactFrictionForce")),
+      volume_(particles_->getVariableDataByName<Real>("VolumetricMeasure")),
+      energy_(particles_->registerStateVariableData<Real>("AnalyticContactEnergy")),
+      boundary_power_(particles_->getVariableDataByName<Real>("ContactBoundaryPower")),
+      friction_boundary_power_(particles_->getVariableDataByName<Real>("ContactFrictionBoundaryPower"))
+{
+    acceleration_ = particles_->registerStateVariableData<Vecd>("PDAcceleration");
+    if (!std::isfinite(mu_) || mu_ < 0 || !std::isfinite(veps_) || veps_ <= 0)
+        throw std::invalid_argument("RigidBoxContactforPD: invalid friction parameters");
+}
+
+size_t RigidBoxContactforPD::addBox(const std::string &name, const Vecd &center, const Vecd &half_size, const Vecd &velocity)
+{
+    if (!center.allFinite() || !half_size.allFinite() || !velocity.allFinite() || half_size.minCoeff() <= 0)
+        throw std::invalid_argument("RigidBoxContactforPD: invalid box geometry or motion");
+    auto *reaction = particles_->registerStateVariableData<Vecd>(name + "Reaction");
+    boxes_.push_back({center, half_size, velocity, reaction});
+    return boxes_.size()-1;
+}
+
+void RigidBoxContactforPD::setKinematics(size_t box, const Vecd &center, const Vecd &velocity)
+{
+    if (!center.allFinite() || !velocity.allFinite()) throw std::invalid_argument("non-finite rigid-box motion");
+    boxes_.at(box).center = center; boxes_.at(box).velocity = velocity;
+}
+
+void RigidBoxContactforPD::update(size_t i, Real)
+{
+    force_[i].setZero(); friction_[i].setZero();
+    energy_[i] = boundary_power_[i] = friction_boundary_power_[i] = 0;
+    Real k = stiffness_ * volume_[i] / (spacing_ * spacing_);
+    for (auto &box : boxes_)
+    {
+        box.reaction[i].setZero();
+        auto geometry = rigidBoxDistance(position_[i], box.center, box.half_size);
+        Real penetration = std::max(0.5 * spacing_ - geometry.first, Real(0));
+        if (penetration == 0) continue;
+        Vecd normal_force = k * penetration * geometry.second;
+        Vecd pair_force = pdContactPairForce(normal_force, velocity_[i]-box.velocity, geometry.second, mu_, veps_);
+        Vecd friction = pair_force-normal_force;
+        force_[i] += pair_force; friction_[i] += friction;
+        box.reaction[i] = -pair_force;
+        energy_[i] += 0.5 * k * penetration * penetration;
+        boundary_power_[i] += pair_force.dot(box.velocity);
+        friction_boundary_power_[i] += friction.dot(box.velocity);
+    }
+    if (apply_acceleration_)
+        (current_acceleration_ ? acceleration_[i] : prior_[i]) += force_[i] / (rho0_ * volume_[i]);
+}
 } // namespace solid_dynamics
 } // namespace SPH

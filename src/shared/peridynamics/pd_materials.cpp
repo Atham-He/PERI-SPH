@@ -69,6 +69,13 @@ void HughesWingetSolid::initializeLocalParameters(BaseParticles *base_particles)
     base_particles->registerStateVariableData<int>("NumericalFailureReason", 0);
     base_particles->addVariableToWrite<int>("NumericalFailureReason");
     base_particles->addEvolvingVariable<int>("NumericalFailureReason");
+    for (const char *name : {"PDInternalForce", "PDNumericalDampingForce", "HourglassForce",
+                             "ContactFrictionForce", "ViscousForceFromFluid", "AcousticDampingForceFromFluid"})
+        base_particles->registerStateVariableData<Vecd>(name);
+    for (const char *name : {"PDInternalWork", "PDExternalWork", "PDHourglassWork", "PDDampingWork",
+                             "ShellViscousWork", "ContactBoundaryWork", "ContactFrictionLoss",
+                             "ContactBoundaryPower", "ContactFrictionBoundaryPower", "PlasticWork", "ShellAcousticWallWork"})
+        base_particles->registerStateVariableData<Real>(name);
     /** bond state: 1 = particle effective, 0 = free particle (all bonds broken) */
     base_particles->registerStateVariableData<int>("ParticleLive", [&](size_t i) -> int
                                                    { return 1; });

@@ -31,6 +31,7 @@
 #include "pd_materials.h"
 #include "riemann_solver.h"
 #include "adaptation.h"
+#include "fluid_integration.hpp"
 
 namespace SPH
 {
@@ -76,6 +77,31 @@ class ContactRelationSelectKernel : public ContactRelationCrossResolution
 };
 namespace fluid_dynamics
 {
+/** Wall pressure extrapolation is an explicit numerical control, shared by
+ * the fluid and the reverse PD traction. factor=1 reproduces upstream;
+ * factor=0 omits it on PD walls without altering wall motion. Rigid
+ * non-PD walls retain the upstream factor=1.
+ */
+class PressureWallTermsforPD : public Integration1stHalf<Contact<Wall>, AcousticRiemannSolver, NoKernelCorrection>
+{
+  public:
+    PressureWallTermsforPD(BaseContactRelation &relation, Real factor);
+    void interaction(size_t i, Real dt=0);
+  protected:
+    StdVec<Real> acceleration_factors_;
+};
+class Integration1stHalfWithWallforPD : public Integration1stHalfInnerRiemann
+{
+  public:
+    Integration1stHalfWithWallforPD(BaseInnerRelation &inner, BaseContactRelation &walls, Real factor=1)
+        : Integration1stHalfInnerRiemann(inner), wall_terms_(walls, factor) {}
+    void interaction(size_t i, Real dt=0)
+    {
+        Integration1stHalfInnerRiemann::interaction(i,dt); wall_terms_.interaction(i,dt);
+    }
+  protected:
+    PressureWallTermsforPD wall_terms_;
+};
 /**
  * @class VelocityDivergenceInner
  * @brief Velocity divergence of fluid particles from inner interactions,
@@ -138,7 +164,7 @@ class AcousticDamperInnerforPD : public LocalDynamics, public DataDelegateInner
   protected:
     Real coeff_acoustic_damper_ = 0.0;
     Real *Vol_, *rho_, *u_div_;
-    Real *mass_;
+    Real *mass_, *work_;
     Vecd *force_, *vel_;
 };
 
@@ -164,7 +190,7 @@ class AcousticDamperWithWallforPD : public LocalDynamics, public DataDelegateCon
   protected:
     Real coeff_acoustic_damper_ = 0.0;
     Real *Vol_, *rho_, *u_div_;
-    Real *mass_;
+    Real *mass_, *work_;
     Vecd *force_, *vel_;
     StdVec<Real *> contact_Vol_;
 };
@@ -194,14 +220,20 @@ class PressureForceFromFluidforPD : public LocalDynamics, public DataDelegateCon
         coeff_acoustic_damper_ = 0.3 * c0 * rho0 * h;
     };
 
+    void setAccelerationPressureFactor(Real value)
+    {
+        if (!std::isfinite(value) || value < 0 || value > 1) throw std::invalid_argument("invalid pressure acceleration factor");
+        acceleration_factor_=value;
+    }
     void interaction(size_t index_i, Real dt = 0.0);
 
   protected:
     HughesWingetSolid &hw_solid_;
     Real coeff_acoustic_damper_ = 0.0;
+    Real acceleration_factor_ = 1;
     Real *Vol_;
     Vecd *vel_ave_, *acc_prior_, *acc_ave_, *n_;
-    Vecd *force_from_fluid_;
+    Vecd *force_from_fluid_, *acoustic_force_from_fluid_;
     Real *pressure_from_fluid_;
     StdVec<Fluid *> contact_fluids_;
     StdVec<Real *> contact_rho_, contact_p_, contact_u_div_, contact_mass_, contact_Vol_;

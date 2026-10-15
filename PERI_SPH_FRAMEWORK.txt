@@ -175,3 +175,8 @@ https://github.com/peridigm/peridigm/blob/master/src/materials/correspondence.cx
 and the control-scheme discussion in Zhang et al. (2023), Materials 16, 4050,
 https://doi.org/10.3390/ma16114050. The revised normalization and endpoint pairing
 follow the dimensional and momentum checks of this project.
+
+Energy and original-size validation extension (2026-10-15)
+Read PERI_SPH_VALIDATION.txt for contact/work corrections, mass/energy definitions,
+sealed sequential studies and the fixed-horizon spatial refinement policy.
+Full-run completion and convergence must be read from study artifacts.

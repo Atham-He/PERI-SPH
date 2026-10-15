@@ -325,3 +325,172 @@ TEST(PDHourglass, VanishesForAffineMotionAndBalancesMomentum)
     for (const Vecd &a : perturbed) scale += a.norm();
     EXPECT_LT(net.norm(), 1e-9 * std::max(scale, Real(1)));
 }
+
+
+TEST(PDEnergy, LinearEOSStorageMatchesPressureWorkAndIsPositive)
+{
+    Real rho0=935, c=25;
+    EXPECT_DOUBLE_EQ(peridynamics::linearEOSSpecificEnergy(rho0, rho0, c), 0);
+    for (Real ratio : {0.9, 0.99999999, 1.00000001, 1.1})
+    {
+        Real rho=rho0*ratio;
+        EXPECT_GE(peridynamics::linearEOSSpecificEnergy(rho,rho0,c),0);
+        Real h=1e-3*rho0;
+        if (std::abs(ratio-1)>0.01)
+        {
+            h=1e-6*rho0;
+            Real derivative=(peridynamics::linearEOSSpecificEnergy(rho+h,rho0,c)-peridynamics::linearEOSSpecificEnergy(rho-h,rho0,c))/(2*h);
+            EXPECT_NEAR(derivative,c*c*(rho-rho0)/(rho*rho),1e-9);
+        }
+    }
+    EXPECT_THROW(peridynamics::linearEOSSpecificEnergy(0,rho0,c),std::invalid_argument);
+}
+
+TEST(PDEnergy, SolidKickWorkPartitionsKineticIncrementExactly)
+{
+    PDTestBody f; f.generate<HughesWingetSolid>(1000,1e6,0.25);
+    SimpleDynamics<solid_dynamics::NosbPDFirstStep> first(f.body);
+    SimpleDynamics<solid_dynamics::NosbPDFourthStep> fourth(f.body);
+    auto &p=f.body.getBaseParticles();
+    auto *v=p.getVariableDataByName<Vecd>("Velocity");
+    auto *a=p.getVariableDataByName<Vecd>("PDAcceleration");
+    auto *prior=p.getVariableDataByName<Vecd>("PDAccelerationPrior");
+    auto *m=p.getVariableDataByName<Real>("Mass");
+    const Vecd ai(2,-3,1), ah(-1,0.5,0.2), ad(-0.2,-0.1,0);
+    Real before=0,after=0,work=0;
+    for(size_t i=0;i<p.TotalRealParticles();++i)
+    {
+        v[i]=Vecd(0.1,0.2,-0.1); prior[i]=Vecd(0,-9.8,0); a[i]=prior[i]+ai+ah+ad;
+        p.getVariableDataByName<Vecd>("PDInternalForce")[i]=m[i]*ai;
+        p.getVariableDataByName<Vecd>("HourglassForce")[i]=m[i]*ah;
+        p.getVariableDataByName<Vecd>("PDNumericalDampingForce")[i]=m[i]*ad;
+        before+=0.5*m[i]*v[i].squaredNorm();
+    }
+    fourth.exec(0.001);
+    for(size_t i=0;i<p.TotalRealParticles();++i)
+    {
+        after+=0.5*m[i]*v[i].squaredNorm();
+        for(const char *name : {"PDInternalWork","PDExternalWork","PDHourglassWork","PDDampingWork"})
+            work+=p.getVariableDataByName<Real>(name)[i];
+    }
+    EXPECT_NEAR(after-before,work,1e-12);
+}
+
+TEST(PDEnergy, FluidKickAndAcousticDamperWorkAreMeasuredIndependently)
+{
+    PDTestBody f; f.generate<HughesWingetSolid>(1000,1e6,0.25);
+    auto &p=f.body.getBaseParticles();
+    p.registerStateVariableData<Vecd>("Velocity");
+    p.registerStateVariableData<Vecd>("ViscousForce");
+    p.registerStateVariableData<Real>("Density",1000.0);
+    SimpleDynamics<peridynamics::FluidKineticWork> ledger(f.body);
+    InteractionDynamics<fluid_dynamics::VelocityDivergenceInner> divergence(*f.inner);
+    InteractionDynamics<fluid_dynamics::AcousticDamperInnerforPD> damping(*f.inner);
+    damping.setCoeffAcousticDamper(1000,10,0.1);
+    auto *v=p.getVariableDataByName<Vecd>("Velocity");
+    auto *m=p.getVariableDataByName<Real>("Mass");
+    Real before=0,after=0,work=0,dt=0.001;
+    for(size_t i=0;i<p.TotalRealParticles();++i)
+    {
+        v[i]=p.getVariableDataByName<Vecd>("Position")[i];
+        before+=0.5*m[i]*v[i].squaredNorm();
+        p.getVariableDataByName<Vecd>("Force")[i]=m[i]*Vecd(0.2,0.3,0.4);
+        p.getVariableDataByName<Vecd>("ForcePrior")[i]=m[i]*Vecd(-0.1,0.2,0.1);
+        v[i]+=dt*Vecd(0.1,0.5,0.5);
+    }
+    ledger.exec(dt); divergence.exec(); damping.exec(dt);
+    for(size_t i=0;i<p.TotalRealParticles();++i)
+    {
+        after+=0.5*m[i]*v[i].squaredNorm();
+        for(const char *name : {"FluidPressureWork","FluidPriorWork","AcousticDampingWorkInner"})
+            work+=p.getVariableDataByName<Real>(name)[i];
+    }
+    EXPECT_NEAR(after-before,work,1e-12);
+}
+
+
+TEST(PDContact, FiniteRigidBoxForceIsNegativePotentialGradientAndReactionBalances)
+{
+    PDTestBody f; f.generate<HughesWingetSolid>(1000,1e6,0.25);
+    SimpleDynamics<solid_dynamics::RigidBoxContactforPD> contact(f.body,0,0.01);
+    contact.addBox("Plate",Vecd(0,-0.4,0),Vecd(0.5,0.15,0.5),Vecd(0,-0.1,0));
+    auto &p=f.body.getBaseParticles();
+    auto *x=p.getVariableDataByName<Vecd>("Position");
+    auto *a=p.getVariableDataByName<Vecd>("PDAccelerationPrior");
+    for(size_t i=0;i<p.TotalRealParticles();++i) x[i]=Vecd(0,0.5,0);
+    auto evaluate=[&](Vecd point)
+    {
+        x[0]=point; a[0].setZero(); contact.exec();
+        return p.getVariableDataByName<Real>("AnalyticContactEnergy")[0];
+    };
+    for(Vecd point : {Vecd(0,-0.21,0),Vecd(0.52,-0.22,0),Vecd(0,-0.27,0)})
+    {
+        evaluate(point);
+        Vecd force=p.getVariableDataByName<Vecd>("ContactRepulsionFromWall")[0];
+        Vecd reaction=p.getVariableDataByName<Vecd>("PlateReaction")[0];
+        EXPECT_LT((force+reaction).norm(),1e-12);
+        EXPECT_NEAR(p.getVariableDataByName<Real>("ContactBoundaryPower")[0],force.dot(Vecd(0,-0.1,0)),1e-12);
+        for(int d=0;d<Dimensions;++d)
+        {
+            Vecd delta=Vecd::Zero(); delta[d]=1e-7;
+            Real derivative=(evaluate(point+delta)-evaluate(point-delta))/(2e-7);
+            EXPECT_NEAR(force[d],-derivative,1e-4*std::max(force.norm(),Real(1)));
+        }
+    }
+    EXPECT_DOUBLE_EQ(evaluate(Vecd(0,-0.15,0)),0);
+    evaluate(Vecd(0,-0.21,0)); Vecd previous=a[0];
+    contact.applyAcceleration(false); contact.exec();
+    EXPECT_LT((a[0]-previous).norm(),1e-12);
+}
+
+
+TEST(PDFSI, PressureTractionAndDensityFluxExchangeEnergyAndMomentumAtZeroExtrapolation)
+{
+    PDTestBody f; f.generate<HughesWingetSolid>(1000,1e6,0.25);
+    auto &sp=f.body.getBaseParticles();
+    sp.registerStateVariableData<Vecd>("AverageVelocity");
+    sp.registerStateVariableData<Vecd>("AverageAcceleration");
+    FluidBody fluid(f.system,makeShared<GeometricShapeBox>(Transform(Vecd(0,-0.6,0)),Vecd(0.3,0.3,0.3),"Fluid"));
+    fluid.defineMatterMaterial<WeaklyCompressibleFluid>(935,25);
+    fluid.generateParticles<BaseParticles,Lattice>();
+    fluid.getBaseParticles().registerStateVariableData<Real>("VelocityDivergence");
+    ContactRelationSelectKernel walls(fluid,{&f.body},true),reverse(f.body,{&fluid},false);
+    fluid_dynamics::PressureWallTermsforPD fluid_force(walls,0);
+    fluid_dynamics::Integration2ndHalf<Contact<Wall>,NoRiemannSolver> flux(walls);
+    InteractionDynamics<solid_dynamics::PressureForceFromFluidforPD<NoRiemannSolver>> shell_force(reverse);
+    shell_force.setAccelerationPressureFactor(0);
+    f.system.initializeSystemCellLinkedLists(); f.system.initializeSystemConfigurations();
+    auto &fp=fluid.getBaseParticles();
+    Vecd vf(0.3,0.2,-0.1),vs(-0.2,-0.1,0.1);
+    for(size_t i=0;i<fp.TotalRealParticles();++i)
+    {
+        fp.getVariableDataByName<Vecd>("Velocity")[i]=vf;
+        fp.getVariableDataByName<Real>("Pressure")[i]=1000;
+        fp.getVariableDataByName<Vecd>("ForcePrior")[i]=Vecd(0,30,0);
+    }
+    for(size_t i=0;i<sp.TotalRealParticles();++i)
+    {
+        sp.getVariableDataByName<Vecd>("AverageVelocity")[i]=vs;
+        sp.getVariableDataByName<Vecd>("AverageAcceleration")[i]=Vecd(0,-10,0);
+        sp.getVariableDataByName<Vecd>("NormalDirection")[i]=Vecd(0,-1,0);
+    }
+    for(size_t i=0;i<fp.TotalRealParticles();++i) fluid_force.interaction(i);
+    shell_force.exec();
+    for(size_t i=0;i<fp.TotalRealParticles();++i) flux.interaction(i);
+    Vecd resultant=Vecd::Zero();Real power=0,scale=0;
+    for(size_t i=0;i<fp.TotalRealParticles();++i)
+    {
+        Vecd force=fp.getVariableDataByName<Vecd>("Force")[i];
+        Real rho=fp.getVariableDataByName<Real>("Density")[i];
+        Real compression=fp.getVariableDataByName<Real>("Mass")[i]*1000/(rho*rho)*fp.getVariableDataByName<Real>("DensityChangeRate")[i];
+        resultant+=force; power+=force.dot(vf)+compression; scale+=force.norm();
+    }
+    for(size_t i=0;i<sp.TotalRealParticles();++i)
+    {
+        Vecd force=sp.getVariableDataByName<Vecd>("PressureForceFromFluid")[i];
+        resultant+=force;power+=force.dot(vs);
+    }
+    ASSERT_GT(scale,1);
+    EXPECT_LT(resultant.norm(),1e-11*scale);
+    EXPECT_LT(std::abs(power),1e-11*scale);
+}

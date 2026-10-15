@@ -32,6 +32,8 @@ foreach(case IN ITEMS smoke_liquid smoke_dry smoke_brittle smoke_fracture)
   set(damage_check)
   if(case STREQUAL "smoke_fracture")
     set(damage_check --require-damage)
+  else()
+    set(damage_check --energy-tolerance 0.05)
   endif()
   add_test(NAME peri_capsule_${case}_verify COMMAND ${Python3_EXECUTABLE}
     "${CMAKE_SOURCE_DIR}/tools/peri_run.py" verify --run-dir "${CMAKE_CURRENT_BINARY_DIR}/${case}" ${damage_check})

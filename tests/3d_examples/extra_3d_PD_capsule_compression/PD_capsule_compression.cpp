@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <chrono>
 
 using namespace SPH;
 
@@ -20,9 +21,10 @@ Real viscosity_shell = 500, critical_plastic_strain = 1;
 Real plate_friction_mu = 0.3, plate_friction_veps = 0.005;
 Real rho0_f = 935, c_f = 25, mu_f = 0.25, fluid_spacing_ratio = 1.5;
 Real gravity_g = 9.8, compression_speed = 0.1, compression_distance = 0.58e-3;
+Real pd_horizon = 0, pd_pressure_acceleration_factor = 0;
 Real U_ref = 0.5, pd_cfl = 0.1, acoustic_cfl = 0.3, acoustic_damping_factor = 0.3;
 Real max_density_error = 0.1, max_fluid_mach = 0.3, hourglass_coefficient = 0.5, hourglass_damage_cutoff = 0.1;
-bool shell_viscoplastic = true, with_liquid = true, reinitialize_density = false;
+bool shell_viscoplastic = true, with_liquid = true, reinitialize_density = false, analytic_plate_contact = true;
 int output_frames = 50, bond_check_interval = 1, inject_nan_step = -1, max_pd_substeps = 6;
 Real capsule_radius_in, resolution_ref, capsule_center_y, upper_plate_bottom, end_time;
 
@@ -56,7 +58,7 @@ static peridynamics::CaseParameters parameters()
     BIND(yield_stress_shell); BIND(hardening_shell); BIND(viscosity_shell); BIND(critical_plastic_strain);
     BIND(plate_friction_mu); BIND(plate_friction_veps); BIND(rho0_f); BIND(c_f); BIND(mu_f);
     BIND(fluid_spacing_ratio); BIND(gravity_g); BIND(compression_speed); BIND(compression_distance);
-    BIND(reinitialize_density); BIND(U_ref); BIND(pd_cfl); BIND(acoustic_cfl); BIND(acoustic_damping_factor);
+    BIND(pd_pressure_acceleration_factor); BIND(pd_horizon); BIND(analytic_plate_contact); BIND(reinitialize_density); BIND(U_ref); BIND(pd_cfl); BIND(acoustic_cfl); BIND(acoustic_damping_factor);
     BIND(hourglass_coefficient); BIND(hourglass_damage_cutoff); BIND(max_density_error); BIND(max_fluid_mach); BIND(shell_viscoplastic); BIND(with_liquid);
     BIND(max_pd_substeps); BIND(output_frames); BIND(bond_check_interval); BIND(inject_nan_step);
 #undef BIND
@@ -76,12 +78,15 @@ static void validateParameters()
         plate_friction_mu < 0 || plate_friction_veps <= 0 ||
         yield_stress_shell <= 0 || hardening_shell < 0 || viscosity_shell < 0 ||
         max_tension_stress <= 0 || critical_plastic_strain <= 0 || U_ref <= 0 ||
+        pd_pressure_acceleration_factor < 0 || pd_pressure_acceleration_factor > 1 ||
         hourglass_coefficient < 0 || hourglass_damage_cutoff <= 0 || hourglass_damage_cutoff > 1 || inject_nan_step < -1)
         throw std::invalid_argument("invalid capsule geometry, material, schedule or numerical controls");
     capsule_radius_in = capsule_radius_out - shell_thickness;
     resolution_ref = shell_thickness / shell_layers;
     capsule_center_y = plate_thickness + initial_gap + capsule_radius_out;
     upper_plate_bottom = capsule_center_y + capsule_radius_out + initial_gap;
+    if (pd_horizon == 0) pd_horizon = 3.015 * resolution_ref;
+    if (pd_horizon < 2 * resolution_ref) throw std::invalid_argument("PD horizon must span at least two particle spacings");
     end_time = compression_distance / compression_speed;
 }
 
@@ -116,6 +121,7 @@ int main(int argc, char **argv)
     liquid.addMaterialProperty<Viscosity>(mu_f);
     liquid.generateParticles<BaseParticles, Lattice>();
     PDBody shell(system, makeShared<CapsuleShellShape>("CapsuleShell"));
+    shell.defineAdaptationRatios(0.5 * pd_horizon / resolution_ref);
     if (shell_viscoplastic)
         shell.defineMatterMaterial<ViscoPlasticSolidforPD>(rho0_shell, youngs_shell, poisson_shell, yield_stress_shell, viscosity_shell, hardening_shell);
     else shell.defineMatterMaterial<HughesWingetSolid>(rho0_shell, youngs_shell, poisson_shell);
@@ -137,11 +143,12 @@ int main(int argc, char **argv)
     ComplexRelation fluid_complex(fluid_inner, fluid_walls);
 
     SimpleDynamics<NormalDirectionFromBodyShape> shell_normals(shell), lower_normals(lower), upper_normals(upper);
-    Dynamics1Level<fluid_dynamics::Integration1stHalfWithWallRiemann> pressure(fluid_inner, fluid_walls);
+    Dynamics1Level<fluid_dynamics::Integration1stHalfWithWallforPD> pressure(fluid_inner, fluid_walls, pd_pressure_acceleration_factor);
     Dynamics1Level<fluid_dynamics::Integration2ndHalfWithWallRiemann> density(fluid_inner, fluid_walls);
     InteractionWithUpdate<fluid_dynamics::DensitySummationComplexFreeSurface> density_sum(fluid_inner, fluid_walls);
     InteractionWithUpdate<fluid_dynamics::ViscousForceWithWall> fluid_viscosity(fluid_inner, fluid_walls);
     SimpleDynamics<fluid_dynamics::ContinuumVolumeUpdate> update_fluid_volume(liquid);
+    SimpleDynamics<peridynamics::FluidKineticWork> fluid_work(liquid);
     ReduceDynamics<fluid_dynamics::AdvectionViscousTimeStep> advection_step(liquid, U_ref);
     ReduceDynamics<fluid_dynamics::AcousticTimeStep> acoustic_step(liquid, acoustic_cfl);
     SimpleDynamics<GravityForce<Gravity>> fluid_gravity(liquid, Gravity(Vecd(0, -gravity_g, 0)));
@@ -156,6 +163,7 @@ int main(int argc, char **argv)
     wall_damping.setCoeffAcousticDamper(rho0_f, damping_c, fluid_horizon);
     InteractionDynamics<solid_dynamics::PressureForceFromFluidforPD<AcousticRiemannSolver>> shell_pressure(shell_fluid);
     shell_pressure.setCoeffAcousticDamper(rho0_f, damping_c, fluid_horizon);
+    shell_pressure.setAccelerationPressureFactor(pd_pressure_acceleration_factor);
     InteractionWithUpdate<solid_dynamics::ViscousForceFromFluid> shell_viscosity(shell_fluid);
     InteractionWithUpdate<solid_dynamics::PressureForceFromFluid<decltype(density)>> upper_pressure(upper_fluid), lower_pressure(lower_fluid);
     InteractionWithUpdate<solid_dynamics::ViscousForceFromFluid> upper_viscosity(upper_fluid), lower_viscosity(lower_fluid);
@@ -164,6 +172,11 @@ int main(int argc, char **argv)
     InteractionDynamics<solid_dynamics::ContactRepulsionFromWallforPD> contact_force(shell_plates, plate_friction_mu, plate_friction_veps);
     InteractionDynamics<solid_dynamics::ContactRepulsionToWallforPD> lower_reaction(lower_shell, plate_friction_mu, plate_friction_veps);
     InteractionDynamics<solid_dynamics::ContactRepulsionToWallforPD> upper_reaction(upper_shell, plate_friction_mu, plate_friction_veps);
+    SimpleDynamics<solid_dynamics::RigidBoxContactforPD> box_contact(shell, plate_friction_mu, plate_friction_veps);
+    Vecd plate_half_size(plate_radius, 0.5 * plate_thickness, plate_radius);
+    box_contact.applyToCurrentAcceleration(true);
+    box_contact.addBox("LowerPlate", Vecd(0, 0.5 * plate_thickness, 0), plate_half_size);
+    box_contact.addBox("UpperPlate", Vecd(0, upper_plate_bottom + 0.5 * plate_thickness, 0), plate_half_size);
     InteractionWithUpdate<solid_dynamics::NosbPDShapeMatrix> shape_matrix(shell_inner);
     SimpleDynamics<solid_dynamics::NosbPDFirstStep> first(shell);
     UniquePtr<BaseDynamics<void>> second, fracture;
@@ -188,6 +201,7 @@ int main(int argc, char **argv)
 
     SimpleDynamics<peridynamics::ParticleStateCheck> fluid_check(liquid), shell_check(shell);
     fluid_check.addScalar("Density", 0); fluid_check.addScalar("Pressure");
+    fluid_check.addScalar("Mass", 0); shell_check.addScalar("Mass", 0);
     fluid_check.addVector("Force"); fluid_check.addVector("ForcePrior");
     shell_check.addMatrix("DeformationGradient"); shell_check.addMatrix("PDStress");
     shell_check.addVector("PDAcceleration"); shell_check.addVector("PDAccelerationPrior");
@@ -205,7 +219,33 @@ int main(int argc, char **argv)
     std::ofstream diagnostics("output/diagnostics.csv"), reaction("output/UpperPlate_TotalReaction.dat");
     diagnostics << std::setprecision(17) << "time_s,stroke_m,acoustic_steps,pd_steps,liquid_mass_kg,fluid_speed_max_m_s,fluid_density_error_max,damage_mean,damage_max,numerical_failures,shell_kinetic_J,liquid_kinetic_J,contact_Fy_N,fluid_Fy_N,total_Fy_N\n";
     reaction << std::setprecision(17) << "time_s stroke_m contact_Fy_N fluid_Fy_N total_Fy_N\n";
+    std::ofstream budget("output/energy_budget.csv"), mass_record("output/mass_budget.csv");
+    budget << std::setprecision(17) << "time_s,plate_contact_work_J,plate_fluid_pressure_work_J,plate_fluid_viscous_work_J,kinetic_J,gravity_potential_change_J,fluid_compression_J,shell_elastic_proxy_J,contact_penalty_J,plastic_work_J,pd_damping_signed_loss_J,acoustic_inner_signed_loss_J,acoustic_wall_signed_loss_J,viscous_signed_loss_J,friction_signed_loss_J,hourglass_signed_transfer_J,mechanical_residual_J,mechanical_residual_relative,shell_kinetic_identity_residual_J,fluid_kinetic_identity_residual_J\n";
+    mass_record << std::setprecision(17) << "time_s,shell_count,liquid_count,shell_mass_kg,liquid_mass_kg,total_mass_kg,shell_mass_relative_error,liquid_mass_relative_error,max_particle_mass_relative_error,liquid_volume_m3,density_volume_mass_residual_kg,liquid_mass_outside_domain_kg\n";
+    Real plate_fluid_pressure_work = 0, plate_fluid_viscous_work = 0;
+    Real initial_gravity_energy = 0, initial_stored_energy = 0;
+    Real initial_shell_mass = 0, initial_liquid_mass = 0;
+    size_t initial_shell_count = shell.getBaseParticles().TotalRealParticles();
+    size_t initial_liquid_count = liquid.getBaseParticles().TotalRealParticles();
+    const auto start_wall_clock = std::chrono::steady_clock::now();
+    const Real plate_initial_y = upper.getBaseParticles().getVariableDataByName<Vecd>("Position")[0][1];
+    StdVec<Real> shell_initial_masses, liquid_initial_masses;
+    auto remember_mass = [](SPHBody &body, StdVec<Real> &values)
+    {
+        auto &p = body.getBaseParticles(); auto *m = p.getVariableDataByName<Real>("Mass");
+        values.assign(m, m + p.TotalRealParticles());
+    };
+    remember_mass(shell, shell_initial_masses); remember_mass(liquid, liquid_initial_masses);
+    auto sum_scalar = [](SPHBody &body, const char *name)
+    {
+        auto &p = body.getBaseParticles(); auto *v = p.getVariableDataByName<Real>(name); Real total = 0;
+        for (size_t i = 0; i < p.TotalRealParticles(); ++i) total += v[i];
+        return total;
+    };
     size_t acoustic_count = 0, pd_count = 0;
+    auto last_progress = start_wall_clock;
+    std::ofstream progress("output/progress.csv");
+    progress << std::setprecision(17) << "wall_s,time_s,completion_fraction,acoustic_steps,pd_steps,last_fluid_dt_s,last_pd_dt_s\n";
     std::string phase = "initialization";
 
     auto check_fluid = [&]()
@@ -223,8 +263,16 @@ int main(int argc, char **argv)
                 peridynamics::numericalFailure(liquid.Name(), i, "Mach-number limit: speed=" + std::to_string(v[i].norm()));
         }
     };
+    auto check_bounds = [&](SPHBody &body)
+    {
+        auto &p = body.getBaseParticles(); auto *x = p.getVariableDataByName<Vecd>("Position");
+        for (size_t i = 0; i < p.TotalRealParticles(); ++i)
+            if (x[i][0] < -extent || x[i][0] > extent || x[i][1] < -extent || x[i][1] > 2 * extent || x[i][2] < -extent || x[i][2] > extent)
+                peridynamics::numericalFailure(body.Name(), i, "particle left computational bounds before neighbor refresh");
+    };
     auto update_contacts = [&]()
     {
+        check_bounds(shell); if (with_liquid) check_bounds(liquid);
         shell.updateCellLinkedList(); upper.updateCellLinkedList();
         if (with_liquid)
         {
@@ -233,10 +281,23 @@ int main(int argc, char **argv)
         }
         shell_plates.updateConfiguration(); lower_shell.updateConfiguration(); upper_shell.updateConfiguration();
     };
+    auto apply_contact = [&](Real contact_time)
+    {
+        if (analytic_plate_contact)
+        {
+            Real displacement = std::min(contact_time / end_time, Real(1)) * compression_distance;
+            Vecd velocity(0, contact_time < end_time ? -compression_speed : 0, 0);
+            box_contact.setKinematics(1, Vecd(0, upper_plate_bottom + 0.5 * plate_thickness - displacement, 0), velocity);
+            box_contact.exec();
+        }
+        else {contact_factor.exec(); contact_force.exec();}
+    };
     auto measure = [&](int frame)
     {
-        contact_factor.exec(); initialize_shell.exec(); contact_force.exec(); upper_reaction.exec(); lower_reaction.exec();
-        Real contact_y = sumVector(upper, "ContactRepulsionToWall")[1], fluid_y = 0;
+        initialize_shell.exec();
+        box_contact.applyAcceleration(false); apply_contact(time); box_contact.applyAcceleration(true);
+        if (!analytic_plate_contact) {upper_reaction.exec(); lower_reaction.exec();}
+        Real contact_y = (analytic_plate_contact ? sumVector(shell, "UpperPlateReaction") : sumVector(upper, "ContactRepulsionToWall"))[1], fluid_y = 0;
         if (with_liquid)
         {
             upper_pressure.exec(); upper_viscosity.exec();
@@ -257,18 +318,80 @@ int main(int argc, char **argv)
             for (size_t i = 0; i < fp.TotalRealParticles(); ++i)
             {mass += fm[i]; vmax = std::max(vmax, fv[i].norm()); rho_error = std::max(rho_error, std::abs(frho[i] / rho0_f - 1)); fluid_ke += 0.5 * fm[i] * fv[i].squaredNorm();}
         }
-        Real stroke = std::min(time / end_time, Real(1)) * compression_distance;
+        // Independently measure the driven plate displacement from particle coordinates.
+        Real stroke = plate_initial_y - upper.getBaseParticles().getVariableDataByName<Vecd>("Position")[0][1];
+        Real shell_mass = 0, gravity_energy = 0, compression_energy = 0, elastic_proxy = 0, contact_energy = 0;
+        Real particle_mass_error = 0, liquid_volume = 0, density_volume_mass = 0, outside_mass = 0;
+        auto *sx = sp.getVariableDataByName<Vecd>("Position");
+        auto *svol = sp.getVariableDataByName<Real>("VolumetricMeasure");
+        auto *stress = sp.getVariableDataByName<Matd>("PDStress");
+        auto *F = sp.getVariableDataByName<Matd>("DeformationGradient");
+        auto *factor = sp.getVariableDataByName<Real>("RepulsionFactor");
+        auto &material = DynamicCast<HughesWingetSolid>(&shell, shell.getMatterMaterial());
+        if (sp.TotalRealParticles() != initial_shell_count || fp.TotalRealParticles() != initial_liquid_count)
+            throw std::runtime_error("particle count changed in a closed particle inventory");
+        for (size_t i = 0; i < sp.TotalRealParticles(); ++i)
+        {
+            shell_mass += sm[i]; gravity_energy += gravity_g * sm[i] * sx[i][1];
+            particle_mass_error = std::max(particle_mass_error, std::abs(sm[i] / shell_initial_masses[i] - 1));
+            Matd dev = stress[i] - stress[i].trace() / Dimensions * Matd::Identity();
+            elastic_proxy += svol[i] * F[i].determinant() * (dev.squaredNorm() / (4 * material.ShearModulus()) +
+                stress[i].trace() * stress[i].trace() / (2 * Dimensions * Dimensions * material.BulkModulus()));
+            contact_energy += material.ContactStiffness() * svol[i] * factor[i] * factor[i];
+        }
+        if (with_liquid)
+        {
+            auto *fm = fp.getVariableDataByName<Real>("Mass"); auto *fx = fp.getVariableDataByName<Vecd>("Position");
+            auto *rho = fp.getVariableDataByName<Real>("Density"); auto *vol = fp.getVariableDataByName<Real>("VolumetricMeasure");
+            for (size_t i = 0; i < fp.TotalRealParticles(); ++i)
+            {
+                gravity_energy += gravity_g * fm[i] * fx[i][1];
+                compression_energy += fm[i] * peridynamics::linearEOSSpecificEnergy(rho[i], rho0_f, c_f);
+                liquid_volume += vol[i]; density_volume_mass += rho[i] * vol[i];
+                particle_mass_error = std::max(particle_mass_error, std::abs(fm[i] / liquid_initial_masses[i] - 1));
+                if (fx[i][0] < -extent || fx[i][0] > extent || fx[i][1] < -extent || fx[i][1] > 2 * extent || fx[i][2] < -extent || fx[i][2] > extent)
+                    outside_mass += fm[i];
+            }
+        }
+        if (analytic_plate_contact) contact_energy = sum_scalar(shell, "AnalyticContactEnergy");
+        Real stored = shell_ke + fluid_ke + compression_energy + elastic_proxy + contact_energy;
+        if (frame == 0)
+        {
+            initial_gravity_energy = gravity_energy; initial_stored_energy = stored;
+            initial_shell_mass = shell_mass; initial_liquid_mass = mass;
+        }
+        Real contact_work = sum_scalar(shell, "ContactBoundaryWork");
+        Real plastic_work = sum_scalar(shell, "PlasticWork");
+        Real pd_loss = -sum_scalar(shell, "PDDampingWork");
+        Real acoustic_inner_loss = with_liquid ? -sum_scalar(liquid, "AcousticDampingWorkInner") : 0;
+        Real acoustic_wall_loss = with_liquid ? -sum_scalar(liquid, "AcousticDampingWorkWall") - sum_scalar(shell, "ShellAcousticWallWork") : 0;
+        Real viscous_loss = with_liquid ? plate_fluid_viscous_work - sum_scalar(liquid, "FluidViscousWork") - sum_scalar(shell, "ShellViscousWork") : 0;
+        Real friction_loss = sum_scalar(shell, "ContactFrictionLoss");
+        Real hg_transfer = -sum_scalar(shell, "PDHourglassWork");
+        Real supplied = contact_work + plate_fluid_pressure_work + plate_fluid_viscous_work;
+        Real accounted = stored - initial_stored_energy + gravity_energy - initial_gravity_energy +
+            plastic_work + pd_loss + acoustic_inner_loss + acoustic_wall_loss + viscous_loss + friction_loss + hg_transfer;
+        Real residual = supplied - accounted;
+        Real energy_scale = std::max({std::abs(supplied), std::abs(stored - initial_stored_energy), std::abs(gravity_energy - initial_gravity_energy),
+            std::abs(plastic_work), std::abs(pd_loss), std::abs(acoustic_inner_loss), std::abs(acoustic_wall_loss), std::abs(viscous_loss), std::abs(friction_loss), std::abs(hg_transfer), Real(1e-30)});
+        Real shell_identity = shell_ke - sum_scalar(shell, "PDInternalWork") - sum_scalar(shell, "PDExternalWork") - sum_scalar(shell, "PDHourglassWork") - sum_scalar(shell, "PDDampingWork");
+        Real fluid_identity = with_liquid ? fluid_ke - sum_scalar(liquid, "FluidPressureWork") - sum_scalar(liquid, "FluidPriorWork") - sum_scalar(liquid, "AcousticDampingWorkInner") - sum_scalar(liquid, "AcousticDampingWorkWall") : 0;
+        budget << time << ',' << contact_work << ',' << plate_fluid_pressure_work << ',' << plate_fluid_viscous_work << ',' << shell_ke + fluid_ke << ',' << gravity_energy - initial_gravity_energy << ',' << compression_energy << ',' << elastic_proxy << ',' << contact_energy << ',' << plastic_work << ',' << pd_loss << ',' << acoustic_inner_loss << ',' << acoustic_wall_loss << ',' << viscous_loss << ',' << friction_loss << ',' << hg_transfer << ',' << residual << ',' << residual / energy_scale << ',' << shell_identity << ',' << fluid_identity << '\n';
+        mass_record << time << ',' << initial_shell_count << ',' << (with_liquid ? initial_liquid_count : 0) << ',' << shell_mass << ',' << mass << ',' << shell_mass + mass << ',' << shell_mass / initial_shell_mass - 1 << ',' << (with_liquid ? mass / initial_liquid_mass - 1 : 0) << ',' << particle_mass_error << ',' << liquid_volume << ',' << density_volume_mass - mass << ',' << outside_mass << '\n';
+        budget.flush(); mass_record.flush();
         diagnostics << time << ',' << stroke << ',' << acoustic_count << ',' << pd_count << ',' << mass << ',' << vmax << ',' << rho_error << ',' << dsum / sp.TotalRealParticles() << ',' << dmax << ',' << failures << ',' << shell_ke << ',' << fluid_ke << ',' << contact_y << ',' << fluid_y << ',' << contact_y + fluid_y << '\n';
         reaction << time << ' ' << stroke << ' ' << contact_y << ' ' << fluid_y << ' ' << contact_y + fluid_y << '\n';
         diagnostics.flush(); reaction.flush(); states.writeToFile(frame);
-        std::cout << "frame=" << frame << " time=" << time << " stroke=" << stroke << " F=" << contact_y + fluid_y << " rho_error=" << rho_error << " vmax=" << vmax << std::endl;
+        std::cout << "frame=" << frame << " time=" << time << " stroke=" << stroke << " F=" << contact_y + fluid_y << " rho_error=" << rho_error << " vmax=" << vmax
+                  << " energy_residual=" << residual / energy_scale << " wall_s="
+                  << std::chrono::duration<Real>(std::chrono::steady_clock::now() - start_wall_clock).count() << std::endl;
     };
 
     try
     {
         system.initializeSystemCellLinkedLists(); system.initializeSystemConfigurations();
         shell_normals.exec(); lower_normals.exec(); upper_normals.exec(); shape_matrix.exec(); move_upper.exec();
-        if (with_liquid) fluid_gravity.exec();
+        if (with_liquid) {fluid_gravity.exec(); update_fluid_volume.exec();}
         shell_check.exec(); check_fluid(); measure(0);
         std::cout << "particles shell=" << shell.getBaseParticles().TotalRealParticles()
                   << " liquid=" << (with_liquid ? liquid.getBaseParticles().TotalRealParticles() : 0)
@@ -292,7 +415,11 @@ int main(int argc, char **argv)
                     if (with_liquid)
                     {
                         fluid_viscosity.exec(); divergence.exec(); wall_divergence.exec();
-                        pressure.exec(dt); inner_damping.exec(dt); wall_damping.exec(dt); check_fluid();
+                        pressure.exec(dt); fluid_work.exec(dt);
+                        upper_pressure.exec(); upper_viscosity.exec();
+                        plate_fluid_pressure_work += dt * compression_speed * sumVector(upper, "PressureForceFromFluid")[1];
+                        plate_fluid_viscous_work += dt * compression_speed * sumVector(upper, "ViscousForceFromFluid")[1];
+                        inner_damping.exec(dt); wall_damping.exec(dt); check_fluid();
                     }
                     phase = "external shell loads";
                     initialize_shell.exec();
@@ -305,7 +432,7 @@ int main(int argc, char **argv)
                         auto *v = p.getVariableDataByName<Real>("VolumetricMeasure");
                         for (size_t i = 0; i < p.TotalRealParticles(); ++i) a[i] += f[i] / (rho0_shell * v[i]);
                     }
-                    contact_factor.exec(); contact_force.exec();
+                    if (!analytic_plate_contact) apply_contact(time);
                     phase = "fluid second half";
                     if (with_liquid) {density.exec(dt); update_fluid_volume.exec(); check_fluid();}
                     phase = "PD subcycling";
@@ -313,7 +440,9 @@ int main(int argc, char **argv)
                     while (elapsed < dt)
                     {
                         Real ds = peridynamics::boundedTimeStep(shell_step.exec(), {dt - elapsed});
-                        first.exec(ds); second->exec(ds);
+                        first.exec(ds);
+                        if (analytic_plate_contact) apply_contact(time + elapsed + 0.5 * ds);
+                        second->exec(ds);
                         if (pd_count % size_t(bond_check_interval) == 0) fracture->exec(ds);
                         hourglass.exec(ds); pd_damping.exec(ds); third.exec(ds); fourth.exec(ds);
                         shell_check.exec(); ++pd_count;
@@ -326,6 +455,12 @@ int main(int argc, char **argv)
                     phase = "accepted step checks"; check_fluid(); shell_check.exec();
                     time = dt == advection_end - time ? advection_end : time + dt;
                     move_upper.exec();
+                    auto now = std::chrono::steady_clock::now();
+                    if (std::chrono::duration<Real>(now - last_progress).count() >= 30)
+                    {
+                        progress << std::chrono::duration<Real>(now - start_wall_clock).count() << ',' << time << ',' << time / end_time << ',' << acoustic_count << ',' << pd_count << ',' << dt << ',' << solid_dt << '\n';
+                        progress.flush(); last_progress = now;
+                    }
                 }
                 if (advection_end == target_time) time = target_time;
                 phase = "contact neighborhood refresh"; update_contacts();

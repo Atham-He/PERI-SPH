@@ -1,9 +1,11 @@
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 from xml.parsers import expat
 
 from peri_audit import rows, scan_vtp
+from peri_run import require_completion_audit
 
 
 VTP = '''<VTKFile><PolyData><FieldData><DataArray Name="TimeValue" type="Float64" NumberOfTuples="1" format="ascii">1.234567890123456e-11</DataArray></FieldData>
@@ -21,6 +23,27 @@ class SnapshotAuditTests(unittest.TestCase):
             path = Path(directory)/"LiquidCore_ite_0000000000.vtp"
             path.write_text(xml)
             return scan_vtp(path)
+
+    def test_completion_gate_rejects_partial_warned_and_failed_audits(self):
+        scenarios = [
+            {"status": "sampled_checks_passed", "simulation_completed": False},
+            {"status": "needs_attention", "simulation_completed": True,
+             "warnings": ["negative viscous loss"]},
+            {"status": "failed", "simulation_completed": True, "reason": "bad snapshot"},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            for audit in scenarios:
+                with self.subTest(audit=audit), patch("peri_audit.inspect", return_value=audit):
+                    with self.assertRaisesRegex(ValueError, "completion audit rejected"):
+                        require_completion_audit(Path(directory))
+
+    def test_completion_gate_accepts_and_records_full_healthy_audit(self):
+        audit = {"status": "sampled_checks_passed", "simulation_completed": True, "warnings": []}
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("peri_audit.inspect", return_value=audit) as inspect:
+                self.assertEqual(require_completion_audit(Path(directory), snapshots=True), audit)
+                inspect.assert_called_once_with(Path(directory), snapshots=True)
+            self.assertTrue((Path(directory)/"completion_audit.json").exists())
 
     def test_small_mass_survives_and_density_volume_reconciles(self):
         result = self.scan(VTP)

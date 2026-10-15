@@ -40,6 +40,17 @@ def status(path):
     return result
 
 
+def require_completion_audit(run_dir, snapshots=False):
+    """Warnings in a completed run cannot silently become convergence evidence."""
+    from peri_audit import inspect
+    audit = inspect(run_dir, snapshots=snapshots)
+    (run_dir / "completion_audit.json").write_text(json.dumps(audit, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    if not audit.get("simulation_completed") or audit["status"] != "sampled_checks_passed":
+        reason = "; ".join(audit.get("warnings", [])) or audit.get("reason", audit["status"])
+        raise ValueError("completion audit rejected run: " + reason)
+    return audit
+
+
 def verify(run_dir, require_damage=False, energy_tolerance=None):
     if energy_tolerance is not None and (not math.isfinite(energy_tolerance) or energy_tolerance <= 0):
         raise ValueError("energy tolerance must be finite and positive")
@@ -229,8 +240,7 @@ def launch(args):
         print((run_dir / "run.log").read_text(encoding="utf-8")[-2000:], file=sys.stderr)
         return process.returncode
     verify(run_dir, energy_tolerance=args.energy_tolerance)
-    from peri_audit import inspect
-    final_audit = inspect(run_dir, snapshots=not args.no_states)
+    final_audit = require_completion_audit(run_dir, snapshots=not args.no_states)
     (run_dir / "live_audit.json").write_text(json.dumps(final_audit, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     return 0
 

@@ -10,7 +10,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
-from peri_run import digest, parameters, verify
+from peri_run import digest, parameters, verify, require_completion_audit
 
 
 def save(path, value):
@@ -108,10 +108,11 @@ def relative_curve_error(a, b, field="total_Fy_N"):
 
 
 def compare_group(root, data, names, group):
-    configs, curves, budgets, verification = {}, {}, {}, {}
+    configs, curves, budgets, verification, audits = {}, {}, {}, {}, {}
     for name in names:
         run = root / "runs" / name
         verification[name] = verify(run)
+        audits[name] = require_completion_audit(run)
         manifest = json.loads((run / "run_manifest.json").read_text(encoding="utf-8"))
         if manifest["executable_sha256"] != data["source_sha256"][data["executable"].removeprefix("frozen_source/")]:
             raise ValueError("different executable used in " + name)
@@ -124,7 +125,7 @@ def compare_group(root, data, names, group):
         if configs[name].keys() != base.keys() or any(configs[name][key] != value for key,value in base.items() if key not in allowed):
             raise ValueError("uncontrolled parameter changed in " + name)
     reference = names[-1]
-    result = {"group": group, "reference": reference, "comparisons": [], "mass_and_energy_checks": verification}
+    result = {"group": group, "reference": reference, "comparisons": [], "mass_and_energy_checks": verification, "completion_audits": audits}
     def work(name):
         row = budgets[name][-1]
         return sum(row[key] for key in ("plate_contact_work_J", "plate_fluid_pressure_work_J", "plate_fluid_viscous_work_J"))
@@ -171,7 +172,12 @@ def run(args):
                 save(root/"study.json",data); return 2
         destination=root/"runs"/case["name"]
         if destination.exists():
-            verify(destination)  # interrupted or failed simulations cannot silently be reused
+            try:
+                verify(destination)  # interrupted or failed simulations cannot silently be reused
+                require_completion_audit(destination, snapshots=not args.no_states)
+            except (OSError, ValueError, KeyError) as error:
+                data.update(status="audit_failed", failed_case=case["name"], reason=str(error))
+                save(root/"study.json", data); return 2
             continue
         ratio=case["shell_layers"]/data["cases"][0]["shell_layers"]
         estimate=args.baseline_memory_gib*1.05*ratio**6
@@ -191,6 +197,11 @@ def run(args):
         if rc:
             data.update(status="simulation_failed", failed_case=case["name"],return_code=rc)
             save(root/"study.json",data); return rc
+        try:
+            require_completion_audit(destination, snapshots=not args.no_states)
+        except (OSError, ValueError, KeyError) as error:
+            data.update(status="audit_failed", failed_case=case["name"], reason=str(error))
+            save(root/"study.json", data); return 2
     compare_group(root,data,["baseline","dt_half","dt_quarter"],"time")
     spatial=compare_group(root,data,["dt_quarter","space_4","space_5"],"space")
     data.update(status="accepted" if spatial["accepted"] else "space_validation_failed")

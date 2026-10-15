@@ -165,3 +165,15 @@ regression checks signed losses strictly. At 2 us, with identical parameters,
 the prior pairing produced -1.56756e-20 J viscous loss; the synchronous pairing
 produced +2.45090e-23 J. The prior diagnostic run is retained as superseded;
 all official full-stroke and refinement cases use the corrected sealed version.
+
+Completion audit acceptance
+A completed solver process is only eligible for the next study case or for
+convergence comparison if require_completion_audit confirms full-stroke
+completion and sampled_checks_passed. Negative signed-loss or mechanical
+budget warnings are retained in completion_audit.json and stop the queue;
+they cannot be bypassed by a small total residual or matching force curves.
+Live warnings remain diagnostic so their cause can be assessed while the
+current trajectory continues. A queue-controller update may adopt a running
+solver after checking process identity; it must retain the sealed physics
+source, binary, configuration and their hashes and record controller changes
+separately. An audit-only controller update does not restart integration.

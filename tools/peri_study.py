@@ -10,16 +10,21 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
-from peri_run import digest, parameters, verify, require_completion_audit
+from peri_run import digest, parameters, verify, require_completion_audit, committed_checkpoints, solver_alive
 
 
 def save(path, value):
-    path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    temporary=path.with_suffix(path.suffix+".tmp")
+    temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+    temporary.replace(path)
     if path.name == "study.json":
         fields = ("status", "active_case", "failed_case", "pending_case", "reason", "return_code", "source_git_head", "audit_file", "audit_source_git_head", "controller_overlay_path")
         summary = {key: value[key] for key in fields if key in value}
         summary["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
-        (path.parent / "status.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        summary_path=path.parent/"status.json"
+        temporary=summary_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(summary_path)
 
 
 def plan(args):
@@ -40,7 +45,7 @@ def plan(args):
     frozen.mkdir()
     for name in ("src", "cmake", "tests/3d_examples/extra_3d_PD_capsule_compression"):
         shutil.copytree(repo / name, frozen / name)
-    for name in ("CMakeLists.txt", "PERI_SPH_FRAMEWORK.txt", "PERI_SPH_VALIDATION.txt", "PERI_SPH_VERSION.txt", "UPSTREAM_SYNC.md", "ACOUSTIC_WORK_AUDIT.txt"):
+    for name in ("CMakeLists.txt", "PERI_SPH_FRAMEWORK.txt", "PERI_SPH_VALIDATION.txt", "PERI_SPH_VERSION.txt", "UPSTREAM_SYNC.md", "ACOUSTIC_WORK_AUDIT.txt", "PERI_SPH_CHECKPOINTS.txt", "CHECKPOINT_REGRESSION.json"):
         shutil.copy2(repo / name, frozen / name)
     (frozen / "tools").mkdir()
     for script in (repo / "tools").glob("peri_*.py"):
@@ -160,6 +165,7 @@ def run(args):
         raise ValueError("memory limits must be positive")
     root=args.root.resolve(); data=json.loads((root/"study.json").read_text(encoding="utf-8"))
     frozen=root/"frozen_source"
+    data["run_controls"]={"memory_limit_gib":args.memory_limit_gib,"baseline_memory_gib":args.baseline_memory_gib,"no_states":args.no_states}
     for name, sha in data["source_sha256"].items():
         if digest(frozen/name) != sha:
             raise ValueError("sealed study source or executable changed: " + name)
@@ -172,14 +178,24 @@ def run(args):
                 data.update(status="time_validation_failed", reason="time or energy gate failed; space runs were not launched")
                 save(root/"study.json",data); return 2
         destination=root/"runs"/case["name"]
+        restoring = False
         if destination.exists():
+            completed=False
             try:
-                verify(destination)  # interrupted or failed simulations cannot silently be reused
-                require_completion_audit(destination, snapshots=not args.no_states)
+                manifest=json.loads((destination/"run_manifest.json").read_text())
+                if solver_alive(manifest): raise ValueError("existing solver still alive; do not launch a duplicate")
+                state_file=destination/"output/run_status.txt"
+                completed=state_file.exists() and state_file.read_text().splitlines()[0]=="completed"
+                if completed:
+                    verify(destination)
+                    require_completion_audit(destination,snapshots=not args.no_states)
+                    continue
+                if manifest.get("checkpoint_format")!=1 or not committed_checkpoints(destination/"checkpoints"):
+                    raise ValueError("interrupted run has no committed full PD checkpoint")
+                restoring=True
             except (OSError, ValueError, KeyError) as error:
-                data.update(status="audit_failed", failed_case=case["name"], reason=str(error))
-                save(root/"study.json", data); return 2
-            continue
+                data.update(status="audit_failed" if completed else "resume_rejected",failed_case=case["name"],reason=str(error))
+                save(root/"study.json",data);return 2
         ratio=case["shell_layers"]/data["cases"][0]["shell_layers"]
         estimate=args.baseline_memory_gib*1.05*ratio**6
         meminfo = Path("/proc/meminfo")
@@ -191,10 +207,16 @@ def run(args):
                         reason="conservative memory screen exceeded; no refined simulation was launched")
             save(root/"study.json",data); return 3
         data.update(status="running", active_case=case["name"]); save(root/"study.json",data)
-        command=[sys.executable,str(frozen/"tools/peri_run.py"),"run","--executable",str(root/data["executable"]),
-                 "--config",str(root/case["config"]),"--run-dir",str(destination)]
-        if args.no_states: command.append("--no-states")
+        if restoring:
+            command=[sys.executable,str(frozen/"tools/peri_run.py"),"resume","--run-dir",str(destination)]
+        else:
+            command=[sys.executable,str(frozen/"tools/peri_run.py"),"run","--executable",str(root/data["executable"]),
+                     "--config",str(root/case["config"]),"--run-dir",str(destination)]
+            if args.no_states:command.append("--no-states")
         rc=subprocess.run(command).returncode
+        if rc==75:
+            data.update(status="paused",active_case=case["name"],reason="complete disk checkpoint committed; safe to resume after process or OS exit")
+            save(root/"study.json",data);return 75
         if rc:
             data.update(status="simulation_failed", failed_case=case["name"],return_code=rc)
             save(root/"study.json",data); return rc

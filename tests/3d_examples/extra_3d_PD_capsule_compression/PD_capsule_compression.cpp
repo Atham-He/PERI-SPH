@@ -4,6 +4,8 @@
  */
 #include "sphinxsys.h"
 #include "pd_case_config.h"
+#include "pd_checkpoint.h"
+#include <regex>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -104,39 +106,43 @@ static Vecd sumVector(SPHBody &body, const std::string &name)
 
 int main(int argc, char **argv)
 {
-    auto config = parameters();
-    try {config.parse(argc, argv); validateParameters();}
+    auto config = parameters();peridynamics::CheckpointOptions checkpoint_options;
+    try {checkpoint_options.parse(argc,argv);config.parse(argc, argv); validateParameters();}
     catch (const std::exception &e) {std::cerr << e.what() << std::endl; return 2;}
+    if(checkpoint_options.describe_only)
+    {std::cout << "{\"format\":1,\"full_pd_state\":true,\"default_threads\":" << checkpoint_options.threads << "}\n";return 0;}
     Real extent = 6 * capsule_radius_out;
-    SPHSystem system(BoundingBoxd(Vecd(-extent, -extent, -extent), Vecd(extent, 2 * extent, extent)), resolution_ref);
+    peridynamics::CheckpointOutputGuard output_guard(!checkpoint_options.resume.empty());
+    SPHSystem system(BoundingBoxd(Vecd(-extent, -extent, -extent), Vecd(extent, 2 * extent, extent)), resolution_ref, checkpoint_options.threads);
+    output_guard.restore();
     system.handleCommandlineOptions(argc, argv);
     if (system.RestartStep() != 0)
     {
-        std::cerr << "PD restart is unsupported until reference bonds and all internal variables are serialized.\n";
+        std::cerr << "Use --pd-resume <checkpoint directory>; upstream restart_step is not a complete PD checkpoint.\n";
         return 2;
     }
     std::filesystem::create_directories("output");
-    config.save("output/effective_parameters.cfg");
+    if(checkpoint_options.resume.empty()) config.save("output/effective_parameters.cfg");
 
     FluidBody liquid(system, makeShared<GeometricShapeBall>(Vecd(0, capsule_center_y, 0), capsule_radius_in, "LiquidCore"));
     liquid.defineAdaptationRatios(1.3, 1 / fluid_spacing_ratio);
     liquid.defineMatterMaterial<WeaklyCompressibleFluid>(rho0_f, c_f);
     liquid.addMaterialProperty<Viscosity>(mu_f);
-    liquid.generateParticles<BaseParticles, Lattice>();
+    liquid.generateParticles<peridynamics::CheckpointParticles, Lattice>();
     PDBody shell(system, makeShared<CapsuleShellShape>("CapsuleShell"));
     shell.defineAdaptationRatios(0.5 * pd_horizon / resolution_ref);
     if (shell_viscoplastic)
         shell.defineMatterMaterial<ViscoPlasticSolidforPD>(rho0_shell, youngs_shell, poisson_shell, yield_stress_shell, viscosity_shell, hardening_shell);
     else shell.defineMatterMaterial<HughesWingetSolid>(rho0_shell, youngs_shell, poisson_shell);
-    shell.generateParticles<BaseParticles, Lattice>();
+    shell.generateParticles<peridynamics::CheckpointParticles, Lattice>();
     SolidBody lower(system, makeShared<PlateShape>("LowerPlate", 0.5 * plate_thickness));
     lower.defineAdaptationRatios(1.3, 1.0 / 3.0);
     lower.defineMatterMaterial<Solid>(rho0_shell, youngs_shell);
-    lower.generateParticles<BaseParticles, Lattice>();
+    lower.generateParticles<peridynamics::CheckpointParticles, Lattice>();
     SolidBody upper(system, makeShared<PlateShape>("UpperPlate", upper_plate_bottom + 0.5 * plate_thickness));
     upper.defineAdaptationRatios(1.3, 1.0 / 3.0);
     upper.defineMatterMaterial<Solid>(rho0_shell, youngs_shell);
-    upper.generateParticles<BaseParticles, Lattice>();
+    upper.generateParticles<peridynamics::CheckpointParticles, Lattice>();
 
     InnerRelation fluid_inner(liquid), shell_inner(shell);
     ContactRelationSelectKernel fluid_walls(liquid, {&shell, &lower, &upper}, true);
@@ -221,12 +227,8 @@ int main(int argc, char **argv)
     states.setFullPrecisionOutput(true);
     Real &time = *system.getSystemVariableDataByName<Real>("PhysicalTime");
     Real pd_dt = pd_cfl * resolution_ref / DynamicCast<HughesWingetSolid>(&shell, shell.getMatterMaterial()).ReferenceSoundSpeed();
-    std::ofstream diagnostics("output/diagnostics.csv"), reaction("output/UpperPlate_TotalReaction.dat");
-    diagnostics << std::setprecision(17) << "time_s,stroke_m,acoustic_steps,pd_steps,liquid_mass_kg,fluid_speed_max_m_s,fluid_density_error_max,damage_mean,damage_max,numerical_failures,shell_kinetic_J,liquid_kinetic_J,contact_Fy_N,fluid_Fy_N,total_Fy_N\n";
-    reaction << std::setprecision(17) << "time_s stroke_m contact_Fy_N fluid_Fy_N total_Fy_N\n";
-    std::ofstream budget("output/energy_budget.csv"), mass_record("output/mass_budget.csv");
-    budget << std::setprecision(17) << "time_s,plate_contact_work_J,plate_fluid_pressure_work_J,plate_fluid_viscous_work_J,kinetic_J,gravity_potential_change_J,fluid_compression_J,shell_elastic_proxy_J,contact_penalty_J,plastic_work_J,pd_damping_signed_loss_J,acoustic_inner_signed_loss_J,acoustic_wall_signed_loss_J,viscous_signed_loss_J,friction_signed_loss_J,hourglass_signed_transfer_J,mechanical_residual_J,mechanical_residual_relative,shell_kinetic_identity_residual_J,fluid_kinetic_identity_residual_J\n";
-    mass_record << std::setprecision(17) << "time_s,shell_count,liquid_count,shell_mass_kg,liquid_mass_kg,total_mass_kg,shell_mass_relative_error,liquid_mass_relative_error,max_particle_mass_relative_error,liquid_volume_m3,density_volume_mass_residual_kg,liquid_mass_outside_domain_kg\n";
+    std::ofstream diagnostics,reaction;
+    std::ofstream budget,mass_record;
     Real plate_fluid_pressure_work = 0, plate_fluid_viscous_work = 0;
     Real initial_gravity_energy = 0, initial_stored_energy = 0;
     Real initial_shell_mass = 0, initial_liquid_mass = 0;
@@ -249,9 +251,75 @@ int main(int argc, char **argv)
     };
     size_t acoustic_count = 0, pd_count = 0;
     auto last_progress = start_wall_clock;
-    std::ofstream progress("output/progress.csv");
-    progress << std::setprecision(17) << "wall_s,time_s,completion_fraction,acoustic_steps,pd_steps,last_fluid_dt_s,last_pd_dt_s\n";
+    std::ofstream progress;
     std::string phase = "initialization";
+    uint64_t completed_frame=0;Real wall_offset=0;
+    auto open_outputs=[&](bool append)
+    {
+        auto mode=std::ios::out|(append ? std::ios::app : std::ios::trunc);
+        diagnostics.open("output/diagnostics.csv",mode);diagnostics << std::setprecision(17);
+        reaction.open("output/UpperPlate_TotalReaction.dat",mode);reaction << std::setprecision(17);
+        budget.open("output/energy_budget.csv",mode);budget << std::setprecision(17);
+        mass_record.open("output/mass_budget.csv",mode);mass_record << std::setprecision(17);
+        progress.open("output/progress.csv",mode);progress << std::setprecision(17);
+        if(!diagnostics || !reaction || !budget || !mass_record || !progress) throw std::runtime_error("cannot open diagnostic outputs");
+        if(!append)
+        {
+            diagnostics << std::setprecision(17) << "time_s,stroke_m,acoustic_steps,pd_steps,liquid_mass_kg,fluid_speed_max_m_s,fluid_density_error_max,damage_mean,damage_max,numerical_failures,shell_kinetic_J,liquid_kinetic_J,contact_Fy_N,fluid_Fy_N,total_Fy_N\n";
+            reaction << std::setprecision(17) << "time_s stroke_m contact_Fy_N fluid_Fy_N total_Fy_N\n";
+            budget << std::setprecision(17) << "time_s,plate_contact_work_J,plate_fluid_pressure_work_J,plate_fluid_viscous_work_J,kinetic_J,gravity_potential_change_J,fluid_compression_J,shell_elastic_proxy_J,contact_penalty_J,plastic_work_J,pd_damping_signed_loss_J,acoustic_inner_signed_loss_J,acoustic_wall_signed_loss_J,viscous_signed_loss_J,friction_signed_loss_J,hourglass_signed_transfer_J,mechanical_residual_J,mechanical_residual_relative,shell_kinetic_identity_residual_J,fluid_kinetic_identity_residual_J\n";
+            mass_record << std::setprecision(17) << "time_s,shell_count,liquid_count,shell_mass_kg,liquid_mass_kg,total_mass_kg,shell_mass_relative_error,liquid_mass_relative_error,max_particle_mass_relative_error,liquid_volume_m3,density_volume_mass_residual_kg,liquid_mass_outside_domain_kg\n";
+            progress << std::setprecision(17) << "wall_s,time_s,completion_fraction,acoustic_steps,pd_steps,last_fluid_dt_s,last_pd_dt_s\n";
+        }
+    };
+    auto flush_outputs=[&](){diagnostics.flush();reaction.flush();budget.flush();mass_record.flush();progress.flush();
+        if(!diagnostics || !reaction || !budget || !mass_record || !progress) throw std::runtime_error("cannot flush diagnostic outputs");};
+    std::string checkpoint_identity=config.serialize()+"\nrecording="+std::to_string(system.StateRecording())+
+        "\nexecutable="+std::to_string(peridynamics::checkpoint_detail::fileHash(std::filesystem::canonical(argv[0])));
+    peridynamics::DiskCheckpoint checkpoint(checkpoint_options.directory,checkpoint_identity);
+    for(SPHBody *body:{static_cast<SPHBody*>(&shell),static_cast<SPHBody*>(&liquid),static_cast<SPHBody*>(&lower),static_cast<SPHBody*>(&upper)})
+    {
+        // The upstream VTP writer lazily registers ParticleGroups. Register it
+        // before either save or load so fresh-process schemas match exactly.
+        body->getBaseParticles().getParticleGroupManager();
+        checkpoint.addBody(dynamic_cast<peridynamics::CheckpointParticles&>(body->getBaseParticles()));
+    }
+    checkpoint.addConfiguration("ShellReference",shell_inner.inner_configuration_,shell.getBaseParticles().ParticlesBound());
+    checkpoint.addConfiguration("FluidInner",fluid_inner.inner_configuration_,liquid.getBaseParticles().ParticlesBound());
+    auto add_contact=[&](const std::string &name,BaseContactRelation &relation)
+    {
+        for(size_t k=0;k<relation.contact_configuration_.size();++k)
+            checkpoint.addConfiguration(name+std::to_string(k),relation.contact_configuration_[k],relation.contact_particles_[k]->ParticlesBound());
+    };
+    add_contact("FluidWalls",fluid_walls);add_contact("ShellFluid",shell_fluid);add_contact("UpperFluid",upper_fluid);add_contact("LowerFluid",lower_fluid);
+    add_contact("ShellPlates",shell_plates);add_contact("LowerShell",lower_shell);add_contact("UpperShell",upper_shell);
+#define CHECKPOINT_SCALAR(x) checkpoint.addScalar(#x,x)
+    CHECKPOINT_SCALAR(time);CHECKPOINT_SCALAR(acoustic_count);CHECKPOINT_SCALAR(pd_count);CHECKPOINT_SCALAR(completed_frame);
+    CHECKPOINT_SCALAR(plate_fluid_pressure_work);CHECKPOINT_SCALAR(plate_fluid_viscous_work);
+    CHECKPOINT_SCALAR(initial_gravity_energy);CHECKPOINT_SCALAR(initial_stored_energy);CHECKPOINT_SCALAR(initial_shell_mass);CHECKPOINT_SCALAR(initial_liquid_mass);
+#undef CHECKPOINT_SCALAR
+    checkpoint.addArray("ShellInitialMasses",shell_initial_masses);checkpoint.addArray("FluidInitialMasses",liquid_initial_masses);
+    for(const char *name:{"diagnostics.csv","UpperPlate_TotalReaction.dat","energy_budget.csv","mass_budget.csv","progress.csv","effective_parameters.cfg"}) checkpoint.addOutput(name);
+    auto last_checkpoint=std::chrono::steady_clock::now();size_t last_checkpoint_step=0;
+    auto save_checkpoint=[&](bool force)
+    {
+        auto now=std::chrono::steady_clock::now();
+        bool due=force || peridynamics::checkpoint_requested ||
+            (checkpoint_options.seconds>0 && std::chrono::duration<Real>(now-last_checkpoint).count()>=checkpoint_options.seconds) ||
+            (checkpoint_options.steps>0 && acoustic_count-last_checkpoint_step>=checkpoint_options.steps);
+        if(!due) return false;
+        peridynamics::checkpoint_requested=0;
+        flush_outputs();
+        {std::ofstream info("output/checkpoint_status.json");info << std::setprecision(17) << "{\"status\":\"writing\",\"time_s\":" << time << "}\n";}
+        auto path=checkpoint.save({time,wall_offset+std::chrono::duration<Real>(now-start_wall_clock).count(),acoustic_count,pd_count,completed_frame});
+        {std::ofstream info("output/checkpoint_status.json");info << std::setprecision(17) << "{\"status\":\"complete\",\"time_s\":" << time << "}\n";}
+        std::cout << "CHECKPOINT committed=" << path << " time=" << std::setprecision(17) << time << " acoustic_steps=" << acoustic_count << std::endl;
+        last_checkpoint=std::chrono::steady_clock::now();last_checkpoint_step=acoustic_count;
+        bool stop=peridynamics::checkpoint_stop_requested || (checkpoint_options.stop_after_checkpoint && time>0);
+        if(stop) std::ofstream("output/run_status.txt") << std::setprecision(17) << "checkpointed\ntime_s=" << time << "\ncheckpoint=" << path.string() << '\n';
+        return stop;
+    };
+
 
     auto check_fluid = [&]()
     {
@@ -399,11 +467,42 @@ int main(int argc, char **argv)
         system.initializeSystemCellLinkedLists(); system.initializeSystemConfigurations();
         shell_normals.exec(); lower_normals.exec(); upper_normals.exec(); shape_matrix.exec(); move_upper.exec();
         if (with_liquid) {fluid_gravity.exec(); update_fluid_volume.exec();}
-        shell_check.exec(); check_fluid(); measure(0);
+        if(checkpoint_options.resume.empty())
+        {
+            if(std::filesystem::exists(checkpoint_options.directory/"LATEST"))
+                std::filesystem::rename(checkpoint_options.directory,checkpoint_options.directory.string()+".previous-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+            open_outputs(false);shell_check.exec();check_fluid();measure(0);
+            if(save_checkpoint(true)) return 75;
+        }
+        else
+        {
+            auto loaded=checkpoint.restore(checkpoint_options.resume);
+            if(time!=loaded.time || acoustic_count!=loaded.acoustic_steps || pd_count!=loaded.pd_steps || completed_frame!=loaded.completed_frame || completed_frame>uint64_t(diagnostic_frames))
+                throw std::runtime_error("checkpoint: inconsistent integrator cursor");
+            wall_offset=loaded.wall_seconds;last_checkpoint_step=acoustic_count;
+            // Rebuild only spatial search structures, never the saved reference
+            // bonds or lagged interaction geometry/order used by the integrator.
+            shell.updateCellLinkedList();liquid.updateCellLinkedList();lower.updateCellLinkedList();upper.updateCellLinkedList();
+            int last_snapshot=int(completed_frame)/(diagnostic_frames/output_frames);
+            std::filesystem::path orphan("output/orphaned-after-resume-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+            std::regex pattern("(CapsuleShell|LiquidCore|LowerPlate|UpperPlate)_ite_([0-9]+)\\.vtp");
+            for(auto &entry:std::filesystem::directory_iterator("output"))
+            {
+                std::smatch match;std::string name=entry.path().filename().string();
+                if(entry.is_regular_file() && std::regex_match(name,match,pattern) && std::stoull(match[2])>uint64_t(last_snapshot))
+                {std::filesystem::create_directories(orphan);std::filesystem::rename(entry.path(),orphan/name);}
+            }
+            open_outputs(true);std::filesystem::remove("output/run_status.txt");
+            std::ofstream resume_info("output/resume_info.json");
+            resume_info << std::setprecision(17) << "{\"time_s\":" << time << ",\"acoustic_steps\":" << acoustic_count << ",\"completed_frame\":" << completed_frame << ",\"generation\":\"" << checkpoint.loadedGeneration().filename().string() << "\"}\n";
+            std::cout << "RESTORED time=" << std::setprecision(17) << time << " generation=" << checkpoint.loadedGeneration() << std::endl;
+        }
+        // Verification mode: commit restored memory before taking another step.
+        if(!checkpoint_options.resume.empty() && checkpoint_options.stop_after_checkpoint && save_checkpoint(true)) return 75;
         std::cout << "particles shell=" << shell.getBaseParticles().TotalRealParticles()
                   << " liquid=" << (with_liquid ? liquid.getBaseParticles().TotalRealParticles() : 0)
                   << " PD_dt=" << pd_dt << " end_time=" << end_time << std::endl;
-        for (int frame = 1; frame <= diagnostic_frames; ++frame)
+        for (int frame = int(completed_frame)+1; frame <= diagnostic_frames; ++frame)
         {
             Real target_time = frame == diagnostic_frames ? end_time : end_time * Real(frame) / diagnostic_frames;
             while (time < target_time)
@@ -468,15 +567,17 @@ int main(int argc, char **argv)
                     auto now = std::chrono::steady_clock::now();
                     if (std::chrono::duration<Real>(now - last_progress).count() >= 30)
                     {
-                        progress << std::chrono::duration<Real>(now - start_wall_clock).count() << ',' << time << ',' << time / end_time << ',' << acoustic_count << ',' << pd_count << ',' << dt << ',' << solid_dt << '\n';
+                        progress << wall_offset + std::chrono::duration<Real>(now - start_wall_clock).count() << ',' << time << ',' << time / end_time << ',' << acoustic_count << ',' << pd_count << ',' << dt << ',' << solid_dt << '\n';
                         progress.flush(); last_progress = now;
                     }
                 }
                 if (advection_end == target_time) time = target_time;
                 phase = "contact neighborhood refresh"; update_contacts();
+                phase = "checkpoint";if(save_checkpoint(false)) return 75;
             }
-            phase = "output"; measure(frame);
+            phase = "output"; measure(frame);completed_frame=frame;
         }
+        if(checkpoint_options.final_checkpoint) {phase="final checkpoint";if(save_checkpoint(true)) return 75;}
         std::ofstream("output/run_status.txt") << "completed\ntime_s=" << std::setprecision(17) << time << '\n';
     }
     catch (const std::exception &e)

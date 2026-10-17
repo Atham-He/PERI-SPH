@@ -14,7 +14,9 @@ class StudyAnalysisTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             (root/"frozen_source").mkdir()
-            (root/"runs/baseline").mkdir(parents=True)
+            (root/"runs/baseline/output").mkdir(parents=True)
+            (root/"runs/baseline/run_manifest.json").write_text("{}")
+            (root/"runs/baseline/output/run_status.txt").write_text("completed\n")
             config = root/"baseline.cfg"; config.write_text("shell_layers=3\n")
             data = {"source_sha256": {}, "cases": [
                 {"name": "baseline", "group": "baseline", "config": "baseline.cfg", "config_sha256": digest(config)},

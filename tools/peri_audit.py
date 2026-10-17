@@ -208,9 +208,18 @@ def inspect(run_dir, snapshots=False, stale_seconds=180):
                 negative_losses.append({"time_s":row["time_s"],"term":key,"value_J":row[key]})
     if negative_losses:
         warnings.append("signed loss is negative beyond 0.1% of current mechanical scale; investigate energy injection")
-    completed = (output/"run_status.txt").exists() and (output/"run_status.txt").read_text().splitlines()[0] == "completed"
+    state_lines=(output/"run_status.txt").read_text().splitlines() if (output/"run_status.txt").exists() else []
+    completed=bool(state_lines) and state_lines[0]=="completed"
+    disk_paused=bool(state_lines) and state_lines[0]=="checkpointed"
+    checkpoint_writing=False
+    if (output/"checkpoint_status.json").exists():
+        try: checkpoint_writing=json.loads((output/"checkpoint_status.json").read_text()).get("status")=="writing"
+        except ValueError:pass
+    if disk_paused:
+        fields=dict(line.split("=",1) for line in state_lines[1:] if "=" in line)
+        accepted_time=max(accepted_time,float(fields["time_s"]))
     age = max(0,time.time()-(output/"progress.csv").stat().st_mtime) if progress else None
-    if age is not None and age > stale_seconds and not completed:
+    if age is not None and age > stale_seconds and not completed and not disk_paused and not checkpoint_writing:
         warnings.append("progress timestamp is stale; process liveness needs checking")
     alive = None
     manifest_file = run_dir/"run_manifest.json"
@@ -223,7 +232,7 @@ def inspect(run_dir, snapshots=False, stale_seconds=180):
                          Path("/proc/sys/kernel/random/boot_id").read_text().strip() == manifest["linux_boot_id"])
             except FileNotFoundError:
                 alive = False
-            if not alive and not completed:
+            if not alive and not completed and not disk_paused:
                 warnings.append("recorded solver process is no longer alive")
     eta = None
     if len(progress) > 1:
@@ -233,7 +242,7 @@ def inspect(run_dir, snapshots=False, stale_seconds=180):
         if wall_interval > 0 and physical_interval > 0:
             eta=(end_time-accepted_time)*wall_interval/physical_interval
     result = {"status":"needs_attention" if warnings else "sampled_checks_passed",
-              "checked_at_utc":datetime.now(timezone.utc).isoformat(),"simulation_completed":completed,
+              "checked_at_utc":datetime.now(timezone.utc).isoformat(),"simulation_completed":completed,"simulation_paused_on_disk":disk_paused,"checkpoint_writing":checkpoint_writing,
               "accepted_time_s":accepted_time,"completion_fraction":accepted_time/end_time,
               "budget_time_s":diagnostic[-1]["time_s"],"diagnostic_samples_checked":len(diagnostic),
               "solver_alive":alive,"estimated_remaining_wall_s_at_recent_rate":eta,

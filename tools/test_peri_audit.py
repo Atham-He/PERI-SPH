@@ -79,11 +79,11 @@ class SnapshotAuditTests(unittest.TestCase):
 
 
 class AcousticBudgetTests(unittest.TestCase):
-    def audit(self, **overrides):
+    def audit(self, state="completed", **overrides):
         with tempfile.TemporaryDirectory() as directory:
             run = Path(directory); output=run/"output"; output.mkdir()
             (output/"effective_parameters.cfg").write_text("compression_distance=1\ncompression_speed=1\nmax_density_error=0.1\nmax_fluid_mach=0.3\nc_f=10\nwith_liquid=1\n")
-            (output/"run_status.txt").write_text("completed\n")
+            (output/"run_status.txt").write_text(state+"\n")
             energy={"time_s":1.,"kinetic_J":1.,"gravity_potential_change_J":0.,
                     "plate_contact_work_J":0.,"plate_fluid_pressure_work_J":0.,"plate_fluid_viscous_work_J":0.,
                     "pd_damping_signed_loss_J":0.,"acoustic_inner_signed_loss_J":0.,"acoustic_wall_signed_loss_J":0.,

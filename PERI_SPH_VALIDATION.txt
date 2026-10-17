@@ -108,9 +108,11 @@ the 2 us pilot is not evidence of large-compression stability. Updated cost
 pilots and logs remain in build/peri_validation. progress.csv is flushed about
 every 30 seconds during accepted increments. Full fields are written at output_frames; budget rows use diagnostic_frames,
 a positive multiple of output_frames (0 selects the same count). The original-
-size configuration uses 1000 diagnostic intervals and 50 VTP intervals. PD bond/internal-variable restart is
-not yet implemented: an interrupted simulation cannot resume from its VTP.
-A completed case may be reused by the study queue; a partial one is rejected.
+size configuration uses 1000 diagnostic intervals and 50 VTP intervals.
+Durable full PD state checkpoints and interrupted-study resume are available
+in the 2026-10-17 extension; see PERI_SPH_CHECKPOINTS.txt. VTP alone is not a
+restart source. Incompatible or missing checkpoints are rejected, never
+silently converted into fresh integrations. Completed cases still require audit.
 
 Snapshot precision correction and live audits (2026-10-15)
 The first original-size run was manually superseded at 0.1324955 ms (2.2844%).
@@ -194,3 +196,8 @@ A convergence result separately records acoustic_passivity_certified; this
 remains false for legacy budgets. Matching curves and a small proxy residual
 do not certify acoustic passivity or full thermodynamic closure. See
 ACOUSTIC_WORK_AUDIT.txt for equations and a controlled counterexample.
+
+Durable disk checkpoint extension (2026-10-17)
+PERI_SPH_CHECKPOINTS.txt documents full registered PD/FSI histories, reference
+bonds, accumulated budgets, atomic generations and the exact restart tests.
+A disk-paused run is incomplete and is never accepted as convergence evidence.

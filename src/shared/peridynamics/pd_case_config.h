@@ -84,12 +84,16 @@ class CaseParameters
             catch (const std::exception &e) { throw std::invalid_argument(key + ": " + e.what()); }
         }
     }
+    std::string serialize() const
+    {
+        std::ostringstream output;output << std::setprecision(17);
+        for (const auto &entry : getters_) output << entry.first << "=" << entry.second() << "\n";
+        return output.str();
+    }
     void save(const std::string &path) const
     {
         std::ofstream output(path);
-        if (!output) throw std::runtime_error("cannot write effective parameters: " + path);
-        output << std::setprecision(17);
-        for (const auto &entry : getters_) output << entry.first << "=" << entry.second() << "\n";
+        if (!output || !(output << serialize())) throw std::runtime_error("cannot write effective parameters: " + path);
     }
 
   private:

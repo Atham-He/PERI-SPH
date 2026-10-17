@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import uuid
 
 
@@ -196,52 +197,145 @@ def launch(args):
         "started_at_utc": datetime.now(timezone.utc).isoformat(), "git_head": head,
         "executable": str(executable), "frozen_executable": str(frozen_executable), "executable_sha256": digest(frozen_executable),
         "case_sha256": digest(config), "source_sha256": hashes,
+        "state_recording": not args.no_states,
+        "checkpoint_capabilities": checkpoint_capabilities(frozen_executable),
     }
-    (run_dir / "run_manifest.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
-    command = [str(frozen_executable), "--case-config", "case.cfg", "--state_recording=" + ("false" if args.no_states else "true")]
-    with (run_dir / "run.log").open("w", encoding="utf-8") as log:
-        process = subprocess.Popen(command, cwd=run_dir, stdout=log, stderr=subprocess.STDOUT)
-        metadata["solver_pid"] = process.pid
+    metadata["checkpoint_format"] = metadata["checkpoint_capabilities"].get("format", 0)
+    return execute(args, run_dir, metadata, frozen_executable)
+
+
+def checkpoint_capabilities(executable):
+    # Old binaries reject this option. Probe inside an isolated directory so
+    # their normal I/O initialization cannot touch any user output.
+    with tempfile.TemporaryDirectory(prefix="peri-capabilities-") as directory:
+        try:
+            result = subprocess.run([str(executable), "--pd-checkpoint-capabilities"], cwd=directory,
+                                    capture_output=True, text=True, timeout=15)
+            value = json.loads(result.stdout)
+            return value if result.returncode == 0 and value.get("format") == 1 else {}
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return {}
+
+
+def solver_alive(metadata):
+    if sys.platform.startswith("linux") and metadata.get("linux_process_start_ticks"):
+        try:
+            fields = (Path("/proc")/str(metadata["solver_pid"])/"stat").read_text().rsplit(")",1)[1].split()
+            return (fields[0] != "Z" and fields[19] == metadata["linux_process_start_ticks"] and
+                    Path("/proc/sys/kernel/random/boot_id").read_text().strip() == metadata["linux_boot_id"])
+        except FileNotFoundError:
+            return False
+    return False
+
+
+def committed_checkpoints(directory):
+    if (directory/"manifest.json").is_file():
+        candidates=[directory]
+    else:
+        candidates=sorted(directory.glob("checkpoint-*"), reverse=True)
+    result=[]
+    for path in candidates:
+        if path.is_symlink():continue
+        try:
+            data=json.loads((path/"manifest.json").read_text())
+            if data["format"] == 1 and data["status"] == "complete" and (path/"state.bin").stat().st_size == data["state_bytes"]:
+                result.append({"path": str(path), **data})
+        except (OSError, ValueError, KeyError):
+            continue
+    return result
+
+
+def resume(args):
+    run_dir=args.run_dir.resolve(strict=True)
+    metadata=json.loads((run_dir/"run_manifest.json").read_text())
+    if solver_alive(metadata):
+        raise ValueError("solver still exists; request a disk checkpoint pause before resuming")
+    executable=run_dir/Path(metadata["frozen_executable"]).name
+    if digest(executable)!=metadata["executable_sha256"] or digest(run_dir/"case.cfg")!=metadata["case_sha256"]:
+        raise ValueError("sealed executable or configuration changed")
+    if metadata.get("checkpoint_format")!=1:
+        raise ValueError("this run has no supported full PD checkpoint capability")
+    requested=args.checkpoint.resolve() if args.checkpoint else run_dir/"checkpoints"
+    if not committed_checkpoints(requested):
+        raise ValueError("no committed disk checkpoint available")
+    args.no_states=not metadata["state_recording"]
+    return execute(args,run_dir,metadata,executable,requested)
+
+
+def execute(args, run_dir, metadata, frozen_executable, checkpoint=None):
+    previous_controls=metadata.get("run_controls",{})
+    if args.checkpoint_seconds is None:args.checkpoint_seconds=previous_controls.get("checkpoint_seconds",600)
+    if args.checkpoint_steps is None:args.checkpoint_steps=previous_controls.get("checkpoint_steps",0)
+    if not math.isfinite(args.checkpoint_seconds) or args.checkpoint_seconds < 0 or args.checkpoint_steps < 0 or (args.threads is not None and args.threads < 1):
+        raise ValueError("invalid checkpoint interval or thread count")
+    capable=metadata.get("checkpoint_format")==1
+    if capable and args.threads is None:
+        args.threads=metadata.get("run_controls",{}).get("threads") or metadata.get("checkpoint_capabilities",{}).get("default_threads")
+    metadata["run_controls"]={"threads":args.threads,"checkpoint_seconds":args.checkpoint_seconds,"checkpoint_steps":args.checkpoint_steps}
+    if not capable and (checkpoint is not None or args.checkpoint_steps or args.stop_after_checkpoint):
+        raise ValueError("executable does not support full PD checkpoints")
+    command=[str(frozen_executable),"--case-config","case.cfg","--state_recording="+("false" if args.no_states else "true")]
+    if capable:
+        command += ["--pd-checkpoint-seconds="+str(args.checkpoint_seconds),"--pd-checkpoint-steps="+str(args.checkpoint_steps)]
+        if args.stop_after_checkpoint: command.append("--pd-stop-after-checkpoint")
+        if args.threads is not None: command.append("--pd-threads="+str(args.threads))
+        if checkpoint is not None: command.append("--pd-resume="+str(checkpoint))
+    if checkpoint is not None and (run_dir/"output/resume_info.json").exists():
+        old=run_dir/"output/resume_info.json"
+        old.rename(old.with_name("resume_info-attempt-"+str(len(metadata.get("attempts",[])))+".json"))
+    attempt={"started_at_utc":datetime.now(timezone.utc).isoformat(),"command":command,"resume_requested":str(checkpoint) if checkpoint else None}
+    metadata.setdefault("attempts",[]).append(attempt)
+    metadata.pop("live_audit_failure",None);metadata.pop("finished_at_utc",None);metadata.pop("return_code",None)
+    metadata["status"]="restoring" if checkpoint else "running"
+    def save_metadata():
+        path=run_dir/"run_manifest.json";temporary=path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(metadata,indent=2)+"\n");temporary.replace(path)
+    with (run_dir/"run.log").open("a" if checkpoint else "w",encoding="utf-8") as log:
+        if checkpoint: log.write("\nRESUME ATTEMPT "+attempt["started_at_utc"]+"\n");log.flush()
+        process=subprocess.Popen(command,cwd=run_dir,stdout=log,stderr=subprocess.STDOUT)
+        metadata["solver_pid"]=process.pid
         if sys.platform.startswith("linux"):
-            proc_stat = Path("/proc") / str(process.pid) / "stat"
-            if proc_stat.exists():
-                metadata["linux_process_start_ticks"] = proc_stat.read_text().rsplit(")", 1)[1].split()[19]
-            metadata["linux_boot_id"] = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-        (run_dir / "run_manifest.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+            metadata["linux_process_start_ticks"]=(Path("/proc")/str(process.pid)/"stat").read_text().rsplit(")",1)[1].split()[19]
+            metadata["linux_boot_id"]=Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        attempt["solver_pid"]=process.pid;save_metadata()
         while True:
-            try:
-                process.wait(timeout=30)
-                break
+            try: process.wait(timeout=30);break
             except subprocess.TimeoutExpired:
-                if (run_dir / "output/effective_parameters.cfg").exists():
+                if checkpoint is not None and not (run_dir/"output/resume_info.json").exists():
+                    live={"status":"restoring_checkpoint","solver_alive":True}
+                elif (run_dir/"output/effective_parameters.cfg").exists():
                     from peri_audit import inspect
-                    try:
-                        live = inspect(run_dir)
-                    except (OSError, ValueError, KeyError) as error:
-                        live = {"status": "failed", "reason": str(error)}
-                    live["checked_at_utc"] = datetime.now(timezone.utc).isoformat()
-                    (run_dir / "live_audit.json").write_text(json.dumps(live, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-                    if live["status"] == "failed":
-                        metadata["live_audit_failure"] = live["reason"]
-                        process.terminate()
-                        process.wait()
-                        break
-    metadata.update(finished_at_utc=datetime.now(timezone.utc).isoformat(), return_code=process.returncode)
-    (run_dir / "run_manifest.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
-    if args.command == "fault-test":
-        record = status(run_dir / "output/run_status.txt")
-        if process.returncode != 1 or record["status"] != "failed" or record.get("phase") != "accepted step checks" or "Velocity" not in record.get("reason", ""):
+                    try: live=inspect(run_dir)
+                    except (OSError,ValueError,KeyError) as error: live={"status":"failed","reason":str(error)}
+                else: continue
+                live["checked_at_utc"]=datetime.now(timezone.utc).isoformat()
+                (run_dir/"live_audit.json").write_text(json.dumps(live,indent=2,allow_nan=False)+"\n")
+                if live["status"]=="failed":
+                    metadata["live_audit_failure"]=live["reason"];process.kill();process.wait();break
+    attempt.update(finished_at_utc=datetime.now(timezone.utc).isoformat(),return_code=process.returncode)
+    metadata.update(finished_at_utc=attempt["finished_at_utc"],return_code=process.returncode)
+    if process.returncode==75:
+        record=status(run_dir/"output/run_status.txt")
+        checkpoints=committed_checkpoints(run_dir/"checkpoints")
+        if record["status"]!="checkpointed" or not checkpoints:
+            raise ValueError("checkpoint stop did not publish a complete state")
+        metadata.update(status="paused",last_checkpoint=checkpoints[0]);save_metadata()
+        from peri_audit import inspect
+        live=inspect(run_dir);(run_dir/"live_audit.json").write_text(json.dumps(live,indent=2,allow_nan=False)+"\n")
+        print(json.dumps({"status":"paused","run_dir":str(run_dir),"checkpoint":checkpoints[0]},indent=2))
+        return 75
+    metadata["status"]="completed" if process.returncode==0 else "failed";save_metadata()
+    if args.command=="fault-test":
+        record=status(run_dir/"output/run_status.txt")
+        if process.returncode!=1 or record["status"]!="failed" or record.get("phase")!="accepted step checks" or "Velocity" not in record.get("reason",""):
             raise ValueError("injected-NaN run failed for an unexpected reason or was accepted")
-        if not list((run_dir / "output").glob("LiquidCore_ite_100000*.vtp")):
-            raise ValueError("failure snapshot was not saved")
-        print("Injected NaN was diagnosed, saved, and rejected with return code 1.")
-        return 0
-    if process.returncode != 0:
-        print((run_dir / "run.log").read_text(encoding="utf-8")[-2000:], file=sys.stderr)
-        return process.returncode
-    verify(run_dir, energy_tolerance=args.energy_tolerance)
-    final_audit = require_completion_audit(run_dir, snapshots=not args.no_states)
-    (run_dir / "live_audit.json").write_text(json.dumps(final_audit, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+        if not list((run_dir/"output").glob("LiquidCore_ite_100000*.vtp")):raise ValueError("failure snapshot was not saved")
+        print("Injected NaN was diagnosed, saved, and rejected with return code 1.");return 0
+    if process.returncode!=0:
+        print((run_dir/"run.log").read_text()[-2000:],file=sys.stderr);return process.returncode
+    verify(run_dir,energy_tolerance=args.energy_tolerance)
+    final_audit=require_completion_audit(run_dir,snapshots=not args.no_states)
+    (run_dir/"live_audit.json").write_text(json.dumps(final_audit,indent=2,allow_nan=False)+"\n")
     return 0
 
 
@@ -257,6 +351,15 @@ def main():
         destination.add_argument("--run-dir", type=Path)
         destination.add_argument("--run-root", type=Path)
         run.add_argument("--no-states", action="store_true")
+    resume_parser=commands.add_parser("resume")
+    resume_parser.add_argument("--run-dir",type=Path,required=True)
+    resume_parser.add_argument("--checkpoint",type=Path)
+    resume_parser.add_argument("--energy-tolerance",type=float)
+    for operational in (commands.choices["run"],commands.choices["fault-test"],resume_parser):
+        operational.add_argument("--checkpoint-seconds",type=float)
+        operational.add_argument("--checkpoint-steps",type=int)
+        operational.add_argument("--stop-after-checkpoint",action="store_true")
+        operational.add_argument("--threads",type=int)
     check = commands.add_parser("verify")
     check.add_argument("--run-dir", type=Path, required=True)
     check.add_argument("--require-damage", action="store_true")
@@ -266,6 +369,7 @@ def main():
         if args.command == "verify":
             verify(args.run_dir.resolve(), args.require_damage, args.energy_tolerance)
             return 0
+        if args.command=="resume": return resume(args)
         return launch(args)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         print("PERI-SPH run rejected:", error, file=sys.stderr)

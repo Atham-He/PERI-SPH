@@ -1,0 +1,104 @@
+PERI-SPH durable disk checkpoints (2026-10-17)
+
+Scope
+The capsule opts into pd_checkpoint.h without changing upstream particle APIs.
+CheckpointParticles exposes all registered discrete and singular variables, not
+just visualization/restart lists. Every participating body (PD shell, liquid,
+plates) is included. PD reference neighbors retain original ordering, geometry
+and live/broken flags. All inner/contact configurations retain their exact
+storage and ordering. Constitutive histories, plastic tensors/hardening,
+kinematics, stresses, densities, identities, accumulated work terms, initial
+mass/energy references, counters and the diagnostic-frame cursor are saved.
+Other applications must register their bodies, configurations, global history
+and output attachments explicitly; this capsule contract does not certify an
+unmodified example's restart state.
+
+Only completed advection boundaries are saved: solid subcycling and fluid
+updates, accepted-time checks and contact refresh have finished. A checkpoint
+may precede a diagnostic sample at that same time; the saved frame cursor
+makes the resumed process emit that sample exactly once. Cell linked lists
+are rebuilt after load, while stored PD reference and fluid/contact geometry
+are restored directly. Half-completed kicks are never accepted snapshots.
+
+Disk protocol
+checkpoints/checkpoint-STEP-ID/ contains state.bin and manifest.json.
+All fixed-size values use native CPU representation. Compatibility requires
+identical effective parameters, binary hash, precision, dimensions, data
+schemas and recording mode. Native checkpoint format 1 is intended for the
+same Linux/WSL CPU build, not cross-version or heterogeneous-machine migration.
+The checksum is FNV-1a for accidental corruption, not an authenticity signature.
+
+State/footer, manifest and directories are fsynced before atomic publication;
+LATEST is atomically replaced and fsynced. Two committed generations are kept.
+A partial .tmp-* generation is ignored. Restore verifies checksum and the whole
+schema before modifying live state. If LATEST is corrupt, a valid older
+committed generation is selected, rejected evidence is quarantined and LATEST
+is repaired. Failures never silently initialize a new calculation at zero.
+A fresh process restores diagnostic/reaction/mass/energy/progress/config file
+prefixes from the selected state. Uncommitted future VTPs are preserved under
+output/orphaned-after-resume-*. An initialization rename journal protects both
+output and output_backup against upstream I/O initialization side effects.
+
+Automatic saves default to every 600 wall-clock seconds plus initialization
+and completion; each save waits for the next safe integration boundary.
+An unplanned kill/power loss loses work since the last completed generation.
+Temporary and rejected generations are retained as evidence and can consume
+disk; inspect them before any manual cleanup. Saving needs room for a third
+complete generation while two prior generations remain intact. Do not equate
+VTPs, SIGSTOP or a paused terminal with a durable restart.
+
+Operational commands (Linux/WSL, from the development repo)
+  python3 tools/peri_control.py status --study STUDY_ROOT
+  python3 tools/peri_control.py checkpoint --study STUDY_ROOT
+  python3 tools/peri_control.py pause --study STUDY_ROOT
+  python3 tools/peri_control.py resume --study STUDY_ROOT --background
+
+pause sends a checked SIGUSR2 request, waits for durable commit, exit code 75
+and study status paused; RAM is then released. Wait for paused_on_disk before
+shutting down. SIGUSR1 requests a save and continues. SIGTERM/SIGINT also
+request save-and-exit; SIGKILL cannot save. Process identity includes boot ID,
+Linux start ticks and the frozen executable hash. Legacy binaries are refused
+before sending these signals. Resume uses sealed study sources/executable and
+continues its baseline/time/space queue with the same acceptance/resource gates.
+
+Individual runs can use:
+  python3 tools/peri_run.py resume --run-dir RUN_DIRECTORY
+Direct executable controls:
+  --pd-resume=checkpoints --pd-checkpoint-dir=checkpoints
+  --pd-checkpoint-seconds=600 --pd-checkpoint-steps=0 --pd-threads=12
+  --pd-stop-after-checkpoint --pd-no-final-checkpoint
+--pd-stop-after-checkpoint is a regression control (stops on the first nonzero
+save); with --pd-resume it re-saves restored memory before advancing, allowing
+a digest comparison of loaded state. Leave it out of normal production runs.
+Conventional --restart_step
+remains rejected because upstream XML does not contain this full PD contract.
+
+Verification
+  ctest --test-dir build -L peri_fast --output-on-failure
+  ctest --test-dir build -L peri_checkpoint --output-on-failure
+The checkpoint integration suite freezes an executable, runs continuous and
+fresh-process resumed 3D liquid, broken-bond and plastic-history cases with
+one thread, and compares the final full physical-state digest, every byte of
+four scientific output files and exact step counts. It also tests SIGKILL,
+truncated latest generation, output-tail rollback and future-snapshot isolation.
+The compact three-layer, 50 um-radius geometry is a restart regression, not convergence evidence.
+The actual results are comparison.json/latest_comparison.json and CTest logs.
+Parallel reduction order can vary across independent processes; bitwise proof
+is scoped to the recorded deterministic single-thread regression. Full-scale
+restore checks do not by themselves establish full-stroke or physical validity.
+
+Existing legacy runs
+Old executable memory cannot be retroactively exported by the new binary.
+Their partial results are retained separately; the first checkpoint-capable
+production trajectory must initialize afresh. Subsequent process/OS exits
+resume the last committed disk state rather than forcing another fresh run.
+
+Recorded verification for this revision
+29 C++ tests, 25 Python tests and all 17 peri_fast CTest entries passed.
+The final checkpoint CTest passed continuous/resumed byte/digest comparisons
+for all three cases, no-advance restored-state comparisons, SIGKILL/corrupt-
+latest fallback, and the real study/runner/controller disk pause/resume chain.
+CHECKPOINT_REGRESSION.json records the executable hash and test results.
+The intentionally weak brittle regression develops uncalibrated bond failure
+and an unclosed mechanical proxy; its restart equality is not an energy or
+fracture calibration claim. Original-size live budgets remain separate.

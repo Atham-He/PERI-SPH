@@ -63,3 +63,10 @@ set_tests_properties(peri_capsule_snapshot_precision_audit PROPERTIES FIXTURES_R
 add_test(NAME peri_capsule_freefall_energy_audit COMMAND ${Python3_EXECUTABLE}
   "${CMAKE_SOURCE_DIR}/tools/peri_audit.py" --run-dir "${CMAKE_CURRENT_BINARY_DIR}/smoke_freefall" --strict)
 set_tests_properties(peri_capsule_freefall_energy_audit PROPERTIES FIXTURES_REQUIRED smoke_freefall_complete LABELS peri_fast TIMEOUT 10)
+
+add_test(NAME peri_capsule_checkpoint_roundtrip COMMAND ${Python3_EXECUTABLE}
+  "${CMAKE_SOURCE_DIR}/tools/peri_checkpoint_regression.py"
+  --executable "$<TARGET_FILE:${PROJECT_NAME}>"
+  --configs "${CMAKE_CURRENT_SOURCE_DIR}/configs"
+  --root "${CMAKE_CURRENT_BINARY_DIR}/checkpoint_regression")
+set_tests_properties(peri_capsule_checkpoint_roundtrip PROPERTIES LABELS peri_checkpoint TIMEOUT 900)

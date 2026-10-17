@@ -81,8 +81,8 @@ requires separate validation. Fracture and outflow need additional free-surface 
 Dry control still allocates frozen fluid particles because the upstream body requires
 particles; with_liquid=false prevents their integration and load contribution.
 PD reference neighborhoods must remain fixed, and PD particles must not be sorted.
-Restart is explicitly rejected: reference bond state and all internal variables do not
-have a complete restart/reload serialization contract yet.
+The capsule now supports full PD disk restart through pd_checkpoint.h and
+--pd-resume; see PERI_SPH_CHECKPOINTS.txt. Upstream XML restart stays rejected.
 
 Outputs
 output/effective_parameters.cfg: all active controls in SI units.
@@ -156,7 +156,7 @@ Remaining work before declaring the framework physically validated
 3. Independent elastic beam frequency/deflection and fracture-energy benchmarks.
 4. Closed-cavity and moving-wall FSI tests with work/energy and interface momentum budgets.
 5. Damage-aware stabilization, objectivity after bond breaking, and post-fracture support.
-6. Full restart serialization, reference-bond integrity, and compatibility tests for other cases.
+6. Extend the capsule disk-restart registration and verification to other cases.
 7. Align measured size, shell thickness, core composition and loading rate; fit shell
    elastic, yield, viscous, hardening and fracture parameters, then validate independently.
 8. Define released mass with a moving boundary or control surface and a mass-flux balance.
@@ -185,3 +185,7 @@ Precision/audit update (2026-10-15): capsule VTP opts into scientific Float64
 max_digits10 output; output_frames and diagnostic_frames are independent.
 Read tools/peri_audit.py live_audit.json for partial runs. Preserve superseded
 runs separately and never mix their binary hashes into convergence tables.
+
+Durable checkpoint extension (2026-10-17)
+Read PERI_SPH_CHECKPOINTS.txt for the full-state contract, atomic persistence,
+safe pause/resume commands and reproducible fresh-process verification.

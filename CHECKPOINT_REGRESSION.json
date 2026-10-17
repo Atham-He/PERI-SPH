@@ -1,0 +1,77 @@
+{
+  "executable_sha256": "f732e9699a613d5cbc26b1fe60e10dbb2e2fcb31e00815e0fcbe9aa2cdbd06dc",
+  "cases": [
+    {
+      "case": "smoke_liquid",
+      "saved_time_s": 2.4999999999999998e-06,
+      "checks": {
+        "diagnostics.csv": true,
+        "mass_budget.csv": true,
+        "energy_budget.csv": true,
+        "UpperPlate_TotalReaction.dat": true,
+        "complete_physical_state_digest": true,
+        "step_counts": true
+      },
+      "restore_before_advancing_digest_identical": true,
+      "damage_max": 0.0,
+      "plastic_work_J": 0.0,
+      "saved_damage_max": 0.0,
+      "saved_plastic_work_J": 0.0
+    },
+    {
+      "case": "smoke_fracture",
+      "saved_time_s": 2.4999999999999998e-06,
+      "checks": {
+        "diagnostics.csv": true,
+        "mass_budget.csv": true,
+        "energy_budget.csv": true,
+        "UpperPlate_TotalReaction.dat": true,
+        "complete_physical_state_digest": true,
+        "step_counts": true
+      },
+      "restore_before_advancing_digest_identical": true,
+      "damage_max": 1.0,
+      "plastic_work_J": 0.0,
+      "saved_damage_max": 1.0,
+      "saved_plastic_work_J": 0.0
+    },
+    {
+      "case": "smoke_checkpoint_plastic",
+      "saved_time_s": 2.4999999999999998e-06,
+      "checks": {
+        "diagnostics.csv": true,
+        "mass_budget.csv": true,
+        "energy_budget.csv": true,
+        "UpperPlate_TotalReaction.dat": true,
+        "complete_physical_state_digest": true,
+        "step_counts": true
+      },
+      "restore_before_advancing_digest_identical": true,
+      "damage_max": 0.0,
+      "plastic_work_J": 1.4653042780200736e-12,
+      "saved_damage_max": 0.0,
+      "saved_plastic_work_J": 2.897392240998527e-13
+    }
+  ],
+  "scope": "small 3D verification; all state digest and scientific CSV byte comparisons; no full-scale convergence claim",
+  "crash_corrupt_latest_fallback": {
+    "checks": {
+      "diagnostics.csv": true,
+      "mass_budget.csv": true,
+      "energy_budget.csv": true,
+      "UpperPlate_TotalReaction.dat": true,
+      "complete_physical_state_digest": true,
+      "step_counts": true
+    },
+    "killed_return_code": -9
+  },
+  "operational_study_pause_resume": {
+    "pause_status": "paused_on_disk",
+    "saved_time_s": 2.040075e-06,
+    "restored_time_s": 2.040075e-06,
+    "new_process": true,
+    "baseline_status": "completed",
+    "post_baseline_resource_gate": "resource_limited"
+  },
+  "run_root": "/home/hezhy58/SPHinXsys/build/tests/3d_examples/extra_3d_PD_capsule_compression/checkpoint_regression/run-1136517871524725b2b1d5b7c0f46c93"
+}

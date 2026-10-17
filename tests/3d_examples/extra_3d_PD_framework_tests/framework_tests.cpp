@@ -1,3 +1,4 @@
+#include "pd_checkpoint.h"
 #include "sphinxsys.h"
 #include <gtest/gtest.h>
 #include <limits>
@@ -577,4 +578,91 @@ TEST(PDFSI, ViscosityPairsBalanceDissipateAndIgnoreLaggedAverageVelocity)
     fluid_force.exec();shell_force.exec();
     for(size_t i=0;i<fp.TotalRealParticles();++i) EXPECT_LT(fp.getVariableDataByName<Vecd>("ViscousForce")[i].norm(),1e-15);
     for(size_t i=0;i<sp.TotalRealParticles();++i) EXPECT_LT(sp.getVariableDataByName<Vecd>("ViscousForceFromFluid")[i].norm(),1e-15);
+}
+
+
+struct CheckpointFixture
+{
+    SPHSystem system{BoundingBoxd(Vecd(-1,-1,-1),Vecd(1,1,1)),0.1,1};
+    PDBody body{system,makeShared<GeometricShapeBox>(Transform(),Vecd(0.3,0.3,0.3),"CheckpointSolid")};
+    UniquePtr<InnerRelation> inner;
+    std::filesystem::path root;
+    Real clock=0.25;uint64_t steps=17;
+    CheckpointFixture()
+    {
+        body.defineMatterMaterial<HughesWingetSolid>(1000,1e6,0.25);
+        body.generateParticles<peridynamics::CheckpointParticles,Lattice>();
+        auto &p=body.getBaseParticles();p.registerStateVariableData<Matd>("PlasticStrain");p.registerStateVariableData<Real>("IsotropicHardeningParam");
+        inner=makeUnique<InnerRelation>(body);system.initializeSystemCellLinkedLists();system.initializeSystemConfigurations();
+        root=std::filesystem::temp_directory_path()/("peri-checkpoint-unit-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::create_directories(root/"output");std::ofstream(root/"output/diagnostics.csv")<<"time_s,x\n0,1\n";
+    }
+    ~CheckpointFixture(){std::filesystem::remove_all(root);}
+    peridynamics::DiskCheckpoint checkpoint(std::string identity="unit-schema-1")
+    {
+        peridynamics::DiskCheckpoint c(root/"checkpoints",identity,root/"output");
+        c.addBody(dynamic_cast<peridynamics::CheckpointParticles&>(body.getBaseParticles()));
+        c.addConfiguration("ReferenceBonds",inner->inner_configuration_,body.getBaseParticles().ParticlesBound());
+        c.addScalar("Clock",clock);c.addScalar("Steps",steps);c.addOutput("diagnostics.csv");return c;
+    }
+};
+TEST(PDCheckpoint, RestoresConstitutiveHistoryReferenceBondsAllStateAndOutputPrefix)
+{
+    CheckpointFixture f;auto &p=f.body.getBaseParticles();auto c=f.checkpoint();
+    auto *plastic=p.getVariableDataByName<Matd>("PlasticStrain");auto *hardening=p.getVariableDataByName<Real>("IsotropicHardeningParam");
+    auto *position=p.getVariableDataByName<Vecd>("Position");auto *stress=p.getVariableDataByName<Matd>("PDStress");
+    plastic[0]=0.03*Matd::Identity();hardening[0]=0.12;stress[0]=12*Matd::Identity();Vecd original=position[0];
+    auto &bond=f.inner->inner_configuration_[0];ASSERT_GT(bond.current_size_,0);size_t neighbor=bond.j_[0];Real distance=bond.r_ij_[0];bond.bondLive_[0]=false;
+    auto generation=c.save({f.clock,0,17,85,1});
+    plastic[0].setZero();hardening[0]=0;stress[0].setZero();position[0]=Vecd(9,8,7);bond.bondLive_[0]=true;bond.r_ij_[0]=5;f.clock=9;f.steps=999;
+    std::ofstream(f.root/"output/diagnostics.csv",std::ios::app)<<"1,999\n";
+    auto restored=c.restore(f.root/"checkpoints");
+    EXPECT_DOUBLE_EQ(f.clock,0.25);EXPECT_EQ(f.steps,17);EXPECT_EQ(restored.completed_frame,1);
+    EXPECT_EQ(position[0],original);EXPECT_EQ(plastic[0],0.03*Matd::Identity());EXPECT_DOUBLE_EQ(hardening[0],0.12);EXPECT_EQ(stress[0],12*Matd::Identity());
+    EXPECT_FALSE(bond.bondLive_[0]);EXPECT_EQ(bond.j_[0],neighbor);EXPECT_DOUBLE_EQ(bond.r_ij_[0],distance);
+    std::ifstream file(f.root/"output/diagnostics.csv");std::string text((std::istreambuf_iterator<char>(file)),{});EXPECT_EQ(text,"time_s,x\n0,1\n");
+    std::ifstream manifest(generation/"manifest.json");std::string json((std::istreambuf_iterator<char>(manifest)),{});EXPECT_NE(json.find("physical_state_fnv1a64"),std::string::npos);
+}
+TEST(PDCheckpoint, IncompleteWriteAndCorruptionPreservePreviousCommittedGeneration)
+{
+    CheckpointFixture f;auto c=f.checkpoint();auto *damage=f.body.getBaseParticles().getVariableDataByName<Real>("Damage");damage[0]=0.1;
+    auto first=c.save({0.25,0,17,85,1});damage[0]=0.2;auto second=c.save({0.3,0,18,90,1});
+    damage[0]=0.3;EXPECT_THROW(c.save({0.4,0,19,95,1},true),std::runtime_error);
+    std::fstream bad(second/"state.bin",std::ios::binary|std::ios::in|std::ios::out);bad.seekp(50);bad.put('X');bad.close();
+    damage[0]=0.9;c.restore(f.root/"checkpoints");EXPECT_EQ(c.loadedGeneration(),first);EXPECT_DOUBLE_EQ(damage[0],0.1);
+    EXPECT_FALSE(std::filesystem::exists(second));
+    std::ifstream latest(f.root/"checkpoints/LATEST");std::string name;std::getline(latest,name);EXPECT_EQ(name,first.filename().string());
+    auto third=c.save({0.35,0,20,100,1});EXPECT_TRUE(std::filesystem::exists(first));
+    damage[0]=0.8;EXPECT_THROW(c.restore(f.root/"checkpoints"/("rejected-"+second.filename().string())),std::runtime_error);EXPECT_DOUBLE_EQ(damage[0],0.8);
+}
+TEST(PDCheckpoint, IncompatibleConfigurationOrMissingHistorySchemaCannotMutateLiveState)
+{
+    CheckpointFixture f;auto c=f.checkpoint();c.save({f.clock,0,17,85,1});
+    auto wrong=f.checkpoint("different-physical-configuration");f.clock=9;
+    EXPECT_THROW(wrong.restore(f.root/"checkpoints"),std::runtime_error);EXPECT_DOUBLE_EQ(f.clock,9);
+    f.body.getBaseParticles().registerStateVariableData<Real>("NewConstitutiveHistory");
+    EXPECT_THROW(c.restore(f.root/"checkpoints"),std::runtime_error);EXPECT_DOUBLE_EQ(f.clock,9);
+}
+
+TEST(PDCheckpoint, OutputGuardPreservesBothFoldersAndRecoversAnInterruptedInitialization)
+{
+    namespace fs=std::filesystem;
+    auto previous=fs::current_path();auto root=fs::temp_directory_path()/("peri-output-guard-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    fs::create_directories(root/"output");fs::create_directory(root/"output_backup");
+    std::ofstream(root/"output/science")<<"saved";std::ofstream(root/"output_backup/prior")<<"old";
+    fs::current_path(root);
+    {peridynamics::CheckpointOutputGuard guard(true);fs::create_directory("output");std::ofstream("output/init")<<"new";guard.restore();}
+    EXPECT_TRUE(fs::exists("output/science"));EXPECT_TRUE(fs::exists("output_backup/prior"));EXPECT_FALSE(fs::exists("output/init"));
+    fs::rename("output","output.pd-preserved-interrupted");std::ofstream(".peri-output-restore-journal")<<"PERI-OUTPUT-GUARD-1\noutput output.pd-preserved-interrupted\n";
+    {peridynamics::CheckpointOutputGuard guard(true);guard.restore();}
+    EXPECT_TRUE(fs::exists("output/science"));EXPECT_FALSE(fs::exists(".peri-output-restore-journal"));
+    fs::current_path(previous);fs::remove_all(root);
+}
+TEST(PDCheckpoint, OptionsRejectMalformedOrNegativeUnsignedControls)
+{
+    for(std::string option:{"--pd-checkpoint-steps=-1","--pd-checkpoint-steps=3junk","--pd-threads=0","--pd-checkpoint-seconds=3junk"})
+    {
+        char app[]="test";char *arguments[]={app,option.data(),nullptr};int count=2;
+        peridynamics::CheckpointOptions options;EXPECT_THROW(options.parse(count,arguments),std::exception);
+    }
 }

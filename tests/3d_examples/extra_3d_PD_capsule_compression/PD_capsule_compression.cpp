@@ -352,7 +352,12 @@ int main(int argc, char **argv)
             liquid.updateCellLinkedList(); fluid_complex.updateConfiguration(); shell_fluid.updateConfiguration();
             upper_fluid.updateConfiguration(); lower_fluid.updateConfiguration();
         }
-        shell_plates.updateConfiguration(); lower_shell.updateConfiguration(); upper_shell.updateConfiguration();
+        // RigidBoxContactforPD reads positions directly. Its analytic path never
+        // consumes these three particle-contact configurations.
+        if (!analytic_plate_contact)
+        {
+            shell_plates.updateConfiguration(); lower_shell.updateConfiguration(); upper_shell.updateConfiguration();
+        }
     };
     auto apply_contact = [&](Real contact_time)
     {

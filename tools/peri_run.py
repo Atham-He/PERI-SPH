@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -21,6 +22,36 @@ def digest(path):
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             h.update(block)
     return h.hexdigest()
+
+
+def source_snapshot_files(repo):
+    """Collect authored inputs without walking generated solver output trees.
+
+    Include the standalone Peri CMake entry and experiment reference profiles.
+    Keep authored geometry/reload inputs; omit generated outputs and binaries.
+    """
+    repo = Path(repo).resolve()
+    roots = [repo / name for name in ('src', 'cmake', 'peri', 'CMakeLists.txt')]
+    roots += list((repo / 'tools').glob('peri_*.py'))
+    roots += list((repo / 'tests/3d_examples').glob('extra_3d_PD_*'))
+    excluded = {'CMakeFiles', '_deps', '__pycache__', '.git', '.venv'}
+    generated_suffixes = {'.pyc', '.pyo', '.o', '.a', '.so', '.dll', '.exe', '.log'}
+    files = set()
+    for root in roots:
+        if root.is_file():
+            files.add(root)
+        elif root.is_dir():
+            def fail_walk(error):
+                raise error
+            for directory, subdirs, names in os.walk(root, onerror=fail_walk):
+                subdirs[:] = [name for name in subdirs if name not in excluded]
+                if root.parent == repo / 'tests/3d_examples' and Path(directory) == root:
+                    subdirs[:] = [name for name in subdirs if name not in {'output', 'checkpoints', 'build'}]
+                for name in names:
+                    path = Path(directory) / name
+                    if path.suffix.lower() not in generated_suffixes and path.is_file():
+                        files.add(path)
+    return sorted(files)
 
 
 def parameters(path):
@@ -166,20 +197,18 @@ def launch(args):
     executable = args.executable.resolve(strict=True)
     config = args.config.resolve(strict=True)
     run_dir = args.run_dir.resolve() if args.run_dir else args.run_root.resolve() / ("run-" + uuid.uuid4().hex)
+    repo = Path(__file__).resolve().parents[1]
+    files = source_snapshot_files(repo)
+    target_case = repo / "tests/3d_examples" / executable.stem
+    stale = [str(p.relative_to(repo)) for p in files if (p.is_relative_to(repo / "src/shared") or p.is_relative_to(repo / "src/for_3D_build") or p.is_relative_to(target_case)) and p.suffix in (".cpp", ".h", ".hpp", ".hxx") and p.stat().st_mtime > executable.stat().st_mtime + 0.001]
+    if stale:
+        raise ValueError("source is newer than the executable; rebuild before running: " + stale[0])
+    # Do not create a seemingly dispatched run when source preflight already fails.
     run_dir.mkdir(parents=True, exist_ok=False)
     shutil.copy2(config, run_dir / "case.cfg")
     # Keep the exact executable even if the development build is replaced.
     frozen_executable = run_dir / executable.name
     shutil.copy2(executable, frozen_executable)
-    repo = Path(__file__).resolve().parents[1]
-    paths = [repo / "src", repo / "cmake", repo / "CMakeLists.txt"] + list((repo / "tools").glob("peri_*.py"))
-    paths += list((repo / "tests/3d_examples").glob("extra_3d_PD_*"))
-    paths += [repo / name for name in ("src/shared/include/sphinxsys.h", "src/shared/particle_neighborhood/neighborhood.h", "src/shared/particle_neighborhood/neighborhood.cpp")]
-    files = sorted({p for path in paths for p in (path.rglob("*") if path.is_dir() else [path]) if p.is_file()})
-    target_case = repo / "tests/3d_examples" / executable.stem
-    stale = [str(p.relative_to(repo)) for p in files if (p.is_relative_to(repo / "src/shared") or p.is_relative_to(repo / "src/for_3D_build") or p.is_relative_to(target_case)) and p.suffix in (".cpp", ".h", ".hpp", ".hxx") and p.stat().st_mtime > executable.stat().st_mtime + 0.001]
-    if stale:
-        raise ValueError("source is newer than the executable; rebuild before running: " + stale[0])
     hashes = {str(p.relative_to(repo)): digest(p) for p in files}
     head, patch = None, b""
     try:
@@ -198,6 +227,7 @@ def launch(args):
         "executable": str(executable), "frozen_executable": str(frozen_executable), "executable_sha256": digest(frozen_executable),
         "case_sha256": digest(config), "source_sha256": hashes,
         "state_recording": not args.no_states,
+        "source_snapshot_scope": "authored source, Peri build/profile inputs and case assets; generated output/checkpoint/build trees excluded",
         "checkpoint_capabilities": checkpoint_capabilities(frozen_executable),
     }
     metadata["checkpoint_format"] = metadata["checkpoint_capabilities"].get("format", 0)

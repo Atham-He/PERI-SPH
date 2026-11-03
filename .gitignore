@@ -3,6 +3,7 @@
 .vscode
 *.json
 !CMakePresets.json
+!peri/experiments/*.json
 
 ##### Windows
 # Windows thumbnail cache files

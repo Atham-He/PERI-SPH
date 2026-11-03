@@ -2,3 +2,5 @@
 numpy
 scipy
 matplotlib
+# Read-only ingestion of the supplied experimental workbook.
+openpyxl

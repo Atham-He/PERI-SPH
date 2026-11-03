@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "kind": "experimental_reference_not_solver_configuration",
+  "doi": "10.1016/j.powtec.2025.121906",
+  "reviewed_pdf_sha256": "288b5c3a6fa47f19722b5380552b91a55dfa2141441d57ad8a4f030026483849",
+  "reviewed_workbook_sha256": "4cc8902cadd3c47862644dd0521bdafd29270a9549621cc4d04ca192234c9347",
+  "title": "Nano-to-microscale mechanical characterization of tung oil-calcium alginate capsules for self-healing soils",
+  "priority_target": "Micro-H_0TO-3SA-H",
+  "material_structure": {
+    "zero_oil": "calcium-alginate gel without tung oil; hydrated samples still contain water",
+    "oil_bearing": "dispersed oil chambers in an alginate matrix; dehydrated high-oil specimens show interconnected channels",
+    "single_uniform_oil_core_shell_mapping_validated": false,
+    "reported_uniform_shell_thickness_m": null,
+    "nominal_oil_loading_is_final_oil_volume_fraction": false,
+    "loading_basis_note": "The paper describes core loading in mass terms and gives a synthesis example of 20 g oil per 100 g alginate solution. Actual post-hydration oil volume fraction is not supplied.",
+    "SEM_area_fraction_is_3D_porosity": false
+  },
+  "group_particle_size_references": {
+    "0TO-3SA-H": {"D50_m": 0.00234, "source": "section 3.1", "is_individual_specimen_diameter": false},
+    "0TO-3SA-D": {"D50_m": 0.00138, "source": "section 3.1", "is_individual_specimen_diameter": false},
+    "20TO-3SA-H": {"D50_m": 0.00198, "source": "section 3.1", "is_individual_specimen_diameter": false},
+    "20TO-3SA-D": {"D50_m": 0.00157, "source": "section 3.1", "is_individual_specimen_diameter": false}
+  },
+  "microcompression": {
+    "source": "section 2.4 and figure 3",
+    "boundary": "two polished parallel plates",
+    "specimens_tested_per_group_in_paper": 5,
+    "workbook_curve_replicate_identity": null,
+    "force_sensor_range_N": 1,
+    "force_sensor_resolution_N": 0.0002,
+    "displacement_sensor_resolution_m": 2e-8,
+    "loading_rate_m_s": null,
+    "individual_specimen_diameter_m": null,
+    "measured_friction_coefficient": null,
+    "paper_contact_assumption": "minimal friction for the initial Hertz interpretation",
+    "contact_zero_verified_from_workbook": false,
+    "Hertz_interpretation_strain_limit": 0.1,
+    "Hertz_modulus_scope": "effective whole-particle small-deformation response, not a directly measured homogeneous shell constitutive modulus"
+  },
+  "nanoindentation": {
+    "source": "section 2.3 and figures 2 and 8",
+    "indenter": "Berkovich",
+    "loading_duration_s": 5,
+    "hold_duration_s": 10,
+    "unloading_duration_s": 5,
+    "row_timestamp_available": false,
+    "protocol_applies_to_microcompression": false,
+    "reported_load_unit_typo_requires_caution": "Section 2.3 prints approximately 50 micrometres as a maximum load; figure 8 and the workbook use micronewtons. Do not create a loading-rate inference from that sentence.",
+    "modulus_scope": "local indentation response; do not substitute for the microscale effective modulus"
+  },
+  "development_constraints": [
+    "The existing 1 mm / 20 micrometre shell / 0.1 m/s case is a numerical reference, not an experimental reproduction.",
+    "with_liquid=false in the existing hollow-shell example is not a homogeneous zero-oil gel model.",
+    "Do not infer physical time from worksheet row number or sort away unloading history.",
+    "Do not fit a unique relaxation time or viscosity without the relevant loading history.",
+    "Preserve nominal labels and both equal Micro-H curves; do not count duplicates as independent validation.",
+    "No existing R8 receipt, executable, numerical guard or archived production queue is changed by this reference profile."
+  ],
+  "material_parameters_fitted": false
+}

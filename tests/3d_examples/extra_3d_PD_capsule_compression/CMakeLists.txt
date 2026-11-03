@@ -40,7 +40,7 @@ foreach(case IN ITEMS smoke_liquid smoke_dry smoke_brittle smoke_fracture smoke_
     set(damage_check --energy-tolerance 0.05)
   endif()
   add_test(NAME peri_capsule_${case}_verify COMMAND ${Python3_EXECUTABLE}
-    "${CMAKE_SOURCE_DIR}/tools/peri_run.py" verify --run-dir "${CMAKE_CURRENT_BINARY_DIR}/${case}" ${damage_check})
+    "${SPHINXSYS_PROJECT_DIR}/tools/peri_run.py" verify --run-dir "${CMAKE_CURRENT_BINARY_DIR}/${case}" ${damage_check})
   set_tests_properties(peri_capsule_${case}_verify PROPERTIES FIXTURES_REQUIRED ${case}_complete LABELS peri_fast)
 endforeach()
 
@@ -50,22 +50,22 @@ if(NOT PERI_ENABLE_LONG_TESTS)
   set_tests_properties(${PROJECT_NAME} PROPERTIES DISABLED TRUE)
 endif()
 add_test(NAME peri_capsule_injected_nan COMMAND ${Python3_EXECUTABLE}
-  "${CMAKE_SOURCE_DIR}/tools/peri_run.py" fault-test
+  "${SPHINXSYS_PROJECT_DIR}/tools/peri_run.py" fault-test
   --executable "$<TARGET_FILE:${PROJECT_NAME}>"
   --config "${CMAKE_CURRENT_SOURCE_DIR}/configs/inject_failure.cfg"
   --run-root "${CMAKE_CURRENT_BINARY_DIR}/fault_runs")
 set_tests_properties(peri_capsule_injected_nan PROPERTIES LABELS peri_fast TIMEOUT 30)
 
 add_test(NAME peri_capsule_snapshot_precision_audit COMMAND ${Python3_EXECUTABLE}
-  "${CMAKE_SOURCE_DIR}/tools/peri_audit.py" --run-dir "${CMAKE_CURRENT_BINARY_DIR}/smoke_diagnostic_cadence" --snapshots)
+  "${SPHINXSYS_PROJECT_DIR}/tools/peri_audit.py" --run-dir "${CMAKE_CURRENT_BINARY_DIR}/smoke_diagnostic_cadence" --snapshots)
 set_tests_properties(peri_capsule_snapshot_precision_audit PROPERTIES FIXTURES_REQUIRED smoke_diagnostic_cadence_complete LABELS peri_fast TIMEOUT 30)
 
 add_test(NAME peri_capsule_freefall_energy_audit COMMAND ${Python3_EXECUTABLE}
-  "${CMAKE_SOURCE_DIR}/tools/peri_audit.py" --run-dir "${CMAKE_CURRENT_BINARY_DIR}/smoke_freefall" --strict)
+  "${SPHINXSYS_PROJECT_DIR}/tools/peri_audit.py" --run-dir "${CMAKE_CURRENT_BINARY_DIR}/smoke_freefall" --strict)
 set_tests_properties(peri_capsule_freefall_energy_audit PROPERTIES FIXTURES_REQUIRED smoke_freefall_complete LABELS peri_fast TIMEOUT 10)
 
 add_test(NAME peri_capsule_checkpoint_roundtrip COMMAND ${Python3_EXECUTABLE}
-  "${CMAKE_SOURCE_DIR}/tools/peri_checkpoint_regression.py"
+  "${SPHINXSYS_PROJECT_DIR}/tools/peri_checkpoint_regression.py"
   --executable "$<TARGET_FILE:${PROJECT_NAME}>"
   --configs "${CMAKE_CURRENT_SOURCE_DIR}/configs"
   --root "${CMAKE_CURRENT_BINARY_DIR}/checkpoint_regression")

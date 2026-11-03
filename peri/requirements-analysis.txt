@@ -1,0 +1,4 @@
+# Required by the retained cantilever analysis and plotting tools.
+numpy
+scipy
+matplotlib

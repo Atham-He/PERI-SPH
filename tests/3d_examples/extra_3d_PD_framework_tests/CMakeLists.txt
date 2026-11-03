@@ -4,5 +4,5 @@ set_target_properties(extra_3d_PD_framework_tests PROPERTIES RUNTIME_OUTPUT_DIRE
 add_test(NAME extra_3d_PD_framework_tests COMMAND extra_3d_PD_framework_tests)
 set_tests_properties(extra_3d_PD_framework_tests PROPERTIES TIMEOUT 120 LABELS peri_fast)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
-add_test(NAME peri_analysis_unit_tests COMMAND ${Python3_EXECUTABLE} -m unittest discover -s "${CMAKE_SOURCE_DIR}/tools" -p "test_peri_*.py" -v)
+add_test(NAME peri_analysis_unit_tests COMMAND ${Python3_EXECUTABLE} -m unittest discover -s "${SPHINXSYS_PROJECT_DIR}/tools" -p "test_peri_*.py" -v)
 set_tests_properties(peri_analysis_unit_tests PROPERTIES TIMEOUT 20 LABELS peri_fast)

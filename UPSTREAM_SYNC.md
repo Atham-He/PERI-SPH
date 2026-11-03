@@ -1,5 +1,13 @@
 # Upstream sync policy (avoid fork drift)
 
+## Independent upstream import on 2026-11-03
+
+The current checkout imports official master `1612330e` while retaining the
+local Peri working tree from `9d9ccd5e`. See `PERI_UPGRADE_20261103.md` and
+the `E:/PERI-SPH/upstream_upgrade_20261103` evidence directory. The new `peri/`
+build entry and capsule/framework tool path adjustments are build integration
+changes. Original validated experiments retain their original source/binaries.
+
 This fork follows a simple two-branch model:
 
 - `master` — tracks the upstream `Xiangyu-Hu/SPHinXsys` master as closely as

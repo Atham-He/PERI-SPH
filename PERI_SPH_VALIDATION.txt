@@ -63,7 +63,7 @@ Original-size study
 2. Run ctest --test-dir build -L peri_fast --output-on-failure.
 3. Run python3 -m unittest discover -s tools -p test_peri_study.py -v.
 4. Create a new sealed study directory:
-   python3 tools/peri_study.py plan --root build/peri_validation/STUDY_ID 
+   python3 tools/peri_study.py plan --root build/peri_validation/STUDY_ID
      --config tests/3d_examples/extra_3d_PD_capsule_compression/configs/full_capsule.cfg
      --executable build/tests/3d_examples/extra_3d_PD_capsule_compression/bin/extra_3d_PD_capsule_compression
 5. Run its sequential queue:

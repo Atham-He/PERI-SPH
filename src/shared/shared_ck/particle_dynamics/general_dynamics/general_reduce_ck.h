@@ -44,16 +44,16 @@ class TotalKineticEnergyCK
 
   public:
     explicit TotalKineticEnergyCK(SPHBody &sph_body);
-    virtual ~TotalKineticEnergyCK() {};
+    virtual ~TotalKineticEnergyCK(){};
 
     class ReduceKernel
     {
       public:
         template <class ExecutionPolicy, class EncloserType>
         ReduceKernel(const ExecutionPolicy &ex_policy, EncloserType &encloser);
-        Real reduce(size_t index_i, Real dt = 0.0)
+        Real reduce(UnsignedInt index_i, Real dt = 0.0)
         {
-            return 0.5 * mass_[index_i] * vel_[index_i].squaredNorm();
+            return Real(0.5) * mass_[index_i] * vel_[index_i].squaredNorm();
         };
 
       protected:
@@ -71,7 +71,7 @@ class TotalMechanicalEnergyCK : public TotalKineticEnergyCK
 
   public:
     explicit TotalMechanicalEnergyCK(SPHBody &sph_body, Gravity &gravity);
-    virtual ~TotalMechanicalEnergyCK() {};
+    virtual ~TotalMechanicalEnergyCK(){};
 
     class ReduceKernel : public TotalKineticEnergyCK::ReduceKernel
     {
@@ -79,7 +79,7 @@ class TotalMechanicalEnergyCK : public TotalKineticEnergyCK
         template <class ExecutionPolicy, class EncloserType>
         ReduceKernel(const ExecutionPolicy &ex_policy, EncloserType &encloser);
 
-        Real reduce(size_t index_i, Real dt = 0.0)
+        Real reduce(UnsignedInt index_i, Real dt = 0.0)
         {
             return TotalKineticEnergyCK::ReduceKernel::reduce(index_i, dt) +
                    mass_[index_i] * gravity_.getPotential(pos_[index_i]);
@@ -104,7 +104,7 @@ class QuantityReduce : public BaseLocalDynamicsReduce<ReturnFunctionType, Dynami
   public:
     template <typename... Args>
     QuantityReduce(DynamicsIdentifier &identifier, Args &&...args);
-    virtual ~QuantityReduce() {};
+    virtual ~QuantityReduce(){};
 
     class ReduceKernel
     {
@@ -112,7 +112,7 @@ class QuantityReduce : public BaseLocalDynamicsReduce<ReturnFunctionType, Dynami
         template <class ExecutionPolicy, class EncloserType>
         ReduceKernel(const ExecutionPolicy &ex_policy, EncloserType &encloser);
 
-        DataType reduce(size_t index_i, Real dt = 0.0)
+        DataType reduce(UnsignedInt index_i, Real dt = 0.0)
         {
             return evaluation_(index_i);
         };
@@ -134,7 +134,7 @@ class SimpleEvaluation
 
   public:
     SimpleEvaluation(BaseParticles *particles, const std::string &variable_name)
-        : dv_variable_(particles->template getVariableByName<InputType>(variable_name)) {};
+        : dv_variable_(particles->template getVariableByName<InputType>(variable_name)){};
     class ComputingKernel
     {
       public:
@@ -142,7 +142,7 @@ class SimpleEvaluation
         ComputingKernel(const ExecutionPolicy &ex_policy, EncloserType &encloser)
             : variable_(encloser.dv_variable_->DelegatedDataView(ex_policy)) {}
 
-        ReturnType operator()(size_t index_i)
+        ReturnType operator()(UnsignedInt index_i)
         {
             return return_function_(variable_[index_i], index_i);
         };
@@ -155,7 +155,7 @@ class SimpleEvaluation
 template <typename DataType>
 struct DirectValue : ReturnFunction<DataType>, InputFunction<DataType>
 {
-    DataType operator()(const DataType &value, size_t)
+    DataType operator()(const DataType &value, UnsignedInt)
     {
         return value;
     };
@@ -164,7 +164,7 @@ struct DirectValue : ReturnFunction<DataType>, InputFunction<DataType>
 template <typename DataType>
 struct IndexedValue : ReturnFunction<Indexed<DataType>>, InputFunction<DataType>
 {
-    Indexed<DataType> operator()(const DataType &value, size_t index_i)
+    Indexed<DataType> operator()(const DataType &value, UnsignedInt index_i)
     {
         return Indexed<DataType>(value, index_i);
     };
@@ -178,14 +178,14 @@ class QuantityAverage : public BaseLocalDynamicsReduce<ReduceSum<Sample<DataType
 
   public:
     QuantityAverage(DynamicsIdentifier &identifier, const std::string &variable_name);
-    virtual ~QuantityAverage() {};
+    virtual ~QuantityAverage(){};
 
     class FinishDynamics
     {
       public:
         using OutputType = DataType;
         template <class EncloserType>
-        FinishDynamics(EncloserType &encloser) {};
+        FinishDynamics(EncloserType &encloser){};
         OutputType Result(const ReduceReturnType &reduced_value)
         {
             return reduced_value.first / reduced_value.second;
@@ -198,7 +198,7 @@ class QuantityAverage : public BaseLocalDynamicsReduce<ReduceSum<Sample<DataType
         template <class ExecutionPolicy, class EncloserType>
         ReduceKernel(const ExecutionPolicy &ex_policy, EncloserType &encloser);
 
-        ReduceReturnType reduce(size_t index_i, Real dt = 0.0)
+        ReduceReturnType reduce(UnsignedInt index_i, Real dt = 0.0)
         {
             return ReduceReturnType(variable_[index_i], Real(1));
         };
@@ -219,7 +219,7 @@ class MaximumNorm : public BaseLocalDynamicsReduce<IndexedMax, DynamicsIdentifie
 
   public:
     MaximumNorm(DynamicsIdentifier &identifier, const std::string &variable_name);
-    virtual ~MaximumNorm() {};
+    virtual ~MaximumNorm(){};
 
     class ReduceKernel
     {
@@ -227,7 +227,7 @@ class MaximumNorm : public BaseLocalDynamicsReduce<IndexedMax, DynamicsIdentifie
         template <class ExecutionPolicy, class EncloserType>
         ReduceKernel(const ExecutionPolicy &ex_policy, EncloserType &encloser);
 
-        ReduceReturnType reduce(size_t index_i, Real dt = 0.0)
+        ReduceReturnType reduce(UnsignedInt index_i, Real dt = 0.0)
         {
             return ReduceReturnType(getNorm(variable_[index_i]), index_i);
         };
@@ -245,7 +245,7 @@ class UpperFrontInAxisDirectionCK : public BaseLocalDynamicsReduce<ReduceMax<Rea
 {
   public:
     UpperFrontInAxisDirectionCK(DynamicsIdentifier &identifier, const std::string &name, int axis = lastAxis);
-    virtual ~UpperFrontInAxisDirectionCK() {};
+    virtual ~UpperFrontInAxisDirectionCK(){};
 
     class ReduceKernel
     {
@@ -253,7 +253,7 @@ class UpperFrontInAxisDirectionCK : public BaseLocalDynamicsReduce<ReduceMax<Rea
         template <class ExecutionPolicy, class EncloserType>
         ReduceKernel(const ExecutionPolicy &ex_policy, EncloserType &encloser);
 
-        Real reduce(size_t index_i, Real dt = 0.0)
+        Real reduce(UnsignedInt index_i, Real dt = 0.0)
         {
             return pos_[index_i][axis_];
         };

@@ -148,6 +148,28 @@ inline std::pair<Real, Vecd> rigidBoxDistance(const Vecd &position, const Vecd &
     return {distance, normal};
 }
 
+/** One contact evaluation. Forces act on the deformable particle; box reaction
+ * is their negative. Sampling never writes particle or integrator state. */
+struct RigidBoxContactResponse
+{
+    Vecd force = Vecd::Zero();
+    Vecd friction = Vecd::Zero();
+    Real penetration = 0;
+    Real potential_energy = 0;
+    Real boundary_power = 0;
+    Real friction_boundary_power = 0;
+};
+
+/** Accepted-state box totals, separate from the last applied integration load. */
+struct RigidBoxContactObservation
+{
+    Vecd reaction = Vecd::Zero();
+    Real potential_energy = 0;
+    Real boundary_power = 0;
+    Real max_penetration = 0;
+    size_t contacting_particles = 0;
+};
+
 /** Conservative normal penalty against translating finite rigid boxes.
  * The particle's contact radius is dp/2, k_i=ContactStiffness*V_i/dp^2.
  * U_i=0.5*k_i*max(dp/2-signed_distance,0)^2. The force is -grad(U).
@@ -163,6 +185,9 @@ class RigidBoxContactforPD : public LocalDynamics
     void setKinematics(size_t box, const Vecd &center, const Vecd &velocity);
     void applyToCurrentAcceleration(bool value) {current_acceleration_ = value;}
     void applyAcceleration(bool value) {apply_acceleration_ = value;}
+    RigidBoxContactResponse evaluate(size_t particle, size_t box) const;
+    StdVec<RigidBoxContactObservation> observe() const;
+    Real normalPenaltyModulus() const { return stiffness_; }
     void update(size_t i, Real dt=0);
   protected:
     struct Box {Vecd center, half_size, velocity; Vecd *reaction;};

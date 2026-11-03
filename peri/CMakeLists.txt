@@ -16,6 +16,7 @@ option(PERI_ENABLE_LONG_TESTS "Enable retained long Peri application tests" OFF)
 foreach(example IN ITEMS
     extra_3d_PD_cantilever
     extra_3d_PD_capsule_compression
+    extra_3d_PD_gel_compression
     extra_3d_PD_framework_tests
     extra_3d_PD_brittle_disc
     extra_3d_PD_ice_jet)

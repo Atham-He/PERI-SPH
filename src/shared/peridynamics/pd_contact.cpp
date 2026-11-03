@@ -190,25 +190,56 @@ void RigidBoxContactforPD::setKinematics(size_t box, const Vecd &center, const V
     boxes_.at(box).center = center; boxes_.at(box).velocity = velocity;
 }
 
+RigidBoxContactResponse RigidBoxContactforPD::evaluate(size_t particle, size_t box_index) const
+{
+    const auto &box = boxes_.at(box_index);
+    const auto geometry = rigidBoxDistance(position_[particle], box.center, box.half_size);
+    RigidBoxContactResponse response;
+    response.penetration = std::max(0.5 * spacing_ - geometry.first, Real(0));
+    if (response.penetration == 0)
+        return response;
+
+    const Real stiffness = stiffness_ * volume_[particle] / (spacing_ * spacing_);
+    const Vecd normal_force = stiffness * response.penetration * geometry.second;
+    response.force = pdContactPairForce(normal_force, velocity_[particle] - box.velocity,
+                                       geometry.second, mu_, veps_);
+    response.friction = response.force - normal_force;
+    response.potential_energy = 0.5 * stiffness * response.penetration * response.penetration;
+    response.boundary_power = response.force.dot(box.velocity);
+    response.friction_boundary_power = response.friction.dot(box.velocity);
+    return response;
+}
+
+StdVec<RigidBoxContactObservation> RigidBoxContactforPD::observe() const
+{
+    StdVec<RigidBoxContactObservation> observations(boxes_.size());
+    for (size_t i = 0; i < particles_->TotalRealParticles(); ++i)
+        for (size_t k = 0; k < boxes_.size(); ++k)
+        {
+            const auto response = evaluate(i, k);
+            auto &total = observations[k];
+            total.reaction -= response.force;
+            total.potential_energy += response.potential_energy;
+            total.boundary_power += response.boundary_power;
+            total.max_penetration = std::max(total.max_penetration, response.penetration);
+            total.contacting_particles += response.penetration > 0;
+        }
+    return observations;
+}
+
 void RigidBoxContactforPD::update(size_t i, Real)
 {
     force_[i].setZero(); friction_[i].setZero();
     energy_[i] = boundary_power_[i] = friction_boundary_power_[i] = 0;
-    Real k = stiffness_ * volume_[i] / (spacing_ * spacing_);
-    for (auto &box : boxes_)
+    for (size_t k = 0; k < boxes_.size(); ++k)
     {
-        box.reaction[i].setZero();
-        auto geometry = rigidBoxDistance(position_[i], box.center, box.half_size);
-        Real penetration = std::max(0.5 * spacing_ - geometry.first, Real(0));
-        if (penetration == 0) continue;
-        Vecd normal_force = k * penetration * geometry.second;
-        Vecd pair_force = pdContactPairForce(normal_force, velocity_[i]-box.velocity, geometry.second, mu_, veps_);
-        Vecd friction = pair_force-normal_force;
-        force_[i] += pair_force; friction_[i] += friction;
-        box.reaction[i] = -pair_force;
-        energy_[i] += 0.5 * k * penetration * penetration;
-        boundary_power_[i] += pair_force.dot(box.velocity);
-        friction_boundary_power_[i] += friction.dot(box.velocity);
+        const auto response = evaluate(i, k);
+        force_[i] += response.force;
+        friction_[i] += response.friction;
+        boxes_[k].reaction[i] = -response.force;
+        energy_[i] += response.potential_energy;
+        boundary_power_[i] += response.boundary_power;
+        friction_boundary_power_[i] += response.friction_boundary_power;
     }
     if (apply_acceleration_)
         (current_acceleration_ ? acceleration_[i] : prior_[i]) += force_[i] / (rho0_ * volume_[i]);

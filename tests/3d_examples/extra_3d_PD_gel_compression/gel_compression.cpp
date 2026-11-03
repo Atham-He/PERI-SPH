@@ -1,0 +1,356 @@
+/** Bounded solid-sphere PD control for a future effective hydrated-gel baseline.
+ * No shell cavity, dummy liquid, fracture, material fitting or fluid exudation.
+ * Observation evaluates accepted-state contact without changing integration state.
+ */
+#include "sphinxsys.h"
+#include "pd_checkpoint.h"
+#include "pd_particle_compression.h"
+#include "execution_limits.h"
+
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <regex>
+
+using namespace SPH;
+namespace fs = std::filesystem;
+using gel_compression::ExecutionLimits;
+using gel_compression::ResourceStop;
+
+namespace
+{
+bool consumeDescriptionFlag(int &argc, char **argv)
+{
+    bool describe = false;
+    int output = 1;
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--describe-model")
+            describe = true;
+        else
+            argv[output++] = argv[i];
+    argc = output;
+    argv[output] = nullptr;
+    return describe;
+}
+
+void requireGoodStream(const std::ofstream &stream)
+{
+    if (!stream)
+        throw std::runtime_error("gel compression: diagnostic output failed");
+}
+
+int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptions &options,
+             const peridynamics::CaseParameters &inputs, const peridynamics::CheckpointOptions &restart)
+{
+    // Fail before SPHSystem can create/rotate output, and before particle allocation.
+    ExecutionLimits limits;
+    if (restart.resume.empty() && (fs::exists("output") || fs::exists(restart.directory / "LATEST")))
+        throw std::invalid_argument("use a new run directory; existing gel output/checkpoint is preserved");
+    const auto &geometry = options.geometry;
+    if (2 * geometry.radius / geometry.spacing > 13)
+        throw std::invalid_argument("gel control resolution exceeds the bounded preparation budget");
+
+    peridynamics::CheckpointOutputGuard output_guard(!restart.resume.empty());
+    const Real extent = 6 * geometry.radius;
+    SPHSystem system(BoundingBoxd(Vecd(-extent, -extent, -extent), Vecd(extent, 2 * extent, extent)),
+                     geometry.spacing, restart.threads);
+    output_guard.restore();
+    system.handleCommandlineOptions(argc, argv);
+    if (system.RestartStep() != 0)
+        throw std::invalid_argument("upstream restart_step is not a full PD checkpoint; use --pd-resume");
+
+    PDBody particle(system, makeShared<GeometricShapeBall>(
+                                Vecd(0, options.centerHeight(), 0), geometry.radius, "GelParticle"));
+    particle.defineAdaptationRatios(0.5 * options.numerics.horizon_ratio);
+    const auto &material = options.material;
+    if (material.viscoplastic)
+        particle.defineMatterMaterial<ViscoPlasticSolidforPD>(
+            material.density, material.youngs_modulus, material.poisson_ratio,
+            material.yield_stress, material.plastic_viscosity, material.hardening_modulus);
+    else
+        particle.defineMatterMaterial<HughesWingetSolid>(
+            material.density, material.youngs_modulus, material.poisson_ratio);
+    particle.generateParticles<peridynamics::CheckpointParticles, Lattice>();
+    auto &particles = particle.getBaseParticles();
+    const size_t count = particles.TotalRealParticles();
+    if (count == 0 || count > ExecutionLimits::max_particles)
+        throw std::invalid_argument("gel control requires 1..1000 particles");
+
+    InnerRelation reference(particle);
+    InteractionWithUpdate<solid_dynamics::NosbPDShapeMatrix> shape(reference);
+    SimpleDynamics<solid_dynamics::PDTimeStepInitialization> initialize(particle, makeShared<Gravity>(Vecd::Zero()));
+    SimpleDynamics<solid_dynamics::NosbPDFirstStep> first(particle);
+    UniquePtr<BaseDynamics<void>> constitutive;
+    if (material.viscoplastic)
+        constitutive = makeUnique<InteractionWithUpdate<solid_dynamics::NosbPDSecondStepPlastic>>(reference);
+    else
+        constitutive = makeUnique<InteractionWithUpdate<solid_dynamics::NosbPDSecondStep>>(reference);
+    InteractionDynamics<solid_dynamics::LittleWoodHourGlassControl> hourglass(
+        reference, options.numerics.hourglass_coefficient, 0.1);
+    InteractionDynamics<solid_dynamics::PairNumericalDampingforPD> damping(reference);
+    InteractionDynamics<solid_dynamics::NosbPDThirdStep> third(reference);
+    SimpleDynamics<solid_dynamics::NosbPDFourthStep> fourth(particle);
+    ReduceDynamics<solid_dynamics::PDTimeStep> timestep(particle, options.numerics.cfl);
+
+    SimpleDynamics<solid_dynamics::RigidBoxContactforPD> contact(
+        particle, options.contact.friction_mu, options.contact.friction_velocity);
+    contact.applyToCurrentAcceleration(true);
+    const Vecd half_size(geometry.plate_half_width, 0.5 * geometry.plate_thickness, geometry.plate_half_width);
+    contact.addBox("LowerPlate", Vecd(0, -0.5 * geometry.plate_thickness, 0), half_size);
+    const peridynamics::CompressionPlateMotion motion{
+        options.initialUpperFace(), geometry.plate_thickness, options.loading.stroke, options.duration()};
+    const size_t upper_box = contact.addBox("UpperPlate", motion.center(0), half_size, motion.velocity(0));
+    auto synchronize_plate = [&](Real time)
+    {
+        contact.setKinematics(upper_box, motion.center(time), motion.velocity(time));
+    };
+
+    SimpleDynamics<peridynamics::ParticleStateCheck> state_check(particle);
+    state_check.addScalar("Mass", 0);
+    state_check.addMatrix("DeformationGradient");
+    state_check.addMatrix("PDStress");
+    state_check.addVector("PDAcceleration");
+    state_check.addVector("PDAccelerationPrior");
+    for (const char *name : {"Mass", "Density", "VolumetricMeasure", "Damage"})
+        particles.addVariableToWrite<Real>(name);
+    for (const char *name : {"PDStress", "DeformationGradient"})
+        particles.addVariableToWrite<Matd>(name);
+    if (material.viscoplastic)
+    {
+        particles.addVariableToWrite<Matd>("PlasticStrain");
+        particles.addVariableToWrite<Real>("IsotropicHardeningParam");
+    }
+    BodyStatesRecordingToVtp states(system);
+    states.setFullPrecisionOutput(true);
+
+    Real &time = *system.getSystemVariableDataByName<Real>("PhysicalTime");
+    size_t steps = 0;
+    uint64_t completed_frame = 0;
+    Real last_contact_time = 0;
+    Real wall_offset = 0;
+    const Real *mass = particles.getVariableDataByName<Real>("Mass");
+    const Vecd *velocity = particles.getVariableDataByName<Vecd>("Velocity");
+    const Vecd *position = particles.getVariableDataByName<Vecd>("Position");
+    StdVec<Real> initial_masses(mass, mass + count);
+
+    // All registered material/integrator state and reference bonds are retained.
+    // This schema is not a claim that new material memories have been validated.
+    particles.getParticleGroupManager();
+    const std::string identity = "gel-solid-sphere-v1\n" + inputs.serialize() +
+        "\nrecording=" + std::to_string(system.StateRecording()) +
+        "\nexecutable=" + std::to_string(peridynamics::checkpoint_detail::fileHash(fs::canonical(argv[0])));
+    peridynamics::DiskCheckpoint checkpoint(restart.directory, identity);
+    checkpoint.addBody(dynamic_cast<peridynamics::CheckpointParticles &>(particles));
+    checkpoint.addConfiguration("GelReference", reference.inner_configuration_, particles.ParticlesBound());
+    checkpoint.addScalar("time", time);
+    checkpoint.addScalar("steps", steps);
+    checkpoint.addScalar("completed_frame", completed_frame);
+    checkpoint.addScalar("last_contact_time", last_contact_time);
+    checkpoint.addArray("initial_masses", initial_masses);
+    checkpoint.addOutput("effective_parameters.cfg");
+    checkpoint.addOutput("diagnostics.csv");
+
+    std::ofstream diagnostics;
+    auto flush = [&]() { diagnostics.flush(); requireGoodStream(diagnostics); };
+    size_t last_checkpoint_step = 0;
+    Real last_checkpoint_wall = 0;
+    auto save_checkpoint = [&](bool force)
+    {
+        const Real now = wall_offset + limits.elapsed();
+        const bool due = force || peridynamics::checkpoint_requested ||
+            (restart.steps && steps - last_checkpoint_step >= restart.steps) ||
+            (restart.seconds > 0 && now - last_checkpoint_wall >= restart.seconds);
+        if (!due)
+            return false;
+        flush();
+        checkpoint.save({time, now, steps, steps, completed_frame});
+        last_checkpoint_step = steps;
+        last_checkpoint_wall = now;
+        peridynamics::checkpoint_requested = 0;
+        return peridynamics::checkpoint_stop_requested ||
+            (restart.stop_after_checkpoint && (!restart.resume.empty() || time > 0));
+    };
+
+    // This observer has no initialize/force/update calls. It records current
+    // accepted geometry separately from the midpoint force actually integrated.
+    auto observe = [&](uint64_t frame)
+    {
+        const auto boxes = contact.observe();
+        Real total_mass = 0, initial_mass = 0, mass_error = 0, kinetic = 0, kick_work = 0;
+        const Vecd *applied = particles.getVariableDataByName<Vecd>("UpperPlateReaction");
+        Vecd applied_total = Vecd::Zero();
+        const Real *internal = particles.getVariableDataByName<Real>("PDInternalWork");
+        const Real *external = particles.getVariableDataByName<Real>("PDExternalWork");
+        const Real *hourglass_work = particles.getVariableDataByName<Real>("PDHourglassWork");
+        const Real *damping_work = particles.getVariableDataByName<Real>("PDDampingWork");
+        const Real *contact_work = particles.getVariableDataByName<Real>("ContactBoundaryWork");
+        const Real *friction_loss = particles.getVariableDataByName<Real>("ContactFrictionLoss");
+        const Real *plastic_work = particles.getVariableDataByName<Real>("PlasticWork");
+        Real applied_contact_work = 0, applied_friction_loss = 0, plastic = 0, hg_work = 0, pd_damping_work = 0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            total_mass += mass[i];
+            initial_mass += initial_masses[i];
+            mass_error = std::max(mass_error, std::abs(mass[i] / initial_masses[i] - 1));
+            kinetic += 0.5 * mass[i] * velocity[i].squaredNorm();
+            kick_work += internal[i] + external[i] + hourglass_work[i] + damping_work[i];
+            applied_contact_work += contact_work[i];
+            applied_friction_loss += friction_loss[i];
+            plastic += plastic_work[i];
+            hg_work += hourglass_work[i];
+            pd_damping_work += damping_work[i];
+            applied_total += applied[i];
+        }
+        diagnostics << time << ',' << motion.displacement(time) << ',' << steps << ',' << count << ','
+                    << total_mass << ',' << total_mass / initial_mass - 1 << ',' << mass_error << ','
+                    << boxes[upper_box].reaction[1] << ',' << applied_total[1] << ',' << last_contact_time << ','
+                    << boxes[0].reaction[1] << ',' << boxes[upper_box].max_penetration << ','
+                    << boxes[upper_box].contacting_particles << ',' << kinetic << ',' << kinetic - kick_work << ','
+                    << boxes[0].potential_energy + boxes[upper_box].potential_energy << ','
+                    << motion.center(time)[1] - half_size[1] << ','
+                    << boxes[upper_box].max_penetration / geometry.spacing << ','
+                    << contact.normalPenaltyModulus() << ',' << applied_contact_work << ',' << applied_friction_loss << ','
+                    << plastic << ',' << hg_work << ',' << pd_damping_work << '\n';
+        flush();
+        states.writeToFile(frame);
+    };
+
+    try
+    {
+        system.initializeSystemCellLinkedLists();
+        system.initializeSystemConfigurations();
+        shape.exec();
+        if (restart.resume.empty())
+        {
+            inputs.save("output/effective_parameters.cfg");
+            diagnostics.open("output/diagnostics.csv");
+            diagnostics << std::setprecision(17)
+                << "time_s,stroke_m,pd_steps,solid_count,solid_mass_kg,mass_relative_error,particle_mass_error,"
+                   "upper_observed_Fy_N,upper_last_applied_Fy_N,last_contact_sample_time_s,lower_observed_Fy_N,"
+                   "upper_max_penetration_m,upper_contact_count,kinetic_J,kick_identity_residual_J,"
+                   "observed_contact_potential_J,upper_face_y_m,upper_penetration_over_spacing,"
+                   "contact_penalty_modulus_Pa,applied_contact_work_J,applied_friction_loss_J,plastic_work_J,"
+                   "hourglass_work_J,pd_damping_work_J\n";
+            observe(0);
+        }
+        else
+        {
+            const auto loaded = checkpoint.restore(restart.resume);
+            if (time != loaded.time || steps != loaded.pd_steps || steps != loaded.acoustic_steps ||
+                completed_frame != loaded.completed_frame || completed_frame > uint64_t(options.loading.output_frames) ||
+                time < 0 || time > options.duration() || last_contact_time < 0 || last_contact_time > time)
+                throw std::runtime_error("inconsistent gel checkpoint cursor");
+            wall_offset = loaded.wall_seconds;
+            last_checkpoint_wall = wall_offset;
+            last_checkpoint_step = steps;
+            particle.updateCellLinkedList(); // Do not rebuild restored reference bonds.
+            synchronize_plate(time);
+            const std::regex snapshot("GelParticle_ite_([0-9]+)\\.vtp");
+            const fs::path orphans = "output/orphaned-after-resume-" + std::to_string(steps) + "-" +
+                std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+            for (const auto &entry : fs::directory_iterator("output"))
+            {
+                std::smatch match;
+                const std::string name = entry.path().filename().string();
+                if (entry.is_regular_file() && std::regex_match(name, match, snapshot) &&
+                    std::stoull(match[1]) > completed_frame)
+                {
+                    fs::create_directories(orphans);
+                    fs::rename(entry.path(), orphans / name);
+                }
+            }
+            diagnostics.open("output/diagnostics.csv", std::ios::app);
+            diagnostics << std::setprecision(17);
+        }
+        if (save_checkpoint(true))
+            return 75;
+
+        for (uint64_t frame = completed_frame + 1; frame <= uint64_t(options.loading.output_frames); ++frame)
+        {
+            const Real target = frame == uint64_t(options.loading.output_frames) ? options.duration() :
+                options.duration() * Real(frame) / options.loading.output_frames;
+            while (time < target)
+            {
+                limits.check(steps, wall_offset);
+                const Real dt = peridynamics::boundedTimeStep(timestep.exec(), {target - time});
+                initialize.exec();
+                first.exec(dt);
+                last_contact_time = time + 0.5 * dt;
+                synchronize_plate(last_contact_time);
+                contact.exec();
+                constitutive->exec(dt);
+                hourglass.exec(dt);
+                damping.exec(dt);
+                third.exec(dt);
+                fourth.exec(dt);
+                ++steps;
+                state_check.exec();
+                for (size_t i = 0; i < count; ++i)
+                    if (position[i].cwiseAbs().maxCoeff() > extent)
+                        peridynamics::numericalFailure(particle.Name(), i, "particle left bounded gel domain");
+                time = dt == target - time ? target : time + dt;
+                synchronize_plate(time);
+                if (save_checkpoint(false))
+                    return 75;
+            }
+            observe(frame);
+            completed_frame = frame;
+        }
+        if (restart.final_checkpoint && save_checkpoint(true))
+            return 75;
+        std::ofstream("output/run_status.txt") << "completed\ntime_s=" << std::setprecision(17) << time << '\n';
+        return 0;
+    }
+    catch (const std::exception &error)
+    {
+        const auto *resource = dynamic_cast<const ResourceStop *>(&error);
+        std::ofstream failure("output/run_status.txt");
+        failure << "failed\ntime_s=" << std::setprecision(17) << time << "\npd_steps=" << steps
+                << "\nreason=" << error.what() << "\nreturn_code=" << (resource ? resource->return_code : 1) << '\n';
+        throw;
+    }
+}
+} // namespace
+
+int main(int argc, char **argv)
+{
+    try
+    {
+        const bool describe = consumeDescriptionFlag(argc, argv);
+        peridynamics::ParticleCompressionOptions options;
+        peridynamics::CheckpointOptions restart;
+        restart.threads = std::max(size_t(1), std::min(restart.threads, ExecutionLimits::max_threads));
+        restart.parse(argc, argv);
+        auto inputs = options.bindings();
+        inputs.parse(argc, argv);
+        options.validate();
+        if (restart.threads > ExecutionLimits::max_threads)
+            throw std::invalid_argument("bounded gel control permits at most eight threads");
+        if (describe || restart.describe_only)
+        {
+            std::cout << std::setprecision(17)
+                      << "{\"model\":\"solid_sphere_no_separate_liquid\",\"calibrated\":false,"
+                         "\"fluid_transport\":false,\"fracture\":false,\"constitutive_model\":\""
+                      << (options.material.viscoplastic ? "perzyna_j2_viscoplastic" : "objective_linear_elastic")
+                      << "\","
+                         "\"format\":1,\"full_pd_state\":true,\"default_threads\":" << restart.threads
+                      << ",\"duration_s\":" << options.duration() << ",\"spacing_m\":" << options.geometry.spacing
+                      << ",\"max_particles\":" << ExecutionLimits::max_particles
+                      << ",\"restart_qualified\":false}\n";
+            return 0;
+        }
+        return simulate(argc, argv, options, inputs, restart);
+    }
+    catch (const ResourceStop &error)
+    {
+        std::cerr << "RESOURCE_STOP: " << error.what() << '\n';
+        return error.return_code;
+    }
+    catch (const std::exception &error)
+    {
+        std::cerr << "GEL_CONTROL_FAILED: " << error.what() << '\n';
+        return 1;
+    }
+}

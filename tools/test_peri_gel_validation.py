@@ -6,9 +6,19 @@ import tempfile
 import unittest
 from peri_gel_validation import force_error, validate_case
 from peri_gel_audit import material_response, matrix, checkpoint_physical_digest, surface_reference, surface_contact_fields
+from peri_gel_contact_time import require_time_only_inputs
 
 
 class GelValidationTests(unittest.TestCase):
+    def test_contact_diagnosis_cannot_change_speed_mass_material_or_penalty(self):
+        anchor = dict(pd_cfl=.1, maximum_dt=4e-9, compression_speed=.1, density=1000, youngs_modulus=1e6, contact_penalty_length=1e-9)
+        fine = dict(anchor, pd_cfl=.05, maximum_dt=2e-9)
+        require_time_only_inputs(anchor, fine, .5)
+        for key in ('compression_speed', 'density', 'youngs_modulus', 'contact_penalty_length'):
+            changed = dict(fine); changed[key] *= .5
+            with self.assertRaises(ValueError): require_time_only_inputs(anchor, changed, .5)
+        with self.assertRaises(ValueError): require_time_only_inputs(anchor, dict(fine, maximum_dt=4e-9), .5)
+
     def test_forged_step_cap_and_two_wall_penetration_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); output = root / 'output'; output.mkdir()

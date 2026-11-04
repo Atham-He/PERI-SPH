@@ -75,3 +75,18 @@ calls, <=5s/native, <=256MiB native RSS and <=32MiB raw outputs, with the actual
 F reserve >=150GiB. Infeasible/invalid cases are explicit negative controls,
 not solver retries. Other failures stop subsequent probes and preserve raw.
 No old R8, gel solver, queue, material fit or reference cache is dispatched.
+
+## Preserved protocol defect and correction
+
+The first frozen v6 probe stopped after one native free-flight attempt: return
+code0, but the stdout JSON omitted string fields and could not be parsed. The
+unqualified local name `quoted` collided through argument-dependent lookup with
+`std::quoted` for mutable std::string lvalues; its returned manipulator was
+discarded. This is a probe serialization bug, not a contact convergence result.
+The original state, malformed stdout, input, return code and ELF remain intact.
+
+The corrected version uses `writeJsonString`, records attempted return metadata
+before decoding, and adds an actual native protocol regression with spaces and
+quotes in the input path. A new frozen directory is required. Passing the
+protocol check alone is not mathematical qualification; the independent exact
+oracle must still check every new native result.

@@ -11,7 +11,7 @@ using namespace SPH;
 using namespace SPH::peridynamics;
 namespace
 {
-void quoted(const std::string &value)
+void writeJsonString(const std::string &value)
 {
     std::cout << '"';
     for (unsigned char c : value)
@@ -39,11 +39,11 @@ int main(int argc, char **argv)
     std::istringstream tail(fields.substr(fields.rfind(')') + 2));
     for (int i = 0; i <= 19; ++i) { tail >> token; if (i == 19) ticks = token; }
     std::cout << "{\"identity\":{\"pid\":" << getpid() << ",\"ppid\":" << getppid() << ",\"start_ticks\":";
-    quoted(ticks); std::cout << ",\"boot_id\":"; quoted(boot_id);
-    std::cout << ",\"executable\":"; quoted(std::filesystem::read_symlink("/proc/self/exe").string());
+    writeJsonString(ticks); std::cout << ",\"boot_id\":"; writeJsonString(boot_id);
+    std::cout << ",\"executable\":"; writeJsonString(std::filesystem::read_symlink("/proc/self/exe").string());
     std::cout << ",\"argv\":[";
     bool first = true;
-    while (std::getline(cmdline, command, '\0')) { if (!first) std::cout << ','; quoted(command); first = false; }
+    while (std::getline(cmdline, command, '\0')) { if (!first) std::cout << ','; writeJsonString(command); first = false; }
     std::cout << "]},\"prototype_only\":true,";
     try
     {
@@ -77,7 +77,7 @@ int main(int argc, char **argv)
     }
     catch (const std::exception &error)
     {
-        std::cout << "\"error\":"; quoted(error.what()); std::cout << "}\n";
+        std::cout << "\"error\":"; writeJsonString(error.what()); std::cout << "}\n";
         return 1;
     }
 }

@@ -9,3 +9,5 @@ set_tests_properties(peri_analysis_unit_tests PROPERTIES TIMEOUT 20 LABELS peri_
 add_executable(extra_3d_PD_normal_contact_probe normal_contact_probe.cpp)
 target_link_libraries(extra_3d_PD_normal_contact_probe PRIVATE sphinxsys_3d)
 set_target_properties(extra_3d_PD_normal_contact_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin")
+add_test(NAME peri_normal_probe_protocol COMMAND ${Python3_EXECUTABLE} "${SPHINXSYS_PROJECT_DIR}/tools/peri_normal_projection.py" protocol-check --executable $<TARGET_FILE:extra_3d_PD_normal_contact_probe>)
+set_tests_properties(peri_normal_probe_protocol PROPERTIES TIMEOUT 10 LABELS peri_fast)

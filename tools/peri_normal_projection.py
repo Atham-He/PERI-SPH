@@ -10,6 +10,7 @@ from pathlib import Path
 import resource
 import shutil
 import subprocess
+import tempfile
 
 
 def read(path): return json.loads(path.read_text())
@@ -126,11 +127,13 @@ def run(root):
         with (directory / 'stdout.json').open('wb') as stdout, (directory / 'stderr.txt').open('wb') as stderr:
             process = subprocess.run(command, stdout=stdout, stderr=stderr, timeout=plan['resources']['native_timeout_s'])
         save(directory / 'return.json', dict(return_code=process.returncode, command=command, recorded_at_utc=datetime.now(timezone.utc).isoformat()))
+        attempted = dict(name=name, expected_code=case['expected_code'], return_code=process.returncode, identity=None)
+        state['calls'].append(attempted); save(root / 'state.json', state)
         output = read(directory / 'stdout.json'); actual = output['identity']
         if actual['argv'] != command or actual['executable'] != str(root / 'native_probe') or actual['ppid'] != os.getpid() or \
                 actual['boot_id'] != state['controller']['boot_id'] or not actual['start_ticks'].isdigit():
             raise ValueError('Actual native OS identity/argv mismatch')
-        state['calls'].append(dict(name=name, expected_code=case['expected_code'], return_code=process.returncode, identity=actual))
+        attempted['identity'] = actual
         save(root / 'state.json', state)
         if process.returncode != case['expected_code']: raise ValueError('Unexpected native failure or false negative-control pass')
         if process.returncode == 0 and not output['converged']: raise ValueError('Native convergence gate failed')
@@ -210,12 +213,31 @@ def review(root):
     print(json.dumps(dict(status=receipt['status'], checked_native_calls=len(receipt['checks']), impact_trajectories=receipt['impact_trajectories']), indent=2))
 
 
+def protocol_check(executable):
+    """Regression for the actual native JSON wire protocol, including ADL and
+    escaped argv strings. This distinct free-flight control is not a gel run."""
+    executable = executable.resolve(strict=True)
+    with tempfile.TemporaryDirectory(prefix='normal probe "quoted" ') as directory:
+        path = Path(directory) / 'input.txt'
+        path.write_text(encode(probe([3], [2], [.25], .04, [])))
+        command = [str(executable), str(path)]
+        process = subprocess.run(command, capture_output=True, timeout=5, check=True)
+        result = json.loads(process.stdout)
+        actual = result['identity']
+        if actual['argv'] != command or actual['ppid'] != os.getpid() or not actual['start_ticks'].isdigit() or not actual['boot_id'] or \
+                result['velocity'] != [.25] or abs(result['position'][0]-2.01) > 1e-14:
+            raise ValueError('Native JSON/identity/free-flight protocol regression failed')
+    print(json.dumps(dict(status='native_json_identity_and_escaped_argv_protocol_passed')))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__); sub = parser.add_subparsers(dest='action', required=True)
     prep = sub.add_parser('prepare'); prep.add_argument('--root', type=Path, required=True); prep.add_argument('--executable', type=Path, required=True)
     for action in ('run', 'review'): sub.add_parser(action).add_argument('--root', type=Path, required=True)
+    sub.add_parser('protocol-check').add_argument('--executable', type=Path, required=True)
     args = parser.parse_args()
     if args.action == 'prepare': prepare(args)
     elif args.action == 'run': run(args.root)
-    else: review(args.root)
+    elif args.action == 'review': review(args.root)
+    else: protocol_check(args.executable)
 if __name__ == '__main__': main()

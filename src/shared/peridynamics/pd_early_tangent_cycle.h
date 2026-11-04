@@ -11,7 +11,7 @@ namespace SPH::peridynamics
  * 0 -> +1 -> -1 -> 0 over 2/4/2 nominal time steps, then held at zero.
  * Each join has zero prescribed velocity. It does not assert that any contact
  * stays active: the physical trajectory must prove same-row reversal itself.
- * This utility is not connected to a solver or an existing frozen protocol.
+ * Kind2 uses this diagnostic; the original kind0/1 motion is unchanged.
  */
 struct EarlyTangentCycle
 {

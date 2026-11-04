@@ -15,6 +15,17 @@ from peri_bounded_gel_audit import (
 CURSOR='actual_interval_mean_prescribed_displacement_difference_over_actual_dt'
 
 
+def early_tangent_shape(time,dt):
+    """Independent decimal piecewise polynomial at original binary64 times."""
+    t=dec(time);ends=[dec(k*dt) for k in [2,6,8]]
+    assert t>=0
+    if t>=ends[2]:return D(0)
+    phase=0 if t<ends[0] else (1 if t<ends[1] else 2)
+    begin=D(0) if phase==0 else ends[phase-1]
+    u=(t-begin)/(ends[phase]-begin);s=3*u*u-2*u*u*u
+    return s if phase==0 else (1-2*s if phase==1 else -1+s)
+
+
 def protocol(case,step,time):
     """95-digit frozen piecewise motion, original binary endpoint clock."""
     dt=float(case['dt']);ends=[16*dt,24*dt,40*dt]
@@ -36,11 +47,12 @@ def protocol(case,step,time):
         cubic[2]=amplitude*(3-6*theta)*delta*delta
         cubic[3]=-2*amplitude*delta**3
     tangent=list(map(dec,case['tangent_stroke']))
+    ta,tb=(early_tangent_shape(time,dt),early_tangent_shape(next_time,dt)) if case['protocol_kind']==2 else (a,b)
     return dict(phase=phase,step=step,old_time=time,new_time=next_time,actual_dt=actual_dt,
         old_offset=[D(-1),-1+stroke*a],new_offset=[D(-1),-1+stroke*b],
         normal_cubic=[[D(-1),D(0),D(0),D(0)],cubic],
-        old_tangent_displacement=[[D(0),D(0)],[x*a for x in tangent]],
-        new_tangent_displacement=[[D(0),D(0)],[x*b for x in tangent]])
+        old_tangent_displacement=[[D(0),D(0)],[x*ta for x in tangent]],
+        new_tangent_displacement=[[D(0),D(0)],[x*tb for x in tangent]])
 
 
 def neumaier(value,total,correction):
@@ -86,6 +98,10 @@ class FrictionInspector(Inspector):
         self.close(header['frame'],expected_frame);self.close(header['plate_tangent'],expected_tangent)
         assert header['protocol_kind']==case['protocol_kind'] and header['phase_step_counts']==[16,8,16]
         self.close(header['phase_end_times'],[16*case['dt'],24*case['dt'],40*case['dt']])
+        if case['protocol_kind']==2:
+            assert header['tangent_cycle_cursor']=='independent_C1_early_cycle_then_zero'
+            assert header['tangent_cycle_factors']==[0,1,-1,0]
+            self.close(header['tangent_cycle_end_times'],[k*case['dt'] for k in [2,6,8]])
         self.close(header['mu'],case['mu']);self.close(header['tangent_stroke'],case['tangent_stroke'])
         assert header['wall_velocity_cursor']==CURSOR
         assert header['geometry_cursor']=='minimum_over_each_linear_particle_and_true_prescribed_cubic_wall_interval'

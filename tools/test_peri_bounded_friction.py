@@ -81,5 +81,28 @@ class FrictionMotionAndHistoryReferenceTests(unittest.TestCase):
             normal_only=False,full_S3_complete=False,normalized_benchmark=True)
         with self.assertRaises(AssertionError):check_geometry(dict(rotation=0),header)
 
+    def test_early_tangent_cycle_preserves_normal_and_accepted_clock(self):
+        with localcontext() as ctx:
+            ctx.prec=95;time=0.;signs=[]
+            for step in range(40):
+                old=protocol(case(1),step,time);new=protocol(case(2),step,time)
+                for field in ['old_time','new_time','actual_dt','old_offset','new_offset','normal_cubic']:
+                    self.assertEqual(old[field],new[field])
+                change=new['new_tangent_displacement'][1][0]-new['old_tangent_displacement'][1][0]
+                signs.append(1 if change>0 else (-1 if change<0 else 0))
+                time=new['new_time']
+            self.assertEqual(signs,[1]*2+[-1]*4+[1]*2+[0]*32)
+
+    def test_early_cycle_endpoints_are_c1_and_held_afterward(self):
+        from peri_bounded_friction_audit import early_tangent_shape
+        with localcontext() as ctx:
+            ctx.prec=95
+            self.assertEqual([early_tangent_shape(t,.01) for t in [0,.02,.06,.08,.4]],[0,1,-1,0,0])
+            for t in [.02,.06,.08]:
+                e=1e-8
+                for direction in [-1,1]:
+                    slope=abs((early_tangent_shape(t+direction*e,.01)-early_tangent_shape(t,.01))/D.from_float(e))
+                    self.assertLess(slope,D('1e-4'))
+
 
 if __name__=='__main__':unittest.main()

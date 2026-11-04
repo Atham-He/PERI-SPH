@@ -182,3 +182,38 @@ TEST(BoundedFrictionProtocol, BadPhaseCursorAndConfigurationReject)
     EXPECT_THROW(protocol.interval(40,.4),std::invalid_argument);
     protocol.tangent_stroke[0]=.2;EXPECT_THROW(protocol.validate(),std::invalid_argument);
 }
+
+TEST(BoundedFrictionProtocol, EarlyCyclePreservesEveryNormalClockAndCubicBit)
+{
+    BoundedFrictionProtocol old,cycle;old.kind=1;cycle.kind=2;
+    cycle.tangent_stroke={.0005,.0003333333333333333};
+    Real time=0;size_t positive=0,negative=0;ContactTangentVector sum=ContactTangentVector::Zero();
+    for(size_t k=0;k<cycle.steps();++k)
+    {
+        const auto a=old.interval(k,time),b=cycle.interval(k,time);
+        EXPECT_DOUBLE_EQ(a.actual_dt,b.actual_dt);EXPECT_DOUBLE_EQ(a.new_time,b.new_time);
+        EXPECT_EQ(a.old_offset,b.old_offset);EXPECT_EQ(a.new_offset,b.new_offset);
+        for(size_t p=0;p<2;++p)EXPECT_EQ(a.normal_cubic[p].coefficients,b.normal_cubic[p].coefficients);
+        if(b.wall_tangent_velocity[1][0]>0)++positive;
+        if(b.wall_tangent_velocity[1][0]<0)++negative;
+        if(k>=8)EXPECT_EQ(b.wall_tangent_velocity[1].norm(),0);
+        sum+=b.actual_dt*b.wall_tangent_velocity[1];time=b.new_time;
+    }
+    EXPECT_EQ(positive,4u);EXPECT_EQ(negative,4u);EXPECT_LT(sum.norm(),1e-18);
+    EXPECT_DOUBLE_EQ(time,old.endTime());
+}
+
+TEST(BoundedFrictionProtocol, EarlyCycleJoinsAndUnsupportedKindReject)
+{
+    const EarlyTangentCycle cycle{.01};
+    EXPECT_DOUBLE_EQ(cycle.at(0),0);EXPECT_DOUBLE_EQ(cycle.at(.02),1);
+    EXPECT_DOUBLE_EQ(cycle.at(.06),-1);EXPECT_DOUBLE_EQ(cycle.at(.08),0);
+    for(Real join:cycle.ends())
+    {
+        const Real epsilon=1e-8;
+        EXPECT_NEAR((cycle.at(join)-cycle.at(join-epsilon))/epsilon,0,1e-4);
+        EXPECT_NEAR((cycle.at(join+epsilon)-cycle.at(join))/epsilon,0,1e-4);
+    }
+    BoundedFrictionProtocol protocol;protocol.kind=3;
+    EXPECT_THROW(protocol.validate(),std::invalid_argument);
+}

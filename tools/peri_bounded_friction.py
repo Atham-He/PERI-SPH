@@ -7,9 +7,10 @@ import argparse,json,math,os,resource,shutil,subprocess,sys,time,traceback
 from pathlib import Path
 from peri_elastic_normal import identity,read,record,reserves,save,stamp,verify
 from peri_bounded_friction_audit import inspect_stream
-from peri_bounded_friction_support import controls,encode,complete_cursor,anchored_normal,compare_rotated,compare_normal_anchor
+from peri_bounded_friction_support import encode,complete_cursor,anchored_normal,compare_rotated,compare_normal_anchor
 from peri_bounded_friction_negative import OneStepCapture,negatives
 from peri_coulomb_global import live_identity
+from peri_early_friction_support import qualification_prerequisite
 
 
 def prepare(root,executable,prospective,normal_root):
@@ -19,6 +20,8 @@ def prepare(root,executable,prospective,normal_root):
     plan=read(prospective)
     assert plan['normalized_physical_gate']==1e-10 and plan['roundoff_gate']==1e-12
     assert plan['dense_penetration_stroke_gate']==.01 and not plan['S3_complete'] and not plan['calibration_allowed']
+    assert plan['campaign']=='early_cycle_unattempted_tail','a new explicit continuation plan is required'
+    continuation=qualification_prerequisite(**plan['continuation'])
     budget=reserves(root.parent)
     mem={line.split(':')[0]:int(line.split()[1])*1024 for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith(('MemTotal:','MemAvailable:'))}
     assert mem['MemAvailable']>=8*2**30,('available_memory',mem)
@@ -29,11 +32,12 @@ def prepare(root,executable,prospective,normal_root):
     assert global_review['supported_original_control_count']==18 and not global_review['S3_complete']
     disk_review=read(plan['disk_review'])
     assert disk_review['status']=='coulomb_disk_kernel_values_derivatives_enclosures_independently_passed'
-    root.mkdir();(root/'frozen').mkdir();artifacts=anchor['artifacts']+[record(prospective)]
+    root.mkdir();(root/'frozen').mkdir();artifacts=anchor['artifacts']+continuation['artifacts']+[record(prospective)]
     artifacts.extend([record(plan['original_global_review']),record(plan['disk_review'])])
     verify([global_review['prior_independent_review']]);artifacts.append(global_review['prior_independent_review'])
     files=[
         'src/shared/peridynamics/pd_bounded_gel_friction.h','src/shared/peridynamics/pd_bounded_friction_protocol.h',
+        'src/shared/peridynamics/pd_early_tangent_cycle.h',
         'src/shared/peridynamics/pd_bounded_normal_scene.h','src/shared/peridynamics/pd_bounded_gel.h',
         'src/shared/peridynamics/pd_fixed_reference.h','src/shared/peridynamics/pd_surface_quadrature.h',
         'src/shared/peridynamics/pd_gel_affine_path.h','src/shared/peridynamics/pd_gel_material.h','src/shared/peridynamics/pd_gel_material.cpp',
@@ -45,12 +49,14 @@ def prepare(root,executable,prospective,normal_root):
         'tests/3d_examples/extra_3d_PD_framework_tests/CMakeLists.txt',
         'tools/peri_bounded_friction.py','tools/peri_bounded_friction_audit.py',
         'tools/peri_bounded_friction_support.py','tools/peri_bounded_friction_negative.py',
+        'tools/peri_early_friction_support.py','tools/test_peri_early_friction_support.py',
         'tools/test_peri_bounded_friction.py','tools/test_peri_bounded_friction_support.py','tools/peri_coulomb_contact_audit.py',
         'tools/peri_bounded_gel_audit.py','tools/peri_pd_reference_audit.py','tools/peri_pd_material_reference.py',
         'tools/peri_gel_affine_audit.py','tools/peri_normal_projection_audit.py','tools/peri_dense_contact_audit.py',
         'tools/peri_many_contact_audit.py','tools/peri_elastic_normal.py','tools/peri_coulomb_global.py',
         'tools/peri_coulomb_global_controls.py','tools/peri_coulomb_global_audit.py',
-        'docs/peri/BOUNDED_FRICTION_QUALIFICATION_20261105.md']
+        'docs/peri/BOUNDED_FRICTION_QUALIFICATION_20261105.md',
+        'docs/peri/EARLY_FRICTION_CYCLE_20261105.md']
     for file in files:
         source=repo/file;target=root/'frozen'/source.name;shutil.copy2(source,target);artifacts.extend([record(source),record(target)])
     binary=root/'frozen'/executable.name;shutil.copy2(executable,binary)
@@ -79,9 +85,11 @@ def prepare(root,executable,prospective,normal_root):
     for line in subprocess.check_output(['ldd',str(executable)],text=True).splitlines():
         for token in line.split():
             if token.startswith('/') and Path(token).is_file():artifacts.append(record(token))
-    cases=controls()
+    cases=continuation['continuation_controls']
+    cases[0]['new_negative_controls']=True
     assert all(c['native_wall_seconds']<=3600 and c['output_GiB']<=4 for c in cases)
-    plan.update(controls=cases,normal_anchor=anchor,prepared_at=stamp(),identity=identity(),resources=budget,
+    plan.update(controls=cases,normal_anchor=anchor,continuation_qualification=continuation,
+        prepared_at=stamp(),identity=identity(),resources=budget,
         source_commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=repo,text=True).strip(),python_version=sys.version)
     save(root/'plan.json',plan);artifacts.append(record(root/'plan.json'));inputs=[]
     for case in cases:
@@ -119,7 +127,7 @@ def review_case(root,name):
         assert meta==attempt['native_identity'] and meta['argv']==attempt['command']
         assert meta['pid']==attempt['child_pid'] and meta['ppid']==attempt['identity']['pid']
         assert meta['boot_id']==attempt['identity']['boot_id'] and meta['start_ticks'].isdigit()
-        capture=OneStepCapture() if name=='actual_PD_two_tangent_press' else None
+        capture=OneStepCapture() if name=='actual_PD_two_tangent_press' or case.get('new_negative_controls') else None
         result['assessment']=inspect_stream(case,attempt['stdout']['path'],0,True,capture)
         if capture:
             result['negative_controls']=negatives(capture,root/'single_step_negatives',attempt['stdout'])
@@ -206,7 +214,7 @@ def run(root):
         save(root/'independent_review.json',dict(status='actual_bounded_PD_friction_trajectories_independently_passed',
             recorded_at=stamp(),identity=identity(),case_reviews=[a['independent_review'] for a in attempts],
             terminal=record(root/'terminal.json'),preparation=record(root/'preparation.json'),
-            scope='one fixed33node actual PD normal/two-tangent original-equation trajectories,40step protocols and same-map normal limit; not convergence/scalability or restart',
+            scope='new early-cycle actual PD trajectory plus previously-unattempted stick/zero-mu; prior press/rotation and failed old protocol retained separately; not convergence/scalability or restart',
             S3_complete=False,S4_complete=False,full_restart_qualified=False,calibration_allowed=False))
     print(json.dumps(dict(status=terminal['status'],attempts=len(attempts),failure=failure)))
     return int(failure is not None)

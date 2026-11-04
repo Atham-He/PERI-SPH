@@ -3,6 +3,7 @@
 #define PD_BOUNDED_FRICTION_PROTOCOL_H
 
 #include "pd_bounded_gel_friction.h"
+#include "pd_early_tangent_cycle.h"
 
 namespace SPH::peridynamics
 {
@@ -53,13 +54,13 @@ struct BoundedFrictionInterval
  */
 struct BoundedFrictionProtocol
 {
-    int kind=0; // 0 press16, 1 press16/hold8/release16
+    int kind=0; // 0 press16, 1 press16/hold8/release16, 2 same normal plus early tangent cycle
     Real nominal_dt=.01,normal_stroke=.01;
     ContactTangentVector tangent_stroke=ContactTangentVector::Zero();
 
     void validate() const
     {
-        if(kind<0 || kind>1 || !std::isfinite(nominal_dt) || nominal_dt<=0 ||
+        if(kind<0 || kind>2 || !std::isfinite(nominal_dt) || nominal_dt<=0 ||
             !std::isfinite(normal_stroke) || normal_stroke<=0 || normal_stroke>=.1 ||
             !tangent_stroke.allFinite() || tangent_stroke.norm()>=.1)
             throw std::invalid_argument("friction protocol: configuration");
@@ -96,6 +97,12 @@ struct BoundedFrictionProtocol
         result.old_offset[1]=-1+normal_stroke*old_shape;result.new_offset[1]=-1+normal_stroke*new_shape;
         result.old_tangent_displacement[1]=tangent_stroke*old_shape;
         result.new_tangent_displacement[1]=tangent_stroke*new_shape;
+        if(kind==2)
+        {
+            const EarlyTangentCycle cycle{nominal_dt};
+            result.old_tangent_displacement[1]=tangent_stroke*cycle.at(accepted_time);
+            result.new_tangent_displacement[1]=tangent_stroke*cycle.at(next);
+        }
         result.wall_tangent_velocity[1]=(result.new_tangent_displacement[1]-result.old_tangent_displacement[1])/dt;
         auto &c=result.normal_cubic[1].coefficients;c[0]=result.old_offset[1];
         if(phase!=1)

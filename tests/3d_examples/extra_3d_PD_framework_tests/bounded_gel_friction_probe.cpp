@@ -38,6 +38,12 @@ void header(const Input &c,const BoundedNormalScene &scene,const BoundedGelFrict
     io::field("mu",c.mu);io::field("tangent_stroke",c.motion.tangent_stroke);
     io::field("protocol_kind",c.motion.kind);io::field("phase_end_times",c.motion.phaseEnds());
     io::field("phase_step_counts",StdVec<size_t>{16,8,16});
+    if(c.motion.kind==2)
+    {
+        io::field("tangent_cycle_end_times",EarlyTangentCycle{c.motion.nominal_dt}.ends());
+        io::field("tangent_cycle_factors",StdVec<Real>{0,1,-1,0});
+        io::field("tangent_cycle_cursor","independent_C1_early_cycle_then_zero");
+    }
     io::field("wall_velocity_cursor","actual_interval_mean_prescribed_displacement_difference_over_actual_dt");
     io::field("dense_penetration_stroke_gate",.01);
     io::field("geometry_cursor","minimum_over_each_linear_particle_and_true_prescribed_cubic_wall_interval");

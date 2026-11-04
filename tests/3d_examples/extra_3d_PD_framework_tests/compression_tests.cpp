@@ -59,6 +59,8 @@ TEST(PDGelOptions, RejectsSingularMaterialUnresolvedSphereAndNonFiniteInputs)
     options.material.poisson_ratio = 0.35;
     options.geometry.spacing = options.geometry.radius;
     EXPECT_THROW(options.validate(), std::invalid_argument);
+    options.geometry.spacing = 2e-5; // Exactly three spacings in the radius.
+    EXPECT_NO_THROW(options.validate());
     options.geometry.spacing = 1e-5;
     options.contact.friction_mu = std::numeric_limits<Real>::quiet_NaN();
     EXPECT_THROW(options.validate(), std::invalid_argument);
@@ -149,4 +151,24 @@ TEST(PDContactObservation, FrictionDissipatesSlipAndSamplingIsGalileanInvariant)
     EXPECT_LT((before.force - after.force).norm(), 1e-10);
     EXPECT_DOUBLE_EQ(before.potential_energy, after.potential_energy);
     EXPECT_NEAR(after.boundary_power - before.boundary_power, before.force.dot(common), 1e-10);
+}
+
+TEST(PDContactObservation, IntegrationVelocityPredictorDoesNotChangeAcceptedStateObservation)
+{
+    SolidSphere solid;
+    auto &p = solid.body.getBaseParticles();
+    SimpleDynamics<solid_dynamics::RigidBoxContactforPD> contact(solid.body, 0.3, 0.01);
+    contact.addBox("Plate", Vecd(0, -0.4, 0), Vecd(0.5, 0.15, 0.5));
+    auto *position = p.getVariableDataByName<Vecd>("Position");
+    auto *velocity = p.getVariableDataByName<Vecd>("Velocity");
+    StdVec<Vecd> predicted(p.TotalRealParticles(), Vecd(-0.03, 0, 0));
+    for (size_t i = 0; i < p.TotalRealParticles(); ++i)
+    { position[i] = Vecd(0, 0.5, 0); velocity[i] = Vecd(0.03, 0, 0); }
+    position[0] = Vecd(0, -0.21, 0);
+    contact.setForceSamplingVelocityData(predicted.data());
+    contact.exec();
+    EXPECT_GT(p.getVariableDataByName<Vecd>("ContactFrictionForce")[0][0], 0);
+    EXPECT_LT(contact.evaluate(0, 0).friction[0], 0);
+    EXPECT_GT(contact.observe()[0].reaction[0], 0);
+    EXPECT_DOUBLE_EQ(velocity[0][0], 0.03);
 }

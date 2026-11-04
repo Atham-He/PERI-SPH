@@ -192,6 +192,11 @@ void RigidBoxContactforPD::setKinematics(size_t box, const Vecd &center, const V
 
 RigidBoxContactResponse RigidBoxContactforPD::evaluate(size_t particle, size_t box_index) const
 {
+    return evaluateAt(particle, box_index, velocity_[particle]);
+}
+
+RigidBoxContactResponse RigidBoxContactforPD::evaluateAt(size_t particle, size_t box_index, const Vecd &velocity) const
+{
     const auto &box = boxes_.at(box_index);
     const auto geometry = rigidBoxDistance(position_[particle], box.center, box.half_size);
     RigidBoxContactResponse response;
@@ -201,7 +206,7 @@ RigidBoxContactResponse RigidBoxContactforPD::evaluate(size_t particle, size_t b
 
     const Real stiffness = stiffness_ * volume_[particle] / (spacing_ * spacing_);
     const Vecd normal_force = stiffness * response.penetration * geometry.second;
-    response.force = pdContactPairForce(normal_force, velocity_[particle] - box.velocity,
+    response.force = pdContactPairForce(normal_force, velocity - box.velocity,
                                        geometry.second, mu_, veps_);
     response.friction = response.force - normal_force;
     response.potential_energy = 0.5 * stiffness * response.penetration * response.penetration;
@@ -233,7 +238,7 @@ void RigidBoxContactforPD::update(size_t i, Real)
     energy_[i] = boundary_power_[i] = friction_boundary_power_[i] = 0;
     for (size_t k = 0; k < boxes_.size(); ++k)
     {
-        const auto response = evaluate(i, k);
+        const auto response = evaluateAt(i, k, force_sampling_velocity_ ? force_sampling_velocity_[i] : velocity_[i]);
         force_[i] += response.force;
         friction_[i] += response.friction;
         boxes_[k].reaction[i] = -response.force;

@@ -20,6 +20,8 @@
 #include "pd_fsi.h"
 #include "pd_kernel.h"
 #include "pd_materials.h"
+#include "pd_gel_material.h"
+#include "pd_gel_dynamics.h"
 #include "nosbpd_dynamics.h"
 
 #endif // ALL_PERIDYNAMICS_H

@@ -185,6 +185,9 @@ class RigidBoxContactforPD : public LocalDynamics
     void setKinematics(size_t box, const Vecd &center, const Vecd &velocity);
     void applyToCurrentAcceleration(bool value) {current_acceleration_ = value;}
     void applyAcceleration(bool value) {apply_acceleration_ = value;}
+    /** Optional integration-only velocity predictor. The body owns the array;
+     * accepted-state evaluate/observe always use actual particle velocities. */
+    void setForceSamplingVelocityData(const Vecd *values) { force_sampling_velocity_ = values; }
     RigidBoxContactResponse evaluate(size_t particle, size_t box) const;
     StdVec<RigidBoxContactObservation> observe() const;
     Real normalPenaltyModulus() const { return stiffness_; }
@@ -197,6 +200,8 @@ class RigidBoxContactforPD : public LocalDynamics
     Vecd *acceleration_;
     Vecd *position_, *velocity_, *prior_, *force_, *friction_;
     Real *volume_, *energy_, *boundary_power_, *friction_boundary_power_;
+    const Vecd *force_sampling_velocity_ = nullptr;
+    RigidBoxContactResponse evaluateAt(size_t particle, size_t box, const Vecd &velocity) const;
 };
 } // namespace solid_dynamics
 } // namespace SPH

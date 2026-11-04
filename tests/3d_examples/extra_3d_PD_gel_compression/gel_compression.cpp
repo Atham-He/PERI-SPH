@@ -65,7 +65,11 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
                                 Vecd(0, options.centerHeight(), 0), geometry.radius, "GelParticle"));
     particle.defineAdaptationRatios(0.5 * options.numerics.horizon_ratio);
     const auto &material = options.material;
-    if (material.viscoplastic)
+    if (material.viscoelastic)
+        particle.defineMatterMaterial<GelViscoelasticSolid>(
+            material.density, material.youngs_modulus, material.poisson_ratio,
+            material.relaxing_shear_ratio, material.relaxation_time);
+    else if (material.viscoplastic)
         particle.defineMatterMaterial<ViscoPlasticSolidforPD>(
             material.density, material.youngs_modulus, material.poisson_ratio,
             material.yield_stress, material.plastic_viscosity, material.hardening_modulus);
@@ -82,8 +86,14 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
     InteractionWithUpdate<solid_dynamics::NosbPDShapeMatrix> shape(reference);
     SimpleDynamics<solid_dynamics::PDTimeStepInitialization> initialize(particle, makeShared<Gravity>(Vecd::Zero()));
     SimpleDynamics<solid_dynamics::NosbPDFirstStep> first(particle);
-    UniquePtr<BaseDynamics<void>> constitutive;
-    if (material.viscoplastic)
+    UniquePtr<BaseDynamics<void>> constitutive, commit_history;
+    if (material.viscoelastic)
+    {
+        using Update = solid_dynamics::GelConstitutiveUpdate;
+        constitutive = makeUnique<InteractionDynamics<Update>>(reference, Update::Stage::MidpointForce);
+        commit_history = makeUnique<InteractionDynamics<Update>>(reference, Update::Stage::AcceptedHistory);
+    }
+    else if (material.viscoplastic)
         constitutive = makeUnique<InteractionWithUpdate<solid_dynamics::NosbPDSecondStepPlastic>>(reference);
     else
         constitutive = makeUnique<InteractionWithUpdate<solid_dynamics::NosbPDSecondStep>>(reference);
@@ -102,6 +112,11 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
     const peridynamics::CompressionPlateMotion motion{
         options.initialUpperFace(), geometry.plate_thickness, options.loading.stroke, options.duration()};
     const size_t upper_box = contact.addBox("UpperPlate", motion.center(0), half_size, motion.velocity(0));
+    auto *contact_sample_position = particles.registerStateVariableData<Vecd>("GelContactSamplePosition");
+    auto *contact_sample_velocity = particles.registerStateVariableData<Vecd>("GelContactSampleVelocity");
+    auto *contact_base_velocity = particles.registerStateVariableData<Vecd>("GelContactBaseVelocity");
+    const auto *previous_acceleration = particles.getVariableDataByName<Vecd>("PDAccelerationOld");
+    contact.setForceSamplingVelocityData(contact_sample_velocity);
     auto synchronize_plate = [&](Real time)
     {
         contact.setKinematics(upper_box, motion.center(time), motion.velocity(time));
@@ -117,10 +132,21 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
         particles.addVariableToWrite<Real>(name);
     for (const char *name : {"PDStress", "DeformationGradient"})
         particles.addVariableToWrite<Matd>(name);
+    for (const char *name : {"Velocity", "UpperPlateReaction", "ContactFrictionForce", "GelContactSamplePosition", "GelContactSampleVelocity", "GelContactBaseVelocity", "PDAccelerationOld"})
+        particles.addVariableToWrite<Vecd>(name);
+    for (const char *name : {"ContactBoundaryWork", "ContactFrictionLoss", "PDHourglassWork", "PDDampingWork"})
+        particles.addVariableToWrite<Real>(name);
     if (material.viscoplastic)
     {
         particles.addVariableToWrite<Matd>("PlasticStrain");
         particles.addVariableToWrite<Real>("IsotropicHardeningParam");
+    }
+    if (material.viscoelastic)
+    {
+        for (const char *name : {"GelGreenStrain", "GelViscousStrain", "GelAcceptedStress"})
+            particles.addVariableToWrite<Matd>(name);
+        for (const char *name : {"GelEnergyDensity", "GelDissipationDensity", "GelHistoryTime"})
+            particles.addVariableToWrite<Real>(name);
     }
     BodyStatesRecordingToVtp states(system);
     states.setFullPrecisionOutput(true);
@@ -130,6 +156,7 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
     uint64_t completed_frame = 0;
     Real last_contact_time = 0;
     Real wall_offset = 0;
+    Real initial_stored_energy = 0;
     const Real *mass = particles.getVariableDataByName<Real>("Mass");
     const Vecd *velocity = particles.getVariableDataByName<Vecd>("Velocity");
     const Vecd *position = particles.getVariableDataByName<Vecd>("Position");
@@ -138,7 +165,7 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
     // All registered material/integrator state and reference bonds are retained.
     // This schema is not a claim that new material memories have been validated.
     particles.getParticleGroupManager();
-    const std::string identity = "gel-solid-sphere-v1\n" + inputs.serialize() +
+    const std::string identity = "gel-solid-sphere-v2\n" + inputs.serialize() +
         "\nrecording=" + std::to_string(system.StateRecording()) +
         "\nexecutable=" + std::to_string(peridynamics::checkpoint_detail::fileHash(fs::canonical(argv[0])));
     peridynamics::DiskCheckpoint checkpoint(restart.directory, identity);
@@ -148,12 +175,18 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
     checkpoint.addScalar("steps", steps);
     checkpoint.addScalar("completed_frame", completed_frame);
     checkpoint.addScalar("last_contact_time", last_contact_time);
+    checkpoint.addScalar("initial_stored_energy", initial_stored_energy);
     checkpoint.addArray("initial_masses", initial_masses);
     checkpoint.addOutput("effective_parameters.cfg");
     checkpoint.addOutput("diagnostics.csv");
+    checkpoint.addOutput("step_trace.csv");
 
-    std::ofstream diagnostics;
-    auto flush = [&]() { diagnostics.flush(); requireGoodStream(diagnostics); };
+    std::ofstream diagnostics, step_trace;
+    auto flush = [&]()
+    {
+        diagnostics.flush(); requireGoodStream(diagnostics);
+        step_trace.flush(); requireGoodStream(step_trace);
+    };
     size_t last_checkpoint_step = 0;
     Real last_checkpoint_wall = 0;
     auto save_checkpoint = [&](bool force)
@@ -189,6 +222,10 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
         const Real *friction_loss = particles.getVariableDataByName<Real>("ContactFrictionLoss");
         const Real *plastic_work = particles.getVariableDataByName<Real>("PlasticWork");
         Real applied_contact_work = 0, applied_friction_loss = 0, plastic = 0, hg_work = 0, pd_damping_work = 0;
+        Real gel_energy = 0, gel_dissipation = 0;
+        const Real *volume = particles.getVariableDataByName<Real>("VolumetricMeasure");
+        const Real *energy = material.viscoelastic ? particles.getVariableDataByName<Real>("GelEnergyDensity") : nullptr;
+        const Real *dissipation = material.viscoelastic ? particles.getVariableDataByName<Real>("GelDissipationDensity") : nullptr;
         for (size_t i = 0; i < count; ++i)
         {
             total_mass += mass[i];
@@ -201,8 +238,18 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
             plastic += plastic_work[i];
             hg_work += hourglass_work[i];
             pd_damping_work += damping_work[i];
+            if (material.viscoelastic)
+            {
+                gel_energy += volume[i] * energy[i];
+                gel_dissipation += volume[i] * dissipation[i];
+            }
             applied_total += applied[i];
         }
+        const Real stored = kinetic + gel_energy + boxes[0].potential_energy + boxes[upper_box].potential_energy;
+        if (frame == 0)
+            initial_stored_energy = stored;
+        const Real residual = applied_contact_work - (stored - initial_stored_energy + gel_dissipation +
+            applied_friction_loss - hg_work - pd_damping_work);
         diagnostics << time << ',' << motion.displacement(time) << ',' << steps << ',' << count << ','
                     << total_mass << ',' << total_mass / initial_mass - 1 << ',' << mass_error << ','
                     << boxes[upper_box].reaction[1] << ',' << applied_total[1] << ',' << last_contact_time << ','
@@ -212,7 +259,8 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
                     << motion.center(time)[1] - half_size[1] << ','
                     << boxes[upper_box].max_penetration / geometry.spacing << ','
                     << contact.normalPenaltyModulus() << ',' << applied_contact_work << ',' << applied_friction_loss << ','
-                    << plastic << ',' << hg_work << ',' << pd_damping_work << '\n';
+                    << plastic << ',' << hg_work << ',' << pd_damping_work << ',' << material.viscoelastic << ','
+                    << gel_energy << ',' << gel_dissipation << ',' << residual << '\n';
         flush();
         states.writeToFile(frame);
     };
@@ -226,13 +274,16 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
         {
             inputs.save("output/effective_parameters.cfg");
             diagnostics.open("output/diagnostics.csv");
+            step_trace.open("output/step_trace.csv");
+            step_trace << std::setprecision(17) << "time_s,dt_s,pd_steps,last_contact_sample_time_s,material_history_time_s\n";
             diagnostics << std::setprecision(17)
                 << "time_s,stroke_m,pd_steps,solid_count,solid_mass_kg,mass_relative_error,particle_mass_error,"
                    "upper_observed_Fy_N,upper_last_applied_Fy_N,last_contact_sample_time_s,lower_observed_Fy_N,"
                    "upper_max_penetration_m,upper_contact_count,kinetic_J,kick_identity_residual_J,"
                    "observed_contact_potential_J,upper_face_y_m,upper_penetration_over_spacing,"
                    "contact_penalty_modulus_Pa,applied_contact_work_J,applied_friction_loss_J,plastic_work_J,"
-                   "hourglass_work_J,pd_damping_work_J\n";
+                   "hourglass_work_J,pd_damping_work_J,material_energy_available,gel_stored_energy_J,"
+                   "gel_dissipation_J,mechanical_residual_J\n";
             observe(0);
         }
         else
@@ -263,6 +314,8 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
             }
             diagnostics.open("output/diagnostics.csv", std::ios::app);
             diagnostics << std::setprecision(17);
+            step_trace.open("output/step_trace.csv", std::ios::app);
+            step_trace << std::setprecision(17);
         }
         if (save_checkpoint(true))
             return 75;
@@ -274,17 +327,27 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
             while (time < target)
             {
                 limits.check(steps, wall_offset);
-                const Real dt = peridynamics::boundedTimeStep(timestep.exec(), {target - time});
+                const Real candidate = material.viscoelastic ?
+                    std::min(timestep.exec(), 0.1 * material.relaxation_time) : timestep.exec();
+                const Real dt = peridynamics::boundedTimeStep(candidate, {target - time});
                 initialize.exec();
                 first.exec(dt);
                 last_contact_time = time + 0.5 * dt;
                 synchronize_plate(last_contact_time);
+                for (size_t i = 0; i < count; ++i)
+                {
+                    contact_sample_position[i] = position[i];
+                    contact_base_velocity[i] = velocity[i];
+                    contact_sample_velocity[i] = velocity[i] + 0.5 * dt * previous_acceleration[i];
+                }
                 contact.exec();
                 constitutive->exec(dt);
                 hourglass.exec(dt);
                 damping.exec(dt);
                 third.exec(dt);
                 fourth.exec(dt);
+                if (commit_history)
+                    commit_history->exec(dt);
                 ++steps;
                 state_check.exec();
                 for (size_t i = 0; i < count; ++i)
@@ -292,6 +355,8 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
                         peridynamics::numericalFailure(particle.Name(), i, "particle left bounded gel domain");
                 time = dt == target - time ? target : time + dt;
                 synchronize_plate(time);
+                const Real history_time = material.viscoelastic ? particles.getVariableDataByName<Real>("GelHistoryTime")[0] : time;
+                step_trace << time << ',' << dt << ',' << steps << ',' << last_contact_time << ',' << history_time << '\n';
                 if (save_checkpoint(false))
                     return 75;
             }
@@ -333,7 +398,8 @@ int main(int argc, char **argv)
             std::cout << std::setprecision(17)
                       << "{\"model\":\"solid_sphere_no_separate_liquid\",\"calibrated\":false,"
                          "\"fluid_transport\":false,\"fracture\":false,\"constitutive_model\":\""
-                      << (options.material.viscoplastic ? "perzyna_j2_viscoplastic" : "objective_linear_elastic")
+                      << (options.material.viscoelastic ? "neo_hookean_green_maxwell" :
+                          (options.material.viscoplastic ? "perzyna_j2_viscoplastic" : "objective_linear_elastic"))
                       << "\","
                          "\"format\":1,\"full_pd_state\":true,\"default_threads\":" << restart.threads
                       << ",\"duration_s\":" << options.duration() << ",\"spacing_m\":" << options.geometry.spacing

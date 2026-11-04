@@ -14,7 +14,7 @@ from peri_run import digest
 PARAMETER_BLOCKS = {
     'contact': frozenset({'friction_mu', 'friction_velocity'}),
     'material': frozenset({'youngs_modulus', 'poisson_ratio', 'yield_stress',
-                           'hardening_modulus', 'plastic_viscosity'}),
+                           'hardening_modulus', 'plastic_viscosity', 'relaxing_shear_ratio', 'relaxation_time'}),
 }
 
 

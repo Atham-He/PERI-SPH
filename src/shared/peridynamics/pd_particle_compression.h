@@ -26,6 +26,9 @@ struct ParticleCompressionOptions
         Real youngs_modulus = 1e6;
         Real poisson_ratio = 0.35;
         bool viscoplastic = false;
+        bool viscoelastic = true;
+        Real relaxing_shear_ratio = 1;
+        Real relaxation_time = 1e-6;
         Real yield_stress = 5e5;
         Real hardening_modulus = 5e6;
         Real plastic_viscosity = 500;
@@ -63,6 +66,9 @@ struct ParticleCompressionOptions
         inputs.bind("youngs_modulus", material.youngs_modulus);
         inputs.bind("poisson_ratio", material.poisson_ratio);
         inputs.bind("viscoplastic", material.viscoplastic);
+        inputs.bind("gel_viscoelastic", material.viscoelastic);
+        inputs.bind("relaxing_shear_ratio", material.relaxing_shear_ratio);
+        inputs.bind("relaxation_time", material.relaxation_time);
         inputs.bind("yield_stress", material.yield_stress);
         inputs.bind("hardening_modulus", material.hardening_modulus);
         inputs.bind("plastic_viscosity", material.plastic_viscosity);
@@ -84,17 +90,19 @@ struct ParticleCompressionOptions
                            geometry.plate_thickness, geometry.initial_gap, material.density,
                            material.youngs_modulus, material.poisson_ratio, material.yield_stress,
                            material.hardening_modulus, material.plastic_viscosity,
+                           material.relaxing_shear_ratio, material.relaxation_time,
                            contact.friction_mu, contact.friction_velocity, loading.speed,
                            loading.stroke, numerics.cfl, numerics.horizon_ratio,
                            numerics.hourglass_coefficient})
             if (!std::isfinite(value))
                 throw std::invalid_argument("particle compression requires finite inputs");
 
-        if (geometry.spacing <= 0 || geometry.radius < 3 * geometry.spacing ||
+        if (geometry.spacing <= 0 || geometry.radius / geometry.spacing < 3 ||
             geometry.plate_half_width <= geometry.radius || geometry.plate_thickness <= 0 ||
             geometry.initial_gap < 0 || material.density <= 0 || material.youngs_modulus <= 0 ||
             material.poisson_ratio <= -1 || material.poisson_ratio >= 0.5 ||
             material.yield_stress <= 0 || material.hardening_modulus < 0 || material.plastic_viscosity < 0 ||
+            (material.viscoplastic && material.viscoelastic) || material.relaxing_shear_ratio < 0 || material.relaxation_time <= 0 ||
             contact.friction_mu < 0 || contact.friction_velocity <= 0 || loading.speed <= 0 ||
             loading.stroke <= 2 * geometry.initial_gap || loading.stroke >= 2 * geometry.radius ||
             loading.output_frames < 1 || numerics.cfl <= 0 || numerics.cfl > 0.2 ||

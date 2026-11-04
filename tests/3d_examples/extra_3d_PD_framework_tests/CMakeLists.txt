@@ -1,4 +1,4 @@
-add_executable(extra_3d_PD_framework_tests framework_tests.cpp compression_tests.cpp gel_material_tests.cpp surface_contact_tests.cpp)
+add_executable(extra_3d_PD_framework_tests framework_tests.cpp compression_tests.cpp gel_material_tests.cpp surface_contact_tests.cpp normal_projection_tests.cpp)
 target_link_libraries(extra_3d_PD_framework_tests PRIVATE sphinxsys_3d GTest::gtest_main)
 set_target_properties(extra_3d_PD_framework_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin")
 add_test(NAME extra_3d_PD_framework_tests COMMAND extra_3d_PD_framework_tests)
@@ -6,3 +6,6 @@ set_tests_properties(extra_3d_PD_framework_tests PROPERTIES TIMEOUT 120 LABELS p
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_test(NAME peri_analysis_unit_tests COMMAND ${Python3_EXECUTABLE} -m unittest discover -s "${SPHINXSYS_PROJECT_DIR}/tools" -p "test_peri_*.py" -v)
 set_tests_properties(peri_analysis_unit_tests PROPERTIES TIMEOUT 20 LABELS peri_fast)
+add_executable(extra_3d_PD_normal_contact_probe normal_contact_probe.cpp)
+target_link_libraries(extra_3d_PD_normal_contact_probe PRIVATE sphinxsys_3d)
+set_target_properties(extra_3d_PD_normal_contact_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin")

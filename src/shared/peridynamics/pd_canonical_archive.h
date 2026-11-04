@@ -15,36 +15,17 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include <cerrno>
-#if !defined(__linux__)
-#error "This archive digest profile requires the frozen Linux AF_ALG provider"
-#endif
-#include <linux/if_alg.h>
-#include <sys/socket.h>
-#include <unistd.h>
+#include "pd_sha256.h"
 
 namespace SPH::peridynamics::canonical_archive
 {
 using Bytes=std::vector<uint8_t>;
-using Digest=std::array<uint8_t,32>;
 static_assert(sizeof(double)==8 && std::numeric_limits<double>::is_iec559,
               "Canonical mechanical scalars require IEEE binary64");
 inline constexpr uint64_t maximum_bytes=16*1024*1024,maximum_fields=256,
     maximum_elements=1024*1024,maximum_name=128;
 inline constexpr std::array<uint8_t,8> magic{'P','E','R','I','A','R','0','1'},
     footer{'P','E','R','I','E','N','D','1'};
-
-class Descriptor
-{
-    int value_;
-  public:
-    explicit Descriptor(int fd):value_(fd)
-    { if(fd<0)throw std::runtime_error("canonical archive: digest descriptor"); }
-    ~Descriptor(){::close(value_);}
-    Descriptor(const Descriptor&)=delete;
-    Descriptor &operator=(const Descriptor&)=delete;
-    int get()const{return value_;}
-};
 
 /** Use the installed kernel SHA256 implementation, not a hand-rolled hash.
  * No alternative provider or algorithm fallback is permitted in this profile.
@@ -53,28 +34,7 @@ class Descriptor
 inline Digest sha256(const Bytes &bytes,size_t count)
 {
     if(count>bytes.size())throw std::invalid_argument("canonical archive: digest size");
-    Descriptor algorithm(::socket(AF_ALG,SOCK_SEQPACKET|SOCK_CLOEXEC,0));
-    sockaddr_alg address{};address.salg_family=AF_ALG;
-    std::memcpy(address.salg_type,"hash",5);std::memcpy(address.salg_name,"sha256",7);
-    if(::bind(algorithm.get(),reinterpret_cast<sockaddr*>(&address),sizeof(address))!=0)
-        throw std::runtime_error("canonical archive: SHA256 provider unavailable");
-    Descriptor operation(::accept4(algorithm.get(),nullptr,nullptr,SOCK_CLOEXEC));
-    size_t offset=0;
-    while(offset<count)
-    {
-        const size_t chunk=std::min(size_t(16384),count-offset);
-        const ssize_t sent=::send(operation.get(),bytes.data()+offset,chunk,MSG_MORE);
-        if(sent<0 && errno==EINTR)continue;
-        if(sent<=0)throw std::runtime_error("canonical archive: SHA256 update");
-        offset+=size_t(sent);
-    }
-    ssize_t finalized;
-    do{finalized=::send(operation.get(),"",0,0);}while(finalized<0 && errno==EINTR);
-    if(finalized!=0)throw std::runtime_error("canonical archive: SHA256 finalization");
-    Digest result{};ssize_t received;
-    do{received=::recv(operation.get(),result.data(),result.size(),0);}while(received<0 && errno==EINTR);
-    if(received!=ssize_t(result.size()))throw std::runtime_error("canonical archive: SHA256 output");
-    return result;
+    Sha256Stream stream;stream.update(bytes.data(),count);return stream.finish();
 }
 
 inline void appendU64(Bytes &out,uint64_t x)

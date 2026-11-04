@@ -4,6 +4,7 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <cfenv>
 #include <unistd.h>
 using namespace SPH;
 using namespace SPH::peridynamics;
@@ -39,6 +40,27 @@ int main(int argc,char **argv)
     {
         if(argc!=2)throw std::invalid_argument("usage: many_contact_probe INPUT");
         std::ifstream input(argv[1]);int mode=0;size_t n=0;input>>mode>>n;
+        if(mode==2)
+        {
+            if(!input || n>256)throw std::invalid_argument("invalid exact balance dimensions");
+            int rounding;uint64_t rbits,sbits;input>>rounding>>rbits>>sbits;
+            Real momentum,scale;std::memcpy(&momentum,&rbits,8);std::memcpy(&scale,&sbits,8);
+            StdVec<Real> coefficients(n),impulses(n);
+            for(auto *values:{&coefficients,&impulses})for(auto &x:*values){uint64_t bits=0;input>>bits;std::memcpy(&x,&bits,8);}
+            if(!input)throw std::invalid_argument("truncated exact balance input");input>>std::ws;if(!input.eof())throw std::invalid_argument("exact balance tail");
+            if(rounding!=0 && rounding!=1)throw std::invalid_argument("invalid exact balance rounding mode");
+            const int previous=std::fegetround();
+            if(std::fesetround(rounding?FE_UPWARD:FE_TONEAREST)!=0)throw std::runtime_error("rounding mode unavailable");
+            ExactContactBalance r;
+            try{r=exactContactBalance(momentum,coefficients,impulses,scale);}
+            catch(...){std::fesetround(previous);throw;}
+            if(std::fesetround(previous)!=0)throw std::runtime_error("rounding mode restore failed");
+            uint64_t value_bits,bound_bits;std::memcpy(&value_bits,&r.normalized_value,8);std::memcpy(&bound_bits,&r.normalized_roundoff_bound,8);
+            std::cout<<",\"normalized_value\":"<<r.normalized_value<<",\"roundoff_bound\":"<<r.normalized_roundoff_bound
+                <<",\"within_budget\":"<<(r.within_budget?"true":"false")<<",\"value_bits\":";jsonString(std::to_string(value_bits));
+            std::cout<<",\"bound_bits\":";jsonString(std::to_string(bound_bits));std::cout<<",\"arithmetic_only\":true,\"rounding_mode_requested\":"<<rounding<<"}\n";
+            return r.within_budget?0:2;
+        }
         if(!input||!n||n>128)throw std::invalid_argument("invalid model dimension");
         DenseContactMatrix a(n,StdVec<Real>(n));
         if(mode==1)
@@ -86,9 +108,19 @@ int main(int argc,char **argv)
                 <<",\"linear_residual\":"<<t.linear_residual<<",\"velocity\":";array(t.velocity);
             std::cout<<",\"normal_impulse\":";array(t.normal_impulse);std::cout<<",\"direction\":";array(t.normalized_direction);
             std::cout<<",\"normalized_residual\":";array(t.normalized_residual);std::cout<<",\"normalized_gaps\":";array(t.normalized_gaps);
+            std::cout<<",\"accumulation_roundoff_bounds\":";array(t.accumulation_roundoff_bounds);
             std::cout<<",\"generalized_jacobian\":";matrix(t.generalized_jacobian);std::cout<<'}';
         }
-        std::cout<<"]}\n";return r.converged?0:2;
+        std::cout<<"],\"precision_rejection\":{\"present\":"<<(r.precision_rejection.present?"true":"false");
+        if(r.precision_rejection.present)
+        {
+            const auto &p=r.precision_rejection;
+            std::cout<<",\"during_line_search\":"<<(p.during_line_search?"true":"false")<<",\"iteration\":"<<p.iteration<<",\"alpha\":"<<p.trial_alpha
+                <<",\"velocity\":";array(p.velocity);std::cout<<",\"normal_impulse\":";array(p.normal_impulse);
+            std::cout<<",\"supplied_momentum\":";array(p.supplied_momentum);std::cout<<",\"normalized_values\":";array(p.normalized_values);
+            std::cout<<",\"roundoff_bounds\":";array(p.roundoff_bounds);
+        }
+        std::cout<<"}}\n";return r.converged?0:2;
     }
     catch(const std::exception &e){std::cout<<",\"error\":";jsonString(e.what());std::cout<<"}\n";return 1;}
 }

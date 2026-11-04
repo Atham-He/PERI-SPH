@@ -3,6 +3,7 @@
 #define PD_MANY_CONTACT_H
 
 #include "pd_nonsymmetric_constraints.h"
+#include "pd_exact_contact_balance.h"
 #include <Eigen/SVD>
 
 namespace SPH::peridynamics
@@ -88,6 +89,7 @@ struct ManyContactTrace
     Real merit = 0, squared_norm = 0, KKT = 0, accepted_step = 0, linear_residual = 0;
     StdVec<Real> velocity, normal_impulse, normalized_direction;
     StdVec<Real> normalized_residual, normalized_gaps;
+    StdVec<Real> accumulation_roundoff_bounds;
     DenseContactMatrix generalized_jacobian;
 };
 
@@ -99,6 +101,13 @@ struct ManyContactResult
     StdVec<Real> velocity, normal_impulse;
     StdVec<ManyContactTrace> trace;
     Real normalized_KKT = 0;
+    struct PrecisionRejection
+    {
+        bool present=false, during_line_search=false;
+        size_t iteration=0;
+        Real trial_alpha=0;
+        StdVec<Real> velocity, normal_impulse, supplied_momentum, normalized_values, roundoff_bounds;
+    } precision_rejection;
 };
 
 /** Bounded semismooth Newton control. Every original contact row is retained;
@@ -134,18 +143,27 @@ inline ManyContactResult solveManyNonsymmetricContact(const StdVec<Real> &old_po
         bounds[s] = (row.new_offset - old_gather) / dt;
         if (!std::isfinite(bounds[s])) throw std::invalid_argument("many contact: nonfinite bound");
     }
-    struct Values { StdVec<Real> residual, gaps; DenseContactMatrix jacobian; Real merit = 0, squared_norm = 0, KKT = 0; };
+    struct Values
+    {
+        StdVec<Real> residual, gaps, supplied_momentum, roundoff_bounds;
+        DenseContactMatrix jacobian;
+        Real merit = 0, squared_norm = 0, KKT = 0;
+        bool precision_budget_ok=true;
+    };
     auto values = [&](const StdVec<Real> &v, const StdVec<Real> &lambda, bool tangent)
     {
-        const auto equation = evaluate(v); Values out; out.residual.resize(size); out.gaps.resize(count);
+        const auto equation = evaluate(v); Values out; out.residual.resize(size); out.gaps.resize(count);out.roundoff_bounds.resize(n);
         if (equation.momentum.size() != n || equation.jacobian.size() != n) throw std::runtime_error("many contact: callback dimensions");
+        out.supplied_momentum=equation.momentum;
         if (tangent) out.jacobian.assign(size, StdVec<Real>(size, 0));
         for (size_t i = 0; i < n; ++i)
         {
             if (equation.jacobian[i].size() != n || !std::isfinite(equation.momentum[i])) throw std::runtime_error("many contact: callback row");
-            Real r = equation.momentum[i];
-            for (size_t s = 0; s < count; ++s) r -= rows[s].coefficients[i] * lambda[s];
-            out.residual[i] = r / impulse_scale;
+            StdVec<Real> coefficients(count);
+            for(size_t s=0;s<count;++s)coefficients[s]=rows[s].coefficients[i];
+            const auto balance=exactContactBalance(equation.momentum[i],coefficients,lambda,impulse_scale);
+            out.residual[i]=balance.normalized_value;out.roundoff_bounds[i]=balance.normalized_roundoff_bound;
+            out.precision_budget_ok &= balance.within_budget;
             for (size_t j = 0; j < n; ++j)
             {
                 if (!std::isfinite(equation.jacobian[i][j])) throw std::runtime_error("many contact: nonfinite tangent");
@@ -153,6 +171,9 @@ inline ManyContactResult solveManyNonsymmetricContact(const StdVec<Real> &old_po
             }
             if (tangent) for (size_t s = 0; s < count; ++s) out.jacobian[i][n+s] = -rows[s].coefficients[i];
         }
+        // The caller receives an explicit uncommitted arithmetic witness,
+        // not a partial Phi/Jacobian presented as a valid nonlinear iterate.
+        if(!out.precision_budget_ok)return out;
         Real product_sum = 0;
         for (size_t s = 0; s < count; ++s)
         {
@@ -172,17 +193,27 @@ inline ManyContactResult solveManyNonsymmetricContact(const StdVec<Real> &old_po
             if (!std::isfinite(r)) throw std::runtime_error("many contact: nonfinite residual");
             out.merit = std::max(out.merit, std::abs(r)); out.squared_norm += r*r;
         }
+        for(size_t i=0;i<n;++i)out.merit=std::max(out.merit,std::abs(out.residual[i])+out.roundoff_bounds[i]);
         if (!std::isfinite(out.squared_norm) || !std::isfinite(out.KKT)) throw std::runtime_error("many contact: nonfinite merit/KKT");
         return out;
     };
     ManyContactResult result; StdVec<Real> velocity(n, 0), lambda(count, 0);
+    auto reject_precision=[&](const Values &out,const StdVec<Real> &v,const StdVec<Real> &l,size_t iteration,Real alpha,bool line_search)
+    {
+        result.status="contact_accumulation_precision_budget";
+        auto &p=result.precision_rejection;p.present=true;p.during_line_search=line_search;p.iteration=iteration;p.trial_alpha=alpha;
+        p.velocity=v;p.normal_impulse=l;p.supplied_momentum=out.supplied_momentum;p.roundoff_bounds=out.roundoff_bounds;
+        p.normalized_values.assign(out.residual.begin(),out.residual.begin()+n);
+    };
     if (!in_domain(velocity)) throw std::invalid_argument("many contact: invalid initial iterate domain");
     for (size_t iteration = 0; iteration <= settings.max_newton_steps; ++iteration)
     {
         const auto current = values(velocity, lambda, true);
+        if(!current.precision_budget_ok){reject_precision(current,velocity,lambda,iteration,0,false);return result;}
         ManyContactTrace trace; trace.iteration = iteration; trace.merit = current.merit; trace.squared_norm = current.squared_norm;
         trace.KKT = current.KKT; trace.velocity = velocity; trace.normal_impulse = lambda;
         trace.normalized_residual = current.residual; trace.normalized_gaps = current.gaps;
+        trace.accumulation_roundoff_bounds=current.roundoff_bounds;
         trace.generalized_jacobian = current.jacobian;
         if (std::max(current.merit, current.KKT) <= settings.relative_tolerance)
         {
@@ -205,6 +236,10 @@ inline ManyContactResult solveManyNonsymmetricContact(const StdVec<Real> &old_po
             for (size_t s = 0; s < count; ++s) l[s] += alpha * impulse_scale * direction.value[n+s];
             if (!in_domain(v)) { ++trace.domain_rejections; continue; }
             const auto trial = values(v, l, false);
+            if(!trial.precision_budget_ok)
+            {
+                result.trace.push_back(std::move(trace));reject_precision(trial,v,l,iteration,alpha,true);return result;
+            }
             if (trial.squared_norm <= (1 - 1e-4 * alpha) * current.squared_norm)
             { trace.accepted_step = alpha; velocity = std::move(v); lambda = std::move(l); accepted = true; break; }
         }

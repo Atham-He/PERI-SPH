@@ -79,6 +79,15 @@ def prepare(root):
     fixed=cross/'frozen/peri_fixed_python_raw_audit.py';shutil.copy2(fixed,ref/fixed.name);artifacts += [record(fixed),record(ref/fixed.name)]
     script=root/'frozen/peri_friction_unattempted_tail.py';shutil.copy2(__file__,script);artifacts += [record(__file__),record(script)]
     original=root/'frozen/original_b492_friction_probe';shutil.copy2(native,original);artifacts += [record(original)]
+    for line in subprocess.check_output(['ldd',str(original)],text=True).splitlines():
+        assert 'not found' not in line
+        for token in line.split():
+            if token.startswith('/'):
+                library=Path(token);expected=[x for x in oldprep['artifacts'] if Path(x['path']).resolve()==library.resolve()]
+                assert expected and all(record(library)['sha256']==x['sha256'] for x in expected),'original native linked library changed'
+                artifacts.append(record(library))
+    document=repo/'docs/peri/UNATTEMPTED_FRICTION_TAILS_20261105.md'
+    shutil.copy2(document,root/'frozen'/document.name);artifacts += [record(document),record(root/'frozen'/document.name)]
     for case in cases:
         destination=root/(case['name']+'.input');shutil.copy2(old/destination.name,destination);artifacts.append(record(destination))
         assert record(destination)['sha256']==record(old/destination.name)['sha256']
@@ -135,6 +144,7 @@ def run(root):
                     assert peak<=gib*1024**2 and threads<=1,'RSS or threads'
                     reserves(root);assert time.monotonic()-started<=wall,'wall budget'
                     assert sum(p.stat().st_size for p in root.glob(label+'*') if p.is_file())<=output_gib*2**30,'case output budget'
+                    assert sum(p.stat().st_size for p in root.rglob('*') if p.is_file())<=8*2**30,'total study output budget'
                 except FileNotFoundError:continue
                 except Exception as error:stop=repr(error);os.killpg(child.pid,signal.SIGKILL);break
                 time.sleep(.25)

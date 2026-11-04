@@ -9,6 +9,12 @@ def vectors(values):return [list(map(dec,row)) for row in values]
 def flat_vectors(values):return [list(values[3*i:3*i+3]) for i in range(len(values)//3)]
 def cross(a,b):return [a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]]
 def add3(a,b):return [x+y for x,y in zip(a,b)]
+
+def invalid_message(flag):
+    # The injected non-deviatoric Green history is rejected by the material
+    # history guard before the later accepted-F/history cursor comparison.
+    return {1:'bounded gel model: physical mass mismatch',2:'invalid gel material history',
+        3:'fixed PD reference: invalid directed packet',4:'stored signed surface weight mismatch'}[flag]
 def matrix_vector(m,v):return [dot(row,v) for row in m]
 
 def cubic_minimum(coefficients):
@@ -270,9 +276,11 @@ def inspect(case,records,code,full=False):
         if code:
             assert code==1 and case['invalid_injection'] in [1,2,3,4]
             assert records[-1]['type']=='error' and not any(r['type']=='step' for r in records)
-            expected={1:'bounded gel model: physical mass mismatch',2:'bounded gel state: inconsistent accepted material cursor',
-                3:'fixed PD reference: invalid directed packet',4:'stored signed surface weight mismatch'}
-            assert records[-1]['message']==expected[case['invalid_injection']],records[-1]['message']
+            assert records[-1]['message']==invalid_message(case['invalid_injection']),records[-1]['message']
+            if case['invalid_injection']==2:
+                assert records[1]['type']=='header';check_geometry(case,records[1])
+                damaged=records[1]['initial_state']['green'][0]
+                assert abs(sum(dec(damaged[k]) for k in [0,4,8])-D('.01'))<=D('1e-12')
             return dict(name=case['name'],status='declared_invalid_physical_state_rejected_without_step',reason=case['invalid_injection'])
         assert records[1]['type']=='header' and records[-1]['type']=='end' and records[-1]['completed']
         h=records[1];audit=Inspector(case,h,full);old,z,loss=audit.initial()

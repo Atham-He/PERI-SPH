@@ -4,9 +4,13 @@ from decimal import Decimal as D,localcontext
 from peri_pd_reference_audit import expected_reference,expected_surface_points,jacobi_eigenvalues
 from peri_pd_material_reference import material_step
 from peri_gel_affine_audit import reference_step,green
-from peri_bounded_gel_audit import cubic_minimum
+from peri_bounded_gel_audit import cubic_minimum,invalid_message
 
 class ActualPDIndependentReferenceTests(unittest.TestCase):
+    def test_declared_history_injection_hits_earlier_material_guard(self):
+        self.assertEqual(invalid_message(2),'invalid gel material history')
+        self.assertNotEqual(invalid_message(2),'bounded gel state: inconsistent accepted material cursor')
+        self.assertNotEqual(invalid_message(2),'truncated bounded sphere input')
     def test_independent_jacobi_spectrum_and_zero_mode(self):
         eigen=jacobi_eigenvalues([[2,-1,0],[-1,2,0],[0,0,0]])
         for a,b in zip(eigen,[0,1,3]):self.assertAlmostEqual(a,b,places=12)

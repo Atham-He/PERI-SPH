@@ -36,7 +36,7 @@ def encode(c):
     for field in ['initial_affine','velocity_rate','local_perturbation','local_velocity_perturbation','translation']:values.extend(c[field])
     return ' '.join(map(str,values))+'\n'
 
-def prepare(root,executable,prospective):
+def prepare(root,executable,prospective,reuse_root=None):
     assert not root.exists(),'new unused study directory required'
     repo=Path(__file__).resolve().parents[1]
     assert not subprocess.check_output(['git','status','--porcelain'],cwd=repo).strip(),'source must be committed'
@@ -89,6 +89,27 @@ def prepare(root,executable,prospective):
     if plan.get('interval_preflight'):artifacts.append(record(plan['interval_preflight']))
     plan.update(controls=controls(),prepared_at=stamp(),identity=identity(),resources=budget,python_version=sys.version,
         source_commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=repo,text=True).strip())
+    if reuse_root is not None:
+        # New assessor qualification may use existing complete raw. Never
+        # execute an already attempted physical input or alter its old state.
+        oldprep=read(reuse_root/'preparation.json');oldplan=read(reuse_root/'plan.json')
+        oldterminal=read(reuse_root/'terminal.json');oldstate=read(reuse_root/'state.json')
+        assert oldterminal['status']=='stopped_for_review' and oldterminal['failure']=="AssertionError('invalid gel material history')"
+        assert record(frozen)['sha256']==record(oldprep['executable'])['sha256']
+        historical=[entry for entry in oldprep['artifacts'] if Path(entry['path']).is_relative_to(reuse_root)]
+        historical.extend(oldprep['inputs']);historical.extend(record(reuse_root/name) for name in ['preparation.json','state.json','plan.json','terminal.json'])
+        reuse={}
+        for oldattempt in oldterminal['attempts']:
+            case=next(c for c in plan['controls'] if c['name']==oldattempt['name'])
+            original=next(c for c in oldplan['controls'] if c['name']==oldattempt['name'])
+            assert case==original and (reuse_root/(case['name']+'.input')).read_text()==encode(case)
+            assert not oldattempt['timed_out'] and oldattempt['return_code']==case['expected_code']
+            historical.extend([oldattempt['stdout'],oldattempt['stderr']]);meta=read_jsonl(oldattempt['stdout']['path'])[0]
+            assert meta['argv']==oldattempt['command'] and meta['ppid']==oldstate['identity']['pid']
+            assert meta['boot_id']==oldstate['identity']['boot_id'] and meta['start_ticks'].isdigit()
+            reuse[case['name']]=dict(oldattempt,reused_from=str(reuse_root),historical_source_commit=oldplan['source_commit'],reused_native_dispatch=False)
+        assert len(reuse)==6 and len(plan['controls'])-len(reuse)==2
+        verify(historical);artifacts.extend(historical);plan['reused_controls']=reuse
     save(root/'plan.json',plan);artifacts.append(record(root/'plan.json'));inputs=[]
     for case in plan['controls']:
         path=root/(case['name']+'.input');path.write_text(encode(case));inputs.append(record(path))
@@ -108,12 +129,16 @@ def run(root):
         for case in plan['controls']:
             reserves(root);out=root/(case['name']+'.jsonl');err=root/(case['name']+'.stderr');start=time.monotonic();timed_out=False
             command=[prep['executable'],str(root/(case['name']+'.input'))]
-            with out.open('xb') as stdout,err.open('xb') as stderr:
-                child=subprocess.Popen(command,stdout=stdout,stderr=stderr,preexec_fn=limits,env=dict(os.environ,OMP_NUM_THREADS='1',OPENBLAS_NUM_THREADS='1'))
-                try:code=child.wait(timeout=120)
-                except subprocess.TimeoutExpired:child.kill();code=child.wait();timed_out=True
-            attempt=dict(name=case['name'],command=command,return_code=code,timed_out=timed_out,wall_seconds=time.monotonic()-start,
-                stdout=record(out),stderr=record(err),cumulative_child_maxRSS_KiB=resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)
+            if case['name'] in plan.get('reused_controls',{}):
+                attempt=copy.deepcopy(plan['reused_controls'][case['name']]);out=Path(attempt['stdout']['path']);code=attempt['return_code']
+                verify([attempt['stdout'],attempt['stderr']])
+            else:
+                with out.open('xb') as stdout,err.open('xb') as stderr:
+                    child=subprocess.Popen(command,stdout=stdout,stderr=stderr,preexec_fn=limits,env=dict(os.environ,OMP_NUM_THREADS='1',OPENBLAS_NUM_THREADS='1'))
+                    try:code=child.wait(timeout=120)
+                    except subprocess.TimeoutExpired:child.kill();code=child.wait();timed_out=True
+                attempt=dict(name=case['name'],command=command,return_code=code,timed_out=timed_out,wall_seconds=time.monotonic()-start,
+                    stdout=record(out),stderr=record(err),cumulative_child_maxRSS_KiB=resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)
             attempts.append(attempt);assert not timed_out and attempt['cumulative_child_maxRSS_KiB']<=1024*1024
             # Preserve last COMPLETE committed cursor even when a later record
             # or gate is invalid. Never count a candidate/rejected step.
@@ -127,8 +152,9 @@ def run(root):
             attempt['last_complete_accepted_time']=accepted[-1]['state']['time'] if accepted else 0
             attempt['last_complete_accepted_steps']=len(accepted);attempt['last_complete_record']=prefix[-1]['type'] if prefix else None
             records=read_jsonl(out);meta=records[0]
-            assert meta['argv']==command and meta['pid']==child.pid and meta['ppid']==identity()['pid']
-            assert meta['boot_id']==identity()['boot_id'] and meta['start_ticks'].isdigit()
+            assert meta['argv']==attempt['command'] and meta['start_ticks'].isdigit()
+            if 'reused_from' not in attempt:
+                assert meta['pid']==child.pid and meta['ppid']==identity()['pid'] and meta['boot_id']==identity()['boot_id']
             attempt['runtime_gate']=inspect(case,records,code,False)
         verify(prep['artifacts']+prep['inputs'])
     except Exception as e:failure=repr(e);failure_traceback=traceback.format_exc()
@@ -148,7 +174,8 @@ def review(root):
         assert terminal['status']=='runtime_completed_pending_independent_review' and len(terminal['attempts'])==len(plan['controls'])
         for case,a in zip(plan['controls'],terminal['attempts']):
             verify([a['stdout'],a['stderr']]);assessed.append(inspect(case,read_jsonl(a['stdout']['path']),a['return_code'],True))
-        base=read_jsonl(root/'normal_compression.jsonl');rotated=read_jsonl(root/'normal_compression_rotated.jsonl')
+        raw_paths={a['name']:a['stdout']['path'] for a in terminal['attempts']}
+        base=read_jsonl(raw_paths['normal_compression']);rotated=read_jsonl(raw_paths['normal_compression_rotated'])
         a=[r for r in base if r['type']=='step'];b=[r for r in rotated if r['type']=='step']
         assert len(a)==len(b)==16
         for x,y in zip(a,b):
@@ -164,7 +191,7 @@ def review(root):
         for label,name in [('collapsed_global_reference','mixed_nonaffine_operator'),('clipped_signed_MLS','mixed_nonaffine_operator'),
             ('symmetrized_true_Jacobian','mixed_nonaffine_operator'),('effective_J_as_kinetic_mass','mixed_nonaffine_operator'),
             ('swapped_material_algorithmic_loss','normal_compression')]:
-            records=copy.deepcopy(read_jsonl(root/(name+'.jsonl')));case=next(c for c in plan['controls'] if c['name']==name)
+            records=copy.deepcopy(read_jsonl(raw_paths[name]));case=next(c for c in plan['controls'] if c['name']==name)
             if label=='collapsed_global_reference':records[1]['reference']['shape_gradient']=[[0,0,0] for _ in range(33*33)]
             elif label=='clipped_signed_MLS':records[1]['surface']['weights']=[max(0,w) for w in records[1]['surface']['weights']]
             elif label=='symmetrized_true_Jacobian':
@@ -192,10 +219,10 @@ def review(root):
 
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('action',choices=['prepare','run','review']);p.add_argument('--root',type=Path,required=True)
-    p.add_argument('--executable',type=Path);p.add_argument('--prospective',type=Path);args=p.parse_args()
+    p.add_argument('--executable',type=Path);p.add_argument('--prospective',type=Path);p.add_argument('--reuse-root',type=Path);args=p.parse_args()
     if args.action=='prepare':
         fresh=not args.root.exists()
-        try:prepare(args.root,args.executable,args.prospective)
+        try:prepare(args.root,args.executable,args.prospective,args.reuse_root)
         except Exception as error:
             if fresh and args.root.exists():save(args.root/'preparation_error.json',dict(status='preparation_failed_no_native_dispatch',
                 identity=identity(),recorded_at=stamp(),failure=repr(error),failure_traceback=traceback.format_exc()))

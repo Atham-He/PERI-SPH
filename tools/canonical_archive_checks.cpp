@@ -87,6 +87,8 @@ int main(int argc,char **argv)
         rejects([&]{Candidate bad(short_,7);},"footer");
         changed=bytes;integerAt(changed,24,maximum_fields+1);resign(changed);
         rejects([&]{Candidate bad(changed,7);},"field count");
+        changed=bytes;integerAt(changed,8,2);resign(changed);
+        rejects([&]{Candidate bad(changed,7);},"schema");
         changed=bytes;const auto offset=dataOffset(bytes,"accepted/values");
         integerAt(changed,offset,UINT64_C(0x7ff8000000000000));resign(changed);
         rejects([&]{Candidate bad(changed,7);},"nonfinite");

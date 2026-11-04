@@ -67,3 +67,8 @@ threshold values unchanged, reuses11existingraw anchors and executes only the
 3unattempted invalid controls. Old state/terminal/raw/reader remain stopped,
 not passed. Complete termination/trial trace instrumentation is still required
 in the later trajectory/restart version, before production qualification.
+
+Post-qualification diagnostic-only source change now records the terminal
+Newton-limit residual before returning. Its regression checks that last entry.
+Qualified v11/v11b native binaries/raw remain unchanged and are not rerun.
+No accepted root equation, Jacobian, history or physical gate was altered.

@@ -196,7 +196,13 @@ inline PrimalDualResult solveNonsymmetricContact(const StdVec<Real> &old_positio
             {
                 result.trace.push_back({mask, iteration, 0, current, 0, 0}); root = true; root_merit = current; break;
             }
-            if (iteration == settings.max_newton_steps) { result.status = "Newton_iteration_limit"; return result; }
+            if (iteration == settings.max_newton_steps)
+            {
+                // Retain the terminal residual even though no physical state
+                // is committed. Frozen v11 controls predate this diagnostic fix.
+                result.trace.push_back({mask, iteration, 0, current, 0, 0});
+                result.status = "Newton_iteration_limit"; return result;
+            }
             const size_t size = n + active.size();
             DenseContactMatrix system(size, StdVec<Real>(size, 0)); StdVec<Real> rhs(size);
             for (size_t i = 0; i < n; ++i)

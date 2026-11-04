@@ -107,4 +107,7 @@ TEST(PrimalDualContact, NewtonLimitIsTerminalWithoutAnotherAlgorithm)
     const auto r=solveNonsymmetricContact({0,0},1,1,{{{1,0},0,.2}},cubic,allDomain,settings);
     EXPECT_FALSE(r.converged); EXPECT_EQ(r.status,"Newton_iteration_limit");
     EXPECT_TRUE(r.velocity.empty());
+    ASSERT_FALSE(r.trace.empty());
+    EXPECT_EQ(r.trace.back().iteration,1u);
+    EXPECT_GT(r.trace.back().merit,settings.relative_tolerance);
 }

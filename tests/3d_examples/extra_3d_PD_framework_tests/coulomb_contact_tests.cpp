@@ -204,3 +204,28 @@ TEST(CoulombContact, ExplicitLargerLinearEntryKeepsOldBoundAndOriginalResidual)
     }
     EXPECT_THROW(solveBoundedConsistentContactSystem({{1,1},{2,2}},{3,7},1024),std::runtime_error);
 }
+
+TEST(CoulombContact, EvaluationFailureKeepsOriginalTrialAndNoAcceptedRoot)
+{
+    const CoulombContactSystem system({0,0,0},1,1,{plane(.3)});
+    const auto broken=[](const StdVec<Real> &)->NonlinearContactEquation
+    { throw std::runtime_error("declared material evaluation fault"); };
+    const auto initial=solveCoulombContact(system,broken,domain);
+    EXPECT_FALSE(initial.converged);EXPECT_TRUE(initial.velocity.empty());EXPECT_TRUE(initial.impulses.empty());
+    EXPECT_TRUE(initial.evaluation_failure.present);EXPECT_FALSE(initial.evaluation_failure.during_line_search);
+    EXPECT_EQ(initial.evaluation_failure.reason,"declared material evaluation fault");
+    EXPECT_EQ(initial.evaluation_failure.velocity,StdVec<Real>(3,0));
+    const auto good=particle({-1,2,1});
+    const auto trial=[&](const StdVec<Real> &v)
+    {
+        if(v[1]!=0)throw std::runtime_error("declared trial evaluation fault");
+        return good(v);
+    };
+    const auto later=solveCoulombContact(system,trial,domain);
+    EXPECT_FALSE(later.converged);EXPECT_TRUE(later.velocity.empty());EXPECT_TRUE(later.impulses.empty());
+    EXPECT_TRUE(later.evaluation_failure.present);EXPECT_TRUE(later.evaluation_failure.during_line_search);
+    EXPECT_GT(later.evaluation_failure.alpha,0);
+    EXPECT_NE(later.evaluation_failure.velocity[1],0);
+    EXPECT_EQ(later.trace.size(),1u);
+    EXPECT_EQ(later.trace[0].original.jacobian.size(),6u);
+}

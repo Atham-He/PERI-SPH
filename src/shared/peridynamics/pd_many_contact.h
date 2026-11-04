@@ -26,15 +26,15 @@ inline ConsistentLinearSolution solveBoundedConsistentContactSystem(const DenseC
     if (!maximum_dimension || maximum_dimension>1024 || !n || n>maximum_dimension || matrix.size()!=n)
         throw std::invalid_argument("consistent contact solve: dimensions");
     Eigen::MatrixXd a(n, n); Eigen::VectorXd b(n);
-    Real norm = 0, norm_b = 0;
+    long double norm = 0, norm_b = 0;
     for (size_t i = 0; i < n; ++i)
     {
         if (matrix[i].size() != n || !std::isfinite(rhs[i])) throw std::invalid_argument("consistent contact solve: row");
-        b[i] = rhs[i]; norm_b = std::max(norm_b, std::abs(rhs[i])); Real row_norm = 0;
+        b[i] = rhs[i]; norm_b = std::max(norm_b, std::abs(static_cast<long double>(rhs[i]))); long double row_norm = 0;
         for (size_t j = 0; j < n; ++j)
         {
             if (!std::isfinite(matrix[i][j])) throw std::invalid_argument("consistent contact solve: nonfinite");
-            a(i,j) = matrix[i][j]; row_norm += std::abs(matrix[i][j]);
+            a(i,j) = matrix[i][j]; row_norm += std::abs(static_cast<long double>(matrix[i][j]));
         }
         norm = std::max(norm, row_norm);
     }

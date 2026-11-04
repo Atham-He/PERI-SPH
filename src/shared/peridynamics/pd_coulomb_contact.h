@@ -97,7 +97,7 @@ struct CoulombContactValues
     StdVec<ContactTangentVector> normalized_relative_velocity;
     StdVec<ContactTangentVector> relative_velocity_roundoff_bound;
     StdVec<CoulombDiskValue> disk;
-    DenseContactMatrix jacobian;
+    DenseContactMatrix jacobian,supplied_jacobian;
     Real merit=0,squared_norm=0,KKT=0,maximum_jacobian_roundoff_bound=0;
     bool precision_budget_ok=true;
 };
@@ -173,7 +173,7 @@ class CoulombContactSystem
         CoulombContactValues out;out.residual.assign(unknowns,0);out.residual_roundoff_bound.assign(unknowns,0);
         out.normalized_gaps.resize(contacts_count);out.gap_roundoff_bound.resize(contacts_count);
         out.normalized_relative_velocity.resize(contacts_count);out.relative_velocity_roundoff_bound.resize(contacts_count);
-        out.disk.resize(contacts_count);out.supplied_momentum=equation.momentum;
+        out.disk.resize(contacts_count);out.supplied_momentum=equation.momentum;out.supplied_jacobian=equation.jacobian;
         if (tangent) out.jacobian.assign(unknowns,StdVec<Real>(unknowns,0));
         CoulombDiskValue arithmetic;const Rational I=exactReal(impulse_scale),V=exactReal(speed);
         auto jacobianValue=[&](size_t i,size_t j,const Rational &value,const Wide &additional_error=Wide(0))
@@ -228,7 +228,8 @@ class CoulombContactSystem
                 {
                     const Wide value=db*Wide(gather[3*s][j]);
                     out.jacobian[normal_index][j]=coulomb_disk_detail::convert(value,
-                        coulomb_disk_detail::arithmeticEnvelope(coulomb_disk_detail::absolute(value)),
+                        coulomb_disk_detail::arithmeticEnvelope(coulomb_disk_detail::absolute(value))+
+                        coulomb_disk_detail::absolute(Wide(gather[3*s][j]))*coulomb_disk_detail::arithmeticEnvelope(2),
                         derivative_bound,arithmetic);
                     out.maximum_jacobian_roundoff_bound=std::max(out.maximum_jacobian_roundoff_bound,derivative_bound);
                 }
@@ -305,6 +306,14 @@ struct CoulombContactResult
         StdVec<Real> velocity,impulses;
         CoulombContactValues original;
     } precision_rejection;
+    struct EvaluationFailure
+    {
+        bool present=false,during_line_search=false;
+        size_t iteration=0;
+        Real alpha=0;
+        StdVec<Real> velocity,impulses;
+        std::string reason;
+    } evaluation_failure;
 };
 
 /** One nonsymmetric all-contact semismooth Newton method. No equation shifts,
@@ -328,9 +337,19 @@ inline CoulombContactResult solveCoulombContact(const CoulombContactSystem &syst
         auto &w=result.precision_rejection;w.present=true;w.during_line_search=line_search;
         w.iteration=iteration;w.alpha=alpha;w.velocity=v;w.impulses=p;w.original=std::move(original);
     };
+    auto failed_evaluation=[&](const std::exception &error,const StdVec<Real> &v,const StdVec<Real> &p,
+        size_t iteration,Real alpha,bool line_search)
+    {
+        result.status="original_material_or_contact_evaluation_failed";
+        auto &w=result.evaluation_failure;w.present=true;w.during_line_search=line_search;
+        w.iteration=iteration;w.alpha=alpha;w.velocity=v;w.impulses=p;w.reason=error.what();
+    };
     for (size_t iteration=0;iteration<=settings.max_newton_steps;++iteration)
     {
-        auto current=system.evaluate(velocity,impulses,material,true);
+        CoulombContactValues current;
+        try { current=system.evaluate(velocity,impulses,material,true); }
+        catch(const std::exception &error)
+        { failed_evaluation(error,velocity,impulses,iteration,0,false);return result; }
         if (!current.precision_budget_ok) { reject(std::move(current),velocity,impulses,iteration,0,false);return result; }
         CoulombContactTrace trace;trace.iteration=iteration;trace.velocity=velocity;trace.impulses=impulses;
         trace.original=std::move(current);
@@ -356,7 +375,13 @@ inline CoulombContactResult solveCoulombContact(const CoulombContactSystem &syst
             for (size_t i=0;i<system.dofs;++i) v[i]+=alpha*system.speed*direction.value[i];
             for (size_t s=0;s<p.size();++s) p[s]+=alpha*system.impulse_scale*direction.value[system.dofs+s];
             if (!in_domain(v)) { ++trace.domain_rejections;continue; }
-            auto trial=system.evaluate(v,p,material,false);
+            CoulombContactValues trial;
+            try { trial=system.evaluate(v,p,material,false); }
+            catch(const std::exception &error)
+            {
+                result.trace.push_back(std::move(trace));
+                failed_evaluation(error,v,p,iteration,alpha,true);return result;
+            }
             if (!trial.precision_budget_ok)
             {
                 result.trace.push_back(std::move(trace));reject(std::move(trial),v,p,iteration,alpha,true);return result;

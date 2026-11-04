@@ -1,4 +1,5 @@
 #include "pd_bounded_gel_friction.h"
+#include "pd_bounded_friction_protocol.h"
 #include <gtest/gtest.h>
 using namespace SPH;
 using namespace SPH::peridynamics;
@@ -106,4 +107,78 @@ TEST(BoundedGelFriction, ExplicitCompensationRetainsSmallDiagnosticIncrements)
     addCompensatedContactValue(-1e16,copied_sum,copied_correction);
     EXPECT_EQ(sum+correction,1);
     EXPECT_DOUBLE_EQ(sum,copied_sum);EXPECT_DOUBLE_EQ(correction,copied_correction);
+}
+
+TEST(BoundedFrictionProtocol, ReferencePressRetainsActualDtAndNormalMotion)
+{
+    BoundedNormalConfig c;BoundedFrictionProtocol protocol;
+    protocol.tangent_stroke={.003,.002};
+    Real time=0;
+    for(size_t step=0;step<16;++step)
+    {
+        const auto interval=protocol.interval(step,time);
+        EXPECT_DOUBLE_EQ(interval.actual_dt,step==15 ? c.endTime()-time : c.dt);
+        EXPECT_NEAR(interval.old_offset[1],-1+c.upperDisplacement(time),1e-15);
+        EXPECT_NEAR(interval.new_offset[1],-1+c.upperDisplacement(interval.new_time),1e-15);
+        EXPECT_NEAR(interval.normal_cubic[1].at(0),interval.old_offset[1],1e-15);
+        EXPECT_NEAR(interval.normal_cubic[1].at(1),interval.new_offset[1],1e-15);
+        const auto relative=(interval.new_tangent_displacement[1]-interval.old_tangent_displacement[1])/interval.actual_dt;
+        EXPECT_EQ((relative-interval.wall_tangent_velocity[1]).norm(),0);
+        time=interval.new_time;
+    }
+    EXPECT_DOUBLE_EQ(time,c.endTime());
+}
+
+TEST(BoundedFrictionProtocol, HoldAndReleaseKeepOneClockAndReverseBothTangents)
+{
+    BoundedFrictionProtocol protocol;protocol.kind=1;protocol.tangent_stroke={.003,.002};
+    Real time=0;ContactTangentVector displacement=ContactTangentVector::Zero();
+    std::array<Real,2> previous{-1,-1};
+    for(size_t step=0;step<protocol.steps();++step)
+    {
+        const auto interval=protocol.interval(step,time);
+        EXPECT_EQ(interval.phase,step<16 ? 0u : (step<24 ? 1u : 2u));
+        EXPECT_NEAR(interval.old_offset[1],previous[1],1e-15);
+        if(step>=16 && step<24)
+        {
+            EXPECT_NEAR(interval.old_offset[1],-.99,1e-15);
+            EXPECT_EQ(interval.wall_tangent_velocity[1].norm(),0);
+        }
+        if(step>=24)
+        {
+            EXPECT_LT(interval.wall_tangent_velocity[1][0],0);
+            EXPECT_LT(interval.wall_tangent_velocity[1][1],0);
+        }
+        displacement+=interval.actual_dt*interval.wall_tangent_velocity[1];
+        time=interval.new_time;previous=interval.new_offset;
+    }
+    EXPECT_DOUBLE_EQ(time,protocol.endTime());
+    EXPECT_NEAR(previous[1],-1,1e-15);EXPECT_LT(displacement.norm(),1e-17);
+}
+
+TEST(BoundedFrictionProtocol, FullCubicGapDetectsBetweenEndpointContactPenetration)
+{
+    BoundedNormalConfig c;c.azimuths=8;const BoundedNormalScene scene(c);
+    BoundedFrictionProtocol protocol;
+    Real time=0;BoundedFrictionInterval interval;
+    for(size_t step=0;step<16;++step){interval=protocol.interval(step,time);time=interval.new_time;}
+    auto q0=scene.model.reference.position,q1=q0;
+    const Real u0=interval.old_offset[1]+1,u1=interval.new_offset[1]+1;
+    for(size_t i=0;i<q0.size();++i)
+    {
+        q0[i][1]=(1-.5*u0)*q0[i][1]-.5*u0;
+        q1[i][1]=(1-.5*u1)*q1[i][1]-.5*u1;
+    }
+    const auto endpoint=boundedFrictionIntervalGaps(scene,q0,q1,interval,false);
+    const auto whole=boundedFrictionIntervalGaps(scene,q0,q1,interval,true);
+    EXPECT_GE(endpoint[1],-1e-12);EXPECT_LT(whole[1],0);
+    EXPECT_NEAR(-whole[1]/protocol.normal_stroke,.002746921031773374,1e-10);
+}
+
+TEST(BoundedFrictionProtocol, BadPhaseCursorAndConfigurationReject)
+{
+    BoundedFrictionProtocol protocol;protocol.kind=1;
+    EXPECT_THROW(protocol.interval(16,.1),std::invalid_argument);
+    EXPECT_THROW(protocol.interval(40,.4),std::invalid_argument);
+    protocol.tangent_stroke[0]=.2;EXPECT_THROW(protocol.validate(),std::invalid_argument);
 }

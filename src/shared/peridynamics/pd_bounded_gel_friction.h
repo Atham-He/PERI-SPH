@@ -57,13 +57,12 @@ inline BoundedGelFrictionState initialBoundedGelFrictionState(const BoundedNorma
     return state;
 }
 
-inline StdVec<CoulombContactConstraint> boundedGelFrictionContacts(const BoundedNormalScene &scene,
-    Real old_time,Real new_time,const std::array<Real,2> &mu,
+inline StdVec<CoulombContactConstraint> boundedGelFrictionContactsAtOffsets(const BoundedNormalScene &scene,
+    const std::array<Real,2> &old_offset,const std::array<Real,2> &new_offset,const std::array<Real,2> &mu,
     const std::array<ContactTangentVector,2> &wall_tangent_velocity)
 {
-    const auto normal=scene.contacts(old_time,new_time);
     if (scene.config.mode==2) return {};
-    StdVec<CoulombContactConstraint> rows;rows.reserve(normal.size());
+    StdVec<CoulombContactConstraint> rows;rows.reserve(2*scene.surface.reference.size());
     for(size_t s=0;s<scene.surface.reference.size();++s)for(size_t plate=0;plate<2;++plate)
     {
         CoulombContactConstraint row;row.weights.assign(scene.model.reference.size(),0);
@@ -71,11 +70,19 @@ inline StdVec<CoulombContactConstraint> boundedGelFrictionContacts(const Bounded
             row.weights[scene.surface.targets[p]]=scene.surface.weights[p];
         row.normal=scene.normal[plate];row.tangent[0]=scene.frame*ContactSpatialVector::UnitX();
         row.tangent[1]=scene.frame*ContactSpatialVector::UnitZ();
-        row.old_offset=normal.at(2*s+plate).old_offset;row.new_offset=normal.at(2*s+plate).new_offset;
+        row.old_offset=old_offset[plate];row.new_offset=new_offset[plate];
         row.mu=mu[plate];row.wall_tangent_velocity=wall_tangent_velocity[plate];
         rows.push_back(std::move(row));
     }
     return rows;
+}
+
+inline StdVec<CoulombContactConstraint> boundedGelFrictionContacts(const BoundedNormalScene &scene,
+    Real old_time,Real new_time,const std::array<Real,2> &mu,
+    const std::array<ContactTangentVector,2> &wall_tangent_velocity)
+{
+    const Real old_u=scene.config.upperDisplacement(old_time),new_u=scene.config.upperDisplacement(new_time);
+    return boundedGelFrictionContactsAtOffsets(scene,{-1,-1+old_u},{-1,-1+new_u},mu,wall_tangent_velocity);
 }
 
 struct BoundedGelFrictionStepResult

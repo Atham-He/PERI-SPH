@@ -1,9 +1,9 @@
-"""Independent 65-digit material-path reference.
+"""Independent 95-digit material-path reference.
 
 Uses a polynomial-plus-exponential particular solution and dimensional closed
 antiderivative for loss; native uses coefficient/Gram series. Averaged PK1 uses
 independent48-point high-precision quadrature. Endpoint tangents are checked by
-65-digit central differences of that independent integral, not native formulas.
+95-digit central differences of that independent integral, not native formulas.
 """
 from decimal import Decimal as D, localcontext
 from functools import lru_cache
@@ -108,7 +108,7 @@ def reference_step(f0,f1,z0,total_loss,dt,p,tangent=True):
         assert diss>=D('-1e-45')
     e1=green(f1); z1=sub(e1,xn); avg=average(f0,f1,x0,dt,p)
     u0=stored(f0,x0,p); u1=stored(f1,xn,p); work=dot(avg,sub(f1,f0))
-    assert abs(work-(u1-u0+diss))<D('1e-28')
+    assert abs(work-(u1-u0+diss))<D('1e-28'),('reference_internal_work_identity',str(work-(u1-u0+diss)))
     jacobian=[[D(0)]*9 for _ in range(9)]
     if tangent and dt:
         epsilon=D('1e-18')
@@ -124,7 +124,7 @@ def reference_step(f0,f1,z0,total_loss,dt,p,tangent=True):
 
 def check(case,records,code):
     with localcontext() as context:
-        context.prec=65
+        context.prec=95
         assert code==case.get('expected_code',0),(case['name'],'return',code)
         p=list(map(lambda v:D(str(v)),case['parameters'])); f0=list(map(lambda v:D(str(v)),case['initial']))
         old_green=list(map(lambda v:D(str(v)),case['green'])); z0=list(map(lambda v:D(str(v)),case['viscous']))

@@ -26,11 +26,11 @@ solver therefore requires a separate admissibility/algorithm derivation.
 Zero branch has the conservative symmetric averaged tangent. This is an
 operator qualification issue, not a failed material arithmetic gate to waive.
 
-Independent reference uses65-digit Decimal polynomial-plus-exponential
+Independent reference uses95-digit Decimal polynomial-plus-exponential
 particular solutions and dimensional closed antiderivatives for loss, rather
 than native Gram/series. Stress uses48-point high-precision quadrature checked
 against polynomial moments; the9x9 tangent is independently differentiated
-with65-digit central differences at epsilon1e-18. All normalized fields have
+with95-digit central differences at epsilon1e-18. All normalized fields have
 gate1e-10. Superposed constant rotations, relaxation, ramp/hold/release, zero
 branch, volumetric and isochoric shear/mixed paths, prehistory and no advance
 are required. Negative controls must reject wrong linear-Green history and
@@ -47,3 +47,12 @@ Global PD work-conjugate gradient/transpose, nonlinear constrained solver and
 its admissible nonsymmetric/symmetric-part properties, time/space/horizon/
 large-strain qualification, full production history restart and experimental
 calibration remain required after this material-point control.
+
+The first v10 study is preserved stopped after four native calls: the65-digit
+reference's own1e-28 work identity lost precision at h≈3.33e-10 (residual≈1e-26).
+An external read-only95/125-digit adjudication localized the issue and agrees
+below1e-40. Native physical raw was not rejected by its own energy gate. The
+new assessor retains1e-10 physical gates and1e-28 selfcheck, changes no native
+physics/ELF, freezes a new version, reuses all four existing raw anchors by SHA,
+and dispatches only the14 previously unattempted inputs. The original v10
+state/terminal/raw/frozen reader remain stopped and unchanged, not passed.

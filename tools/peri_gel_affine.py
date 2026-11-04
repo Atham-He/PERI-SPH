@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from decimal import Decimal as D
 from peri_elastic_normal import identity, read, record, reserves, save, stamp, verify
 from peri_gel_affine_audit import check,green,multiply,sub,scale
@@ -72,6 +73,18 @@ def prepare(root,executable,prospective):
         values=[*case['parameters'],*case['initial'],*case['green'],*case['viscous'],case['old_dissipation'],len(case['steps'])]
         for step in case['steps']: values.extend([step['dt'],*step['F']])
         path=root/(case['name']+'.input'); path.write_text(' '.join(map(str,values))+'\n'); inputs.append(record(path))
+    for anchor in plan.get('raw_anchors',[]):
+        assert anchor['return_code']==0
+        verify([anchor[key] for key in ['stdout','stderr','input','source_state','source_terminal','executable']])
+        assert record(root/(anchor['name']+'.input'))['sha256']==anchor['input']['sha256']
+        assert record(frozen_exe)['sha256']==anchor['executable']['sha256'],'anchor physics ELF changed'
+        artifacts.extend([anchor[key] for key in ['stdout','stderr','input','source_state','source_terminal','executable']])
+    if plan.get('failure_adjudication'):
+        artifacts.append(record(plan['failure_adjudication']))
+    for original in plan.get('unchanged_physical_inputs',[]):
+        verify([original])
+        assert record(root/Path(original['path']).name)['sha256']==original['sha256'],'physical input changed'
+        artifacts.append(original)
     save(root/'preparation.json',dict(artifacts=artifacts,inputs=inputs,executable=str(frozen_exe)))
     print(json.dumps(dict(status='prepared_not_passed',cases=len(controls),source_commit=plan['source_commit'])))
 
@@ -86,29 +99,43 @@ def parse(path): return [json.loads(line) for line in Path(path).read_text().spl
 
 def run(root):
     assert not (root/'state.json').exists(),'attempted state cannot be redispatched'
-    prep=read(root/'preparation.json'); plan=read(root/'plan.json'); attempts=[]; failure=None
+    prep=read(root/'preparation.json'); plan=read(root/'plan.json'); attempts=[]; failure=None; failure_traceback=None
+    anchors={anchor['name']:anchor for anchor in plan.get('raw_anchors',[])}
     save(root/'state.json',dict(status='attempted',started_at=stamp(),identity=identity(),preparation=record(root/'preparation.json')))
     try:
         verify(prep['artifacts']+prep['inputs'])
         for case in plan['cases']:
             reserves(root); out=root/(case['name']+'.jsonl'); err=root/(case['name']+'.stderr')
             command=[prep['executable'],str(root/(case['name']+'.input'))]; started=time.monotonic(); timeout=False
-            with out.open('xb') as stdout,err.open('xb') as stderr:
-                child=subprocess.Popen(command,stdout=stdout,stderr=stderr,preexec_fn=limits)
-                try: code=child.wait(timeout=5)
-                except subprocess.TimeoutExpired: child.kill(); code=child.wait(); timeout=True
+            anchor=anchors.get(case['name'])
+            if anchor:
+                # Historical raw is copied byte-for-byte, never redispatched.
+                verify([anchor[key] for key in ['stdout','stderr','input','source_state','source_terminal','executable']])
+                shutil.copy2(anchor['stdout']['path'],out); shutil.copy2(anchor['stderr']['path'],err)
+                code=anchor['return_code']; command=anchor['command']
+            else:
+                with out.open('xb') as stdout,err.open('xb') as stderr:
+                    child=subprocess.Popen(command,stdout=stdout,stderr=stderr,preexec_fn=limits)
+                    try: code=child.wait(timeout=5)
+                    except subprocess.TimeoutExpired: child.kill(); code=child.wait(); timeout=True
             attempt=dict(name=case['name'],command=command,return_code=code,timed_out=timeout,wall_seconds=time.monotonic()-started,
-                stdout=record(out),stderr=record(err),cumulative_child_maxRSS_KiB=resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)
+                stdout=record(out),stderr=record(err),cumulative_child_maxRSS_KiB=resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,
+                reused_existing_raw_no_native_dispatch=bool(anchor),source_anchor=anchor)
             attempts.append(attempt)
             assert not timeout and attempt['cumulative_child_maxRSS_KiB']<=256*1024
             raw=parse(out); meta=raw[0]
-            assert meta['type']=='identity' and meta['pid']==child.pid and meta['ppid']==identity()['pid']
-            assert meta['argv']==command and meta['boot_id']==identity()['boot_id']
+            assert meta['type']=='identity' and meta['argv']==command
+            if anchor:
+                historical=read(anchor['source_state']['path'])['identity']
+                assert meta['ppid']==historical['pid'] and meta['boot_id']==historical['boot_id']
+                assert meta['start_ticks'].isdigit() and meta['pid']>0
+            else:
+                assert meta['pid']==child.pid and meta['ppid']==identity()['pid'] and meta['boot_id']==identity()['boot_id']
             attempt['runtime_gate']=check(case,raw,code)
         verify(prep['artifacts']+prep['inputs'])
-    except Exception as error: failure=repr(error)
+    except Exception as error: failure=repr(error); failure_traceback=traceback.format_exc()
     save(root/'terminal.json',dict(status='runtime_completed_pending_independent_review' if failure is None else 'stopped_for_review',
-        finished_at=stamp(),attempts=attempts,failure=failure))
+        finished_at=stamp(),attempts=attempts,failure=failure,failure_traceback=failure_traceback))
     print(json.dumps(dict(status=read(root/'terminal.json')['status'],attempts=len(attempts),failure=failure)))
     return int(failure is not None)
 

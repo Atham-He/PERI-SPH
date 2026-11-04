@@ -46,5 +46,14 @@ class AffineMaterialReferenceTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 reference_step(identity_matrix(),final,[D(0)]*9,D(0),D('.1'),[D(5000),D(1000),D(500),D('.3')],False)
 
+    def test_small_h_antiderivative_keeps_the_original_selfcheck_at_95_digits(self):
+        with localcontext() as context:
+            context.prec=95
+            final=list(map(D,['1.08','.2','-.03','.01','.93','.04','0','-.02','1.02']))
+            ref=reference_step(identity_matrix(),final,[D(0)]*9,D(0),D('1e-10'),[D(5000),D(1000),D(500),D('.3')],False)
+            residual=ref['work']-(ref['stored_new']-ref['stored_old']+ref['physical_dissipation'])
+            self.assertLess(abs(residual),D('1e-28'))
+            self.assertGreater(ref['physical_dissipation'],0)
+
 
 if __name__=='__main__': unittest.main()

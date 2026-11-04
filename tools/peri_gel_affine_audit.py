@@ -165,4 +165,5 @@ def check(case,records,code):
         return dict(name=case['name'],status='independent_affine_history_work_and_endpoint_tangent_passed',steps=len(entries),
                     maximum_normalized_error=worst,maximum_consistent_tangent_asymmetry=max_asym,
                     independently_checked_9x9_tangents=valid_tangents,
-                    SPD_tangent_permitted=max_asym<=1e-10)
+                    symmetry_necessary_condition_only=max_asym<=1e-10,
+                    positive_definiteness_not_assessed=True)

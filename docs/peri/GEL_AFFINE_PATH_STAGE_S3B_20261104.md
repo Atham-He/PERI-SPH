@@ -56,3 +56,11 @@ new assessor retains1e-10 physical gates and1e-28 selfcheck, changes no native
 physics/ELF, freezes a new version, reuses all four existing raw anchors by SHA,
 and dispatches only the14 previously unattempted inputs. The original v10
 state/terminal/raw/frozen reader remain stopped and unchanged, not passed.
+
+Reporting clarification after the completed v10b review: its per-case legacy
+field `SPD_tangent_permitted` tested symmetry only, which is necessary but not
+sufficient for SPD. The immutable receipt is preserved; no SPD certificate is
+inferred from that field. Subsequent source reports use
+`symmetry_necessary_condition_only` and `positive_definiteness_not_assessed`.
+The independently measured mixed-path asymmetry already excludes an SPD-only
+global solve for that true tangent; complete global admissibility remains open.

@@ -76,7 +76,13 @@ def prepare(root,executable,prospective):
         entry=dict(original=record(source),frozen=record(target));manifest.append(entry);artifacts.extend(entry.values())
     save(root/'frozen/compiler_dependencies.json',manifest);artifacts.append(record(root/'frozen/compiler_dependencies.json'))
     import _decimal,math
-    for p in [Path(sys.executable).resolve(),Path(_decimal.__file__),Path(math.__file__)]:artifacts.append(record(p))
+    artifacts.append(record(Path(sys.executable).resolve()))
+    modules={}
+    for module in [_decimal,math]:
+        origin=module.__spec__.origin;modules[module.__name__]=origin
+        if getattr(module,'__file__',None):artifacts.append(record(Path(module.__file__)))
+        else:assert origin in ['built-in','frozen'],('unidentified interpreter module',module.__name__,origin)
+    save(root/'frozen/interpreter_modules.json',modules);artifacts.append(record(root/'frozen/interpreter_modules.json'))
     for line in subprocess.check_output(['ldd',str(executable)],text=True).splitlines():
         for token in line.split():
             if token.startswith('/') and Path(token).is_file():artifacts.append(record(token))
@@ -187,5 +193,11 @@ def review(root):
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('action',choices=['prepare','run','review']);p.add_argument('--root',type=Path,required=True)
     p.add_argument('--executable',type=Path);p.add_argument('--prospective',type=Path);args=p.parse_args()
-    if args.action=='prepare':prepare(args.root,args.executable,args.prospective)
+    if args.action=='prepare':
+        fresh=not args.root.exists()
+        try:prepare(args.root,args.executable,args.prospective)
+        except Exception as error:
+            if fresh and args.root.exists():save(args.root/'preparation_error.json',dict(status='preparation_failed_no_native_dispatch',
+                identity=identity(),recorded_at=stamp(),failure=repr(error),failure_traceback=traceback.format_exc()))
+            raise
     else:sys.exit(globals()[args.action](args.root))

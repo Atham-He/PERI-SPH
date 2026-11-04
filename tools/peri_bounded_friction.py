@@ -21,6 +21,11 @@ def prepare(root,executable,prospective,normal_root):
     assert plan['normalized_physical_gate']==1e-10 and plan['roundoff_gate']==1e-12
     assert plan['dense_penetration_stroke_gate']==.01 and not plan['S3_complete'] and not plan['calibration_allowed']
     assert plan['campaign']=='early_cycle_unattempted_tail','a new explicit continuation plan is required'
+    previous_plan=read(Path(plan['continuation']['prior_root'])/'plan.json')
+    trusted_normal=Path(previous_plan['normal_anchor']['review']['path']).parent
+    if normal_root is not None:
+        assert normal_root.resolve()==trusted_normal.resolve(),'normal anchor must equal the sealed previous plan'
+    normal_root=trusted_normal
     continuation=qualification_prerequisite(**plan['continuation'])
     budget=reserves(root.parent)
     mem={line.split(':')[0]:int(line.split()[1])*1024 for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith(('MemTotal:','MemAvailable:'))}

@@ -79,7 +79,7 @@ def main():
         save(root/'plan.json',dict(prepared_at=stamp(),source_commit=source,source_snapshots=prepared['source_snapshots'],anchors=anchors,
             compile_command=prepared['compile_command'],link_command=prepared['link_command'],build_cwd=str(prepared['builddir']),
             compile_budget=dict(CPU_seconds=180,wall_seconds=240,AS_GiB=2),native_budget=dict(CPU_seconds=30,wall_seconds=45,AS_GiB=1,threads=1),
-            declared_modes=['--capabilities','--initialize'],new_physical_steps=0,physical_dispatch_allowed=False,
+            declared_modes=['--capabilities','--initialize','--diagnostic-fixture'],new_physical_steps=0,physical_dispatch_allowed=False,
             gates=['All original/actual includes/source/runtime/production/reference hashes unchanged',
                 'Compile actual original nonsymmetric Newton entry, but never invoke physical modes',
                 'Explicit initialized140field candidate/138field record and old t0 body independently byte-matched except new mu',
@@ -94,14 +94,21 @@ def main():
         inputs=[record(root/'original.input')]; frozen=dict(plan=record(root/'plan.json'),build=build,inputs=inputs,anchors=anchors)
         save(root/'frozen_execution.json',frozen)
         phases=[]
-        for label,arguments in [('capabilities',['--capabilities']),('initialize',['--initialize',str(root)])]:
+        for label,arguments in [('capabilities',['--capabilities']),('initialize',['--initialize',str(root)]),('diagnostic_fixture',['--diagnostic-fixture'])]:
             native=run(root,label,[build['ELF']['path']]+arguments,root,30,45,1)
             rows=[json.loads(x) for x in (root/(label+'.stdout')).read_text().splitlines()]
             assert native['peak_parent_threads']<=1
             for x in anchors+build['support']+build['source_snapshots']+inputs+[build['ELF'],build['source_manifest'],build['build_runtime_manifest']]:assert record(x['path'])==x
             phases.append(native)
             if label=='capabilities':assert rows[-1]['actual_PD_checkpoint_driver'] and not rows[-1]['full_restart_qualified']
-            else:assessment=assess(root,baseline,build,rows[-1])
+            elif label=='initialize':assessment=assess(root,baseline,build,rows[-1])
+            else:
+                assert rows[-1]==dict(type='diagnostic_fixture',controlled_formatter_only=True,new_physical_steps=0)
+                diagnostic=json.loads((root/(label+'.stderr')).read_text())
+                assert diagnostic==dict(type='checkpoint_driver_failure',mechanical_durable_step=7,mechanical_durable_time=.07,
+                    mechanical_durable_bytes=123456,last_full_debug_step=6,last_full_debug_time=.06,actual_solver_calls=7,
+                    publication_error_number=5,publication_stage=3,message='controlled formatter fixture: quote" backslash\\ newline\n',append_witness=None)
+                assessment['allocation_free_failure_formatter_fixture_independently_matched']=True
         assessment.update(recorded_at=stamp(),source_commit=source,plan=record(root/'plan.json'),frozen_execution=record(root/'frozen_execution.json'),
             actual_compiler_dependency_count=build['actual_compiler_dependency_count'],phases=phases)
         save(root/'independent_preflight.json',assessment);save(root/'terminal.json',dict(status=assessment['status'],return_code=0,finished_at=stamp(),receipt=record(root/'independent_preflight.json')))

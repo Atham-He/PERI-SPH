@@ -32,6 +32,11 @@ the noexcept owned-state swap. That endpoint check does not call a second Newton
 Actual mechanical durable cursor is updated before full debug formatting.
 Failures print the mechanical cursor, separate current-process full debug-row
 cursor, actual solve count and first append failure witness while owner lives.
+Checkpoint publication errors also retain the explicit error number and stage,
+including the selected new owner after a post-rename directory-sync failure.
+`--diagnostic-fixture` is a zero-advance controlled formatter check, not a disk
+fault or physical failure; its distinct mechanical/debug cursors, numeric error
+and escaped quote/backslash/newline are independently checked.
 No subsequent solve occurs after an exception, rejected gate or uncertain write.
 CP sealing occurs at accepted steps8/20/32/40 and any declared early terminal.
 All branch prefixes, selected pointers and unselected later tails are retained.

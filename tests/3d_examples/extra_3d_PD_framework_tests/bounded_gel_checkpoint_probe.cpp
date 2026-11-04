@@ -78,6 +78,8 @@ struct DurableDriverCursor
     uint64_t durable_step=0,durable_bytes=0,debug_step=0,solver_calls=0;
     Real durable_time=0,debug_time=0;
     BoundedAppendWitness last_append{};
+    int publication_error_number=0;
+    unsigned publication_stage=0; // 1 initial,2 explicit resume,3 later seal
     void accepted(const BoundedOwnedCheckpoint *owner)noexcept
     {
         if(!owner)return;const auto &c=owner->candidate();
@@ -89,9 +91,9 @@ struct DurableDriverCursor
 // This remains useful if full Newton JSON formatting failed after fsync/commit.
 void diagnostic(const std::exception &error,const DurableDriverCursor &cursor,const BoundedOwnedCheckpoint *owner)noexcept
 {
-    std::fprintf(stderr,"{\"type\":\"checkpoint_driver_failure\",\"mechanical_durable_step\":%llu,\"mechanical_durable_time\":%.17g,\"mechanical_durable_bytes\":%llu,\"last_full_debug_step\":%llu,\"last_full_debug_time\":%.17g,\"actual_solver_calls\":%llu,\"message\":\"",
+    std::fprintf(stderr,"{\"type\":\"checkpoint_driver_failure\",\"mechanical_durable_step\":%llu,\"mechanical_durable_time\":%.17g,\"mechanical_durable_bytes\":%llu,\"last_full_debug_step\":%llu,\"last_full_debug_time\":%.17g,\"actual_solver_calls\":%llu,\"publication_error_number\":%d,\"publication_stage\":%u,\"message\":\"",
         (unsigned long long)cursor.durable_step,cursor.durable_time,(unsigned long long)cursor.durable_bytes,
-        (unsigned long long)cursor.debug_step,cursor.debug_time,(unsigned long long)cursor.solver_calls);
+        (unsigned long long)cursor.debug_step,cursor.debug_time,(unsigned long long)cursor.solver_calls,cursor.publication_error_number,cursor.publication_stage);
     for(const unsigned char *p=reinterpret_cast<const unsigned char*>(error.what());*p;++p)
     {if(*p=='"'||*p=='\\')std::fputc('\\',stderr);if(*p<32)std::fprintf(stderr,"\\u%04x",unsigned(*p));else std::fputc(*p,stderr);}
     std::fputs("\",\"append_witness\":",stderr);
@@ -106,12 +108,14 @@ void diagnostic(const std::exception &error,const DurableDriverCursor &cursor,co
     }
     std::fputs("}\n",stderr);std::fflush(stderr);
 }
-void seal(BoundedGenerationStore &store,const std::string &store_path,const Digest &trusted,const std::string &label)
+void seal(BoundedGenerationStore &store,const std::string &store_path,const Digest &trusted,const std::string &label,DurableDriverCursor &cursor)
 {
     const auto &candidate=store.live()->candidate();const uint64_t step=candidate.body.accepted.gel.steps,generation=step?step:1;
     VerifiedBoundedMechanicalPrefix proof(store.live()->workingSourcePath(),candidate,generation,trusted,true);
     const auto branch="g_"+label+"_s"+std::to_string(step);
+    cursor.publication_stage=3;
     const auto result=store.publish(candidate,generation,proof,branch,store.currentPointerBytes());
+    cursor.publication_error_number=result.error_number;cursor.accepted(store.live());
     require(result.status==BoundedPublishStatus::PublishedDurable,"checkpoint driver: checkpoint publication durability uncertain");
     writeAt(store_path,"selected_"+label+"_s"+std::to_string(step)+".bin",store.currentPointerBytes().value());
     io::begin("checkpoint");io::field("generation",generation);io::field("accepted_step",step);
@@ -144,7 +148,9 @@ int execute(int argc,char **argv)
             require(initial.body.accepted.gel.steps==0,"checkpoint driver: fresh initial step");
             bound.reset(new BoundedRunningContract(running(root,initial.contract)));
             VerifiedBoundedMechanicalPrefix proof(root+"/initial.phy",initial,1,trusted,true);
+            cursor.publication_stage=1;
             const auto result=store.publish(initial,1,proof,"g_"+label+"_initial",std::nullopt);
+            cursor.publication_error_number=result.error_number;cursor.accepted(store.live());
             require(result.status==BoundedPublishStatus::PublishedDurable,"checkpoint driver: initial publication durability uncertain");
             cursor.accepted(store.live());
             // Reusing the original full header preserves independent reference
@@ -169,7 +175,9 @@ int execute(int argc,char **argv)
                 io::field("archive_sha256",hex(sha256(loaded.archive_bytes,loaded.archive_bytes.size())));
                 io::field("new_physical_steps",0);io::field("full_restart_qualified",false);io::finish();return 0;
             }
+            cursor.publication_stage=2;
             const auto result=store.publish(loaded.candidate,generation,*loaded.prefix,"g_"+label+"_resume",expected);
+            cursor.publication_error_number=result.error_number;cursor.accepted(store.live());
             require(result.status==BoundedPublishStatus::PublishedDurable,"checkpoint driver: resume publication durability uncertain");
             cursor.accepted(store.live());
             io::begin("resume_header");io::field("selected_generation",generation);io::field("accepted_step",cursor.durable_step);
@@ -205,7 +213,7 @@ int execute(int argc,char **argv)
             require(append.status==BoundedAppendStatus::AcceptedDurable,"checkpoint driver: accepted physical write failed");
             obs::step(scene,old.accepted,result,interval,rows,true,whole,endpoint,"all_applicable_step_gates_passed");
             cursor.debug_step=cursor.durable_step;cursor.debug_time=cursor.durable_time;
-            const auto k=cursor.durable_step;if(k==8 || k==20 || k==32 || k==40 || k==target)seal(store,store_path,trusted,label);
+            const auto k=cursor.durable_step;if(k==8 || k==20 || k==32 || k==40 || k==target)seal(store,store_path,trusted,label,cursor);
         }
         io::begin("end");io::field("completed",true);io::field("accepted_steps",cursor.durable_step);
         io::field("last_accepted_time",cursor.durable_time);io::field("actual_solver_calls",cursor.solver_calls);
@@ -229,6 +237,15 @@ int main(int argc,char **argv)
             require(argc==2,"checkpoint driver: capability arguments");io::begin("capabilities");
             io::field("actual_PD_checkpoint_driver",true);io::field("initialization_only_preflight_available",true);
             io::field("explicit_selected_generation",true);io::field("full_restart_qualified",false);io::field("S3_complete",false);io::finish();return 0;
+        }
+        if(mode=="--diagnostic-fixture")
+        {
+            require(argc==2,"checkpoint driver: diagnostic fixture arguments");
+            DurableDriverCursor fixture;fixture.durable_step=7;fixture.durable_time=.07;fixture.durable_bytes=123456;
+            fixture.debug_step=6;fixture.debug_time=.06;fixture.solver_calls=7;
+            fixture.publication_error_number=EIO;fixture.publication_stage=3;
+            diagnostic(std::runtime_error("controlled formatter fixture: quote\" backslash\\ newline\n"),fixture,nullptr);
+            io::begin("diagnostic_fixture");io::field("controlled_formatter_only",true);io::field("new_physical_steps",0);io::finish();return 0;
         }
         io::identity();
         if(mode=="--initialize"){require(argc==3,"checkpoint driver: initialize ROOT");initialize(argv[2]);return 0;}

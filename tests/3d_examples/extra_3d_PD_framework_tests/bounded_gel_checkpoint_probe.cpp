@@ -73,7 +73,7 @@ void initialize(const std::string &root)
     io::field("new_physical_steps",0);io::field("full_restart_qualified",false);io::finish();
 }
 
-struct Cursor
+struct DurableDriverCursor
 {
     uint64_t durable_step=0,durable_bytes=0,debug_step=0,solver_calls=0;
     Real durable_time=0,debug_time=0;
@@ -87,7 +87,7 @@ struct Cursor
 };
 // Allocation-free first failure witness, emitted while the owner still exists.
 // This remains useful if full Newton JSON formatting failed after fsync/commit.
-void diagnostic(const std::exception &error,const Cursor &cursor,const BoundedOwnedCheckpoint *owner)noexcept
+void diagnostic(const std::exception &error,const DurableDriverCursor &cursor,const BoundedOwnedCheckpoint *owner)noexcept
 {
     std::fprintf(stderr,"{\"type\":\"checkpoint_driver_failure\",\"mechanical_durable_step\":%llu,\"mechanical_durable_time\":%.17g,\"mechanical_durable_bytes\":%llu,\"last_full_debug_step\":%llu,\"last_full_debug_time\":%.17g,\"actual_solver_calls\":%llu,\"message\":\"",
         (unsigned long long)cursor.durable_step,cursor.durable_time,(unsigned long long)cursor.durable_bytes,
@@ -133,7 +133,7 @@ int execute(int argc,char **argv)
         if(!validate){target=integer(argv[8]);label=argv[9];}
     }
     if(!validate){gen::branchLeaf("g_"+label+"_s40");require(target>0 && target<=40,"checkpoint driver: prospective terminal step bound");}
-    BoundedGenerationStore store(store_path,trusted);Cursor cursor;
+    BoundedGenerationStore store(store_path,trusted);DurableDriverCursor cursor;
     try
     {
         std::unique_ptr<BoundedRunningContract> bound;
@@ -234,5 +234,5 @@ int main(int argc,char **argv)
         if(mode=="--initialize"){require(argc==3,"checkpoint driver: initialize ROOT");initialize(argv[2]);return 0;}
         return execute(argc,argv);
     }
-    catch(const std::exception &error){diagnostic(error,Cursor{},nullptr);return 1;}
+    catch(const std::exception &error){diagnostic(error,DurableDriverCursor{},nullptr);return 1;}
 }

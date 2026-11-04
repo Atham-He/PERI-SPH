@@ -116,7 +116,7 @@ struct BoundedFrictionProtocol
     }
 };
 
-inline std::array<Real,2> boundedFrictionIntervalGaps(const BoundedNormalScene &scene,
+template<class Scene>inline std::array<Real,2> boundedFrictionIntervalGaps(const Scene &scene,
     const StdVec<Vecd> &q0,const StdVec<Vecd> &q1,const BoundedFrictionInterval &interval,bool whole_interval=true)
 {
     if(q0.size()!=scene.model.reference.size() || q1.size()!=q0.size())

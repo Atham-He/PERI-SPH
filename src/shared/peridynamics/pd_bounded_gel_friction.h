@@ -57,7 +57,7 @@ inline BoundedGelFrictionState initialBoundedGelFrictionState(const BoundedNorma
     return state;
 }
 
-inline StdVec<CoulombContactConstraint> boundedGelFrictionContactsAtOffsets(const BoundedNormalScene &scene,
+template<class Scene>inline StdVec<CoulombContactConstraint> boundedGelFrictionContactsAtOffsets(const Scene &scene,
     const std::array<Real,2> &old_offset,const std::array<Real,2> &new_offset,const std::array<Real,2> &mu,
     const std::array<ContactTangentVector,2> &wall_tangent_velocity)
 {
@@ -102,17 +102,11 @@ struct BoundedGelFrictionStepResult
     Vecd angular_drift_minus_external=Vecd::Zero(),internal_old_torque=Vecd::Zero();
 };
 
-/** True local-PD material context plus simultaneous normal/two-tangent solve.
- * The old state remains untouched on EVERY failure. The caller additionally
- * applies whole-interval geometry/output gates before committing this result.
- */
-inline BoundedGelFrictionStepResult advanceBoundedGelFriction(const BoundedGelModel &model,
-    const BoundedGelFrictionState &old,Real dt,const StdVec<CoulombContactConstraint> &rows,
-    const StdVec<size_t> &plate,const ManyContactSettings &settings={})
+namespace bounded_friction_detail
 {
-    using namespace coulomb_contact_detail;
-    const BoundedGelStepContext context(model,old.gel,dt);const size_t n=model.reference.size(),m=rows.size();
-    if (plate.size()!=m || old.gel.last_normal_impulse.size()!=m || old.last_tangent_impulse.size()!=m ||
+inline void validateHistory(const BoundedGelFrictionState &old,size_t n,size_t m,const StdVec<size_t> &plate)
+{
+    if (old.gel.position.size()!=n || plate.size()!=m || old.gel.last_normal_impulse.size()!=m || old.last_tangent_impulse.size()!=m ||
         old.tangent_slip_sum.size()!=m || old.tangent_slip_correction.size()!=m ||
         old.ledger_sum.size()!=size_t(ContactLedger::Count) || old.ledger_correction.size()!=old.ledger_sum.size())
         throw std::invalid_argument("bounded gel friction: history dimensions");
@@ -123,11 +117,28 @@ inline BoundedGelFrictionStepResult advanceBoundedGelFriction(const BoundedGelMo
     for(size_t i=0;i<old.ledger_sum.size();++i)
         if (!std::isfinite(old.ledger_sum[i]) || !std::isfinite(old.ledger_correction[i]))
             throw std::invalid_argument("bounded gel friction: cumulative history");
-    const CoulombContactSystem system(flattenPD(old.gel.position),dt,context.total_mass,rows,settings);
+}
+
+/** Scratch proposal arithmetic shared by native solve and readonly record
+ * validation. Caller must have proved the supplied final original R/KKT and
+ * arithmetic certificate. This function never runs Newton or commits a state.
+ */
+inline BoundedGelFrictionStepResult finishProposal(const BoundedGelModel &model,const BoundedGelFrictionState &old,
+    Real dt,const StdVec<CoulombContactConstraint> &rows,const StdVec<size_t> &plate,
+    const BoundedGelStepContext &context,const CoulombContactSystem &system,CoulombContactResult solved)
+{
+    using namespace coulomb_contact_detail;
+    const size_t n=model.reference.size(),m=rows.size();validateHistory(old,n,m,plate);
+    if(&context.model!=&model || &context.old!=&old.gel || context.dt!=dt || system.dt!=dt ||
+        system.dofs!=3*n || system.contacts_count!=m)
+        throw std::invalid_argument("bounded gel friction: proposal context mismatch");
     BoundedGelFrictionStepResult r;r.next=old;
-    r.solve=solveCoulombContact(system,[&](const auto &v){return context.evaluate(v).equation;},
-        [&](const auto &v){return context.inDomain(v);},settings);
+    r.solve=std::move(solved);
     if (!r.solve.converged) { r.status=r.solve.status;return r; }
+    if(r.solve.velocity.size()!=3*n || r.solve.impulses.size()!=3*m || r.solve.trace.empty() ||
+        !std::isfinite(r.solve.normalized_KKT) || r.solve.normalized_KKT<0 || r.solve.normalized_KKT>1e-12 ||
+        r.solve.trace.back().iteration>48)
+        throw std::invalid_argument("bounded gel friction: unvalidated final proposal");
     r.evaluation=context.evaluate(r.solve.velocity);r.next.gel.velocity=unflattenPD(r.solve.velocity);
     const auto &g=system.coefficients();const auto &impulse=r.solve.impulses;
     r.next.gel.time=old.gel.time+dt;r.next.gel.steps=old.gel.steps+1;
@@ -253,6 +264,23 @@ inline BoundedGelFrictionStepResult advanceBoundedGelFriction(const BoundedGelMo
     catch(const std::runtime_error &error) { r.status=error.what();return r; }
     r.accepted=true;r.status="original_PD_normal_and_two_tangent_step_gates_passed";
     return r;
+}
+} // namespace bounded_friction_detail
+
+/** True local-PD material context plus simultaneous normal/two-tangent solve.
+ * The old state remains untouched on EVERY failure. The caller additionally
+ * applies whole-interval geometry/output gates before committing this result.
+ */
+inline BoundedGelFrictionStepResult advanceBoundedGelFriction(const BoundedGelModel &model,
+    const BoundedGelFrictionState &old,Real dt,const StdVec<CoulombContactConstraint> &rows,
+    const StdVec<size_t> &plate,const ManyContactSettings &settings={})
+{
+    const BoundedGelStepContext context(model,old.gel,dt);
+    bounded_friction_detail::validateHistory(old,model.reference.size(),rows.size(),plate);
+    const CoulombContactSystem system(flattenPD(old.gel.position),dt,context.total_mass,rows,settings);
+    auto solved=solveCoulombContact(system,[&](const auto &v){return context.evaluate(v).equation;},
+        [&](const auto &v){return context.inDomain(v);},settings);
+    return bounded_friction_detail::finishProposal(model,old,dt,rows,plate,context,system,std::move(solved));
 }
 } // namespace SPH::peridynamics
 #endif

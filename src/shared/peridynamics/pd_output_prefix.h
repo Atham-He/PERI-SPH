@@ -75,6 +75,23 @@ class VerifiedOutputPrefix
     uint64_t bytes()const{return count_;}
     const Digest &digest()const{return digest_;}
 
+    // Read semantic records through the SAME verified descriptor. Reopening a
+    // pathname after hash validation would introduce a path-replacement race.
+    void readAt(uint64_t offset,uint8_t *destination,size_t size)const
+    {
+        if(offset>count_ || uint64_t(size)>count_-offset || (size && !destination))
+            throw std::invalid_argument("output prefix: semantic read bound");
+        unchanged();size_t received=0;
+        while(received<size)
+        {
+            const auto n=::pread(source_.get(),destination+received,size-received,off_t(offset+received));
+            if(n<0 && errno==EINTR)continue;
+            if(n<=0)throw std::runtime_error("output prefix: semantic read end");
+            received+=size_t(n);
+        }
+        unchanged();
+    }
+
     // The transaction owner supplies its private staging directory. Creation
     // is exclusively a NEW leaf: this API cannot overwrite a live descriptor.
     // Failed staging is preserved. Session/pointer commit is a separate layer.

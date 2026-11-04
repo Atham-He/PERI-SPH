@@ -49,6 +49,10 @@ def neumaier(value,total,correction):
     return nxt,correction
 
 
+def reversed_contact_counts(row_signs):
+    return [sum(signs=={1,-1} for (s,k),signs in row_signs.items() if k==a) for a in range(2)]
+
+
 def expected_contacts(header,interval):
     surface=header['surface'];rows=[]
     for s in range(len(surface['reference'])):
@@ -87,10 +91,11 @@ class FrictionInspector(Inspector):
         assert header['geometry_cursor']=='minimum_over_each_linear_particle_and_true_prescribed_cubic_wall_interval'
         self.G=coefficients(header['initial_contacts'],99)
         assert header['C_full_three_components']==self.G and header['C']==self.G[::3]
-        self.ever_active=set();self.slip_signs=[set(),set()]
+        self.ever_active=set();self.slip_signs=[set(),set()];self.row_slip_signs={};self.capture=None
         self.statistics=dict(sliding_rows=0,strict_stick_rows=0,previously_active_separation_rows=0,
             Maxwell_loss=D(0),normal_loss=D(0),friction_loss=D(0),algorithmic_loss=D(0),
-            positive_input_work=D(0),minimum_observed_gap=D('Infinity'))
+            positive_input_work=D(0),minimum_observed_gap=D('Infinity'),
+            nonzero_tangent0_rows=0,nonzero_tangent1_rows=0)
 
     def initial(self):
         old,z,loss=super().initial();history=self.h['initial_friction_history'];m=len(self.ids)
@@ -191,12 +196,17 @@ class FrictionInspector(Inspector):
             active=lam>frac(self.I)*frac(1e-8)
             if active:
                 self.ever_active.add(s)
+                for a in range(2):
+                    if abs(fp[3*s+1+a])>frac(self.I)*frac(1e-10):
+                        self.statistics['nonzero_tangent'+str(a)+'_rows']+=1
                 radius=dec(contact['mu'])*decimal(lam);tn=sum(decimal(x)**2 for x in fp[3*s+1:3*s+3]).sqrt()
                 speed=sum(decimal(x)**2 for x in relative).sqrt()
                 if speed>D('1e-8'):
                     self.statistics['sliding_rows']+=1
                     for a in range(2):
-                        if abs(relative[a])>frac(1e-8):self.slip_signs[a].add(1 if relative[a]>0 else -1)
+                        if abs(relative[a])>frac(1e-8):
+                            sign=1 if relative[a]>0 else -1
+                            self.slip_signs[a].add(sign);self.row_slip_signs.setdefault((s,a),set()).add(sign)
                 elif radius-tn>D('1e-8')*self.I:self.statistics['strict_stick_rows']+=1
             else:
                 endpoint_gap=fdot(self.G[3*s],flatten(new['position']))-frac(contact['new_offset'])
@@ -244,18 +254,20 @@ class FrictionInspector(Inspector):
         for field,value in [('Maxwell_loss',reference['physical_material_loss']),('normal_loss',decimal(Dn)),('friction_loss',decimal(Df)),('algorithmic_loss',decimal(da))]:
             self.statistics[field]+=value
         self.statistics['positive_input_work']+=sum((max(D(0),decimal(x+y)) for x,y in zip(Wn,Wt)),D(0))
+        if self.capture:self.capture(self,old,z,loss,history,row)
         self.cache.clear()  # retain at most one accepted step's Newton material packets
         return new,[x['viscous'] for x in reference['points']],[x['total_dissipation'] for x in reference['points']],hnew
 
 
-def inspect_stream(case,path,code,full=False):
+def inspect_stream(case,path,code,full=False,capture=None):
     with localcontext() as ctx:
         ctx.prec=95
         assert code==case.get('expected_code',0)==0,(case['name'],'return_code',code)
         with open(path,encoding='utf8') as stream:
             meta=json.loads(next(stream));h=json.loads(next(stream))
             assert meta['type']=='identity' and h['type']=='header'
-            audit=FrictionInspector(case,h,full);old,z,loss,history=audit.initial();count=0;end=None
+            audit=FrictionInspector(case,h,full);audit.capture=capture
+            old,z,loss,history=audit.initial();count=0;end=None
             for line in stream:
                 row=json.loads(line)
                 if row['type']=='end':
@@ -268,7 +280,8 @@ def inspect_stream(case,path,code,full=False):
         stat=audit.statistics
         for field in case.get('require_statistics',[]):assert stat[field]>0,(case['name'],'missing_observation',field)
         if case.get('require_two_way_slip'):
-            assert audit.slip_signs==[{1,-1},{1,-1}],(case['name'],'two_way_actual_relative_slip',audit.slip_signs)
+            # Opposite signs at different plates are not temporal reversal.
+            assert all(n>0 for n in reversed_contact_counts(audit.row_slip_signs)),(case['name'],'same_contact_temporal_slip_reversal')
         spectrum=stability_spectrum(case['rotation'],tuple(h['reference']['volume']),h['reference']['horizon'],
             *[float(h['parameters'][k]) for k in [0,1]],float(h['eta'])) if full else None
         return dict(name=case['name'],status='independent_actual_PD_original_friction_consistency_passed' if full else 'runtime_pending_full_point_tangent_review',
@@ -276,6 +289,7 @@ def inspect_stream(case,path,code,full=False):
             geometry=audit.geometry,independent_stability=spectrum,all_trial_point_tangents_checked=full,
             independent_trial_material_points=audit.trial_points,
             observations={k:float(v) if isinstance(v,D) else v for k,v in stat.items()},
+            temporally_reversed_contacts_per_tangent=reversed_contact_counts(audit.row_slip_signs),
             algorithmic_loss_positive_input=float(stat['algorithmic_loss']/stat['positive_input_work']) if stat['positive_input_work'] else None,
             normal_only=False,trajectory_convergence_qualified=False,angular_conservation_qualified=False,
             full_restart_qualified=False,S3_complete=False,calibration_allowed=False)

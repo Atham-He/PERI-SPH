@@ -120,6 +120,86 @@ def box_response(position, velocity, center, half, wall_velocity, volume, config
     return force, stiffness * penetration**2 / 2, penetration
 
 
+def surface_reference(path):
+    cache = []
+    with path.open(newline='') as stream:
+        for row in csv.DictReader(stream):
+            sample, particle = int(row['sample']), int(row['particle'])
+            reference = [float(row[d]) for d in ('x', 'y', 'z')]
+            area, weight = float(row['area']), float(row['weight'])
+            if sample == len(cache): cache.append(dict(reference=reference, area=area, links=[]))
+            if sample < 0 or sample >= len(cache) or particle < 0 or not all(math.isfinite(v) for v in reference + [area, weight]):
+                raise ValueError('invalid surface cache sample/target')
+            item = cache[sample]
+            if item['reference'] != reference or item['area'] != area or area <= 0:
+                raise ValueError('inconsistent reference surface sample')
+            if item['links'] and particle <= item['links'][-1][0]:
+                raise ValueError('surface targets duplicated or out of deterministic order')
+            item['links'].append((particle, weight))
+    if not cache or any(abs(math.fsum(w for _, w in s['links']) - 1) > 1e-10 for s in cache):
+        raise ValueError('surface partition of unity failed')
+    return cache
+
+
+def surface_contact_fields(fields, row, config, cache):
+    count = len(fields['Mass'])
+    duration = config['compression_stroke'] / config['compression_speed']
+    young, nu = config['youngs_modulus'], config['poisson_ratio']
+    modulus = young / (3 * (1 - 2 * nu)) + 4 * young / (6 * (1 + nu)) * (1 + config['relaxing_shear_ratio'])
+    stiffness = modulus / config['contact_penalty_length']
+    if len(cache) != 2 * int(config['surface_rings']) * int(config['surface_azimuths']) or not math.isclose(
+            math.fsum(s['area'] for s in cache), 4 * math.pi * config['radius']**2, rel_tol=1e-11):
+        raise ValueError('incomplete reference sphere area rule')
+    applied = [[[ ] for _ in range(3)] for _ in range(count)]
+    friction = [[[ ] for _ in range(3)] for _ in range(count)]
+    observed, last, potential = [], [], []
+    def gather(item, name):
+        if any(i >= count for i, _ in item['links']): raise ValueError('surface target outside particle body')
+        return [math.fsum(w * fields[name][3*i+d] for i, w in item['links']) for d in range(3)]
+    for item in cache:
+        accepted = gather(item, 'Position')
+        if row['pd_steps'] == 0 and max(abs(a-b) for a, b in zip(accepted, item['reference'])) > 1e-10 * config['radius']:
+            raise ValueError('reference surface affine reproduction failed against initial raw positions')
+        for sample, time, position_name, velocity_name in [
+                (False, row['time_s'], 'Position', 'Velocity'),
+                (True, row['last_contact_sample_time_s'], 'GelContactSamplePosition', 'GelContactSampleVelocity')]:
+            if sample and not row['pd_steps']: continue
+            position = gather(item, position_name)
+            face = 2 * (config['radius'] + config['initial_gap']) - min(time / duration, 1) * config['compression_stroke']
+            if 0 <= position[1] <= face: continue
+            if max(abs(position[0]), abs(position[2])) >= config['plate_half_width']:
+                raise ValueError('surface sample outside finite plate support')
+            velocity = gather(item, velocity_name)
+            for wall in (0, 1):
+                penetration = max(0, -position[1] if wall == 0 else position[1] - face)
+                if not penetration: continue
+                wall_v = [0, -config['compression_speed'] if wall and time < duration else 0, 0]
+                tangent = [velocity[0], 0, velocity[2]]
+                speed = math.sqrt(dot(tangent, tangent))
+                magnitude = stiffness * item['area'] * penetration
+                f = [-config['friction_mu'] * magnitude * math.tanh(speed / config['friction_velocity']) * t / speed
+                     if speed else 0 for t in tangent]
+                force = [f[0], magnitude if wall == 0 else -magnitude, f[2]]
+                if sample:
+                    for i, weight in item['links']:
+                        for d in range(3):
+                            applied[i][d].append(weight * force[d]); friction[i][d].append(weight * f[d])
+                    if wall: last.append(-force[1])
+                else:
+                    potential.append(0.5 * stiffness * item['area'] * penetration**2)
+                    if wall: observed.append(-force[1])
+    error = 0
+    if row['pd_steps']:
+        for i in range(count):
+            for d in range(3):
+                error = max(error, abs(math.fsum(applied[i][d]) - fields['ContactRepulsionFromWall'][3*i+d]),
+                            abs(math.fsum(friction[i][d]) - fields['ContactFrictionForce'][3*i+d]))
+                if abs(fields['LowerPlateReaction'][3*i+d] + fields['UpperPlateReaction'][3*i+d] +
+                       fields['ContactRepulsionFromWall'][3*i+d]) > 1e-10 * young * config['spacing']**2:
+                    raise ValueError('mapped body/plate reaction balance failed')
+    return observed, last, potential, error / (young * config['spacing']**2)
+
+
 def audit_frames(directory, config):
     with (directory / 'output/diagnostics.csv').open() as stream:
         diagnostics = [{key: float(value) for key, value in row.items()} for row in csv.DictReader(stream)]
@@ -134,6 +214,7 @@ def audit_frames(directory, config):
     initial_masses = None
     previous_loss = None
     checked = 0
+    cache = surface_reference(directory / 'output/surface_reference.csv') if config.get('reference_surface_contact') else None
     for file, row in zip(files, diagnostics):
         fields = {node.get('Name'): [float(value) for value in (node.text or '').split()]
                   for node in ET.parse(file).iter('DataArray') if node.get('Name')}
@@ -168,10 +249,11 @@ def audit_frames(directory, config):
             position, velocity = fields['Position'][3*i:3*i+3], fields['Velocity'][3*i:3*i+3]
             upper = [0, row['upper_face_y_m'] + half[1], 0]
             wall_velocity = [0, -config['compression_speed'] if row['time_s'] < duration else 0, 0]
-            force, U, _ = box_response(position, velocity, upper, half, wall_velocity, volume, config)
-            observed_upper.append(-force[1]); potential.append(U)
-            _, lower_U, _ = box_response(position, velocity, [0, -half[1], 0], half, [0, 0, 0], volume, config)
-            potential.append(lower_U)
+            if cache is None:
+                force, U, _ = box_response(position, velocity, upper, half, wall_velocity, volume, config)
+                observed_upper.append(-force[1]); potential.append(U)
+                _, lower_U, _ = box_response(position, velocity, [0, -half[1], 0], half, [0, 0, 0], volume, config)
+                potential.append(lower_U)
             if row['pd_steps']:
                 dt = trace[int(row['pd_steps'])]
                 for d in range(3):
@@ -180,13 +262,19 @@ def audit_frames(directory, config):
                         raise ValueError('raw contact midpoint velocity predictor differs')
                 sample_time = row['last_contact_sample_time_s']
                 sample_center = [0, 2 * (config['radius'] + config['initial_gap']) + half[1] - min(sample_time / duration, 1) * config['compression_stroke'], 0]
-                sample_force, _, _ = box_response(fields['GelContactSamplePosition'][3*i:3*i+3],
-                    fields['GelContactSampleVelocity'][3*i:3*i+3], sample_center, half,
-                    [0, -config['compression_speed'] if sample_time < duration else 0, 0], volume, config)
                 reaction = fields['UpperPlateReaction'][3*i:3*i+3]
-                error['contact_force_over_Edp2'] = max(error['contact_force_over_Edp2'],
-                    max(abs(reaction[d] + sample_force[d]) for d in range(3)) / (young * spacing**2))
+                if cache is None:
+                    sample_force, _, _ = box_response(fields['GelContactSamplePosition'][3*i:3*i+3],
+                        fields['GelContactSampleVelocity'][3*i:3*i+3], sample_center, half,
+                        [0, -config['compression_speed'] if sample_time < duration else 0, 0], volume, config)
+                    error['contact_force_over_Edp2'] = max(error['contact_force_over_Edp2'],
+                        max(abs(reaction[d] + sample_force[d]) for d in range(3)) / (young * spacing**2))
                 applied_upper.append(reaction[1])
+        if cache is not None:
+            observed_upper, sample_upper, potential, contact_error = surface_contact_fields(fields, row, config, cache)
+            error['contact_force_over_Edp2'] = max(error['contact_force_over_Edp2'], contact_error)
+            if row['pd_steps'] and abs(math.fsum(sample_upper) - math.fsum(applied_upper)) > 1e-10 * young * spacing**2:
+                raise ValueError('independent mapped upper plate reaction failed')
         energy_scale = young * math.fsum(fields['VolumetricMeasure'])
         force_scale = young * spacing**2 * count
         checks = [('gel_stored_energy_J', math.fsum(energy_sum), energy_scale),

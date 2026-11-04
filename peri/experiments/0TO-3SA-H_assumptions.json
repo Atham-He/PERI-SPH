@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "status": "prospective_assumptions_not_calibration_inputs_released",
+  "curve": "Micro-H_0TO-3SA-H",
+  "experimental_loading_speed_m_per_s": null,
+  "individual_specimen_diameter_m": null,
+  "user_authorization": "2026-11-04: original speed/diameter unavailable; use literature or a reasonable assumed speed",
+  "prospective_reference_speed_m_per_s": 0.0005,
+  "prospective_speed_sensitivity_m_per_s": [0.00025, 0.0005, 0.001],
+  "speed_reference": {
+    "title": "Determination of the mechanical properties of single calcium alginate microbeads loaded gallic acid",
+    "doi": "10.1016/j.matpr.2020.05.747",
+    "url": "https://www.sciencedirect.com/science/article/pii/S2214785320343601",
+    "reported_speed_m_per_s": 0.0005,
+    "reported_mean_diameter_range_m": [0.0007, 0.00075],
+    "transfer_limit": "A different composition and size; supports an assumed single-bead protocol, not the speed of the target experiment."
+  },
+  "target_group_D50_m": 0.00234,
+  "diameter_status": "Group D50 only; not an individual specimen measurement. Use as an explicitly nominal geometry with diameter sensitivity before fitting.",
+  "identifiability": "A single displacement-force curve without time identifies rate-dependent parameters only conditional on the assumed speed. Relaxation times must not be reported as independently measured.",
+  "release_gate": "Gel constitutive, contact quadrature/penalty, time/space/horizon and restart verification must pass before 0TO calibration."
+}

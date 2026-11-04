@@ -19,12 +19,15 @@ class ResourceStop : public std::runtime_error
     int return_code;
 };
 
-/** Fixed prospective budget for this <=1000-particle numerical control only.
+/** Prospective budget for the new <=8192-particle solid gel spatial study only.
+ * 912 particles / 920 steps measured 2.764s and a 9.94MiB checkpoint; at fixed
+ * horizon, doubling resolution predicts ~128x work and ~64x neighbor storage.
+ * This does not modify the sealed R8 N<=1000 guard or any accuracy threshold.
  * Host storage must be identified separately from free space inside a WSL VHD. */
 class ExecutionLimits
 {
   public:
-    static constexpr size_t max_particles = 1000;
+    static constexpr size_t max_particles = 8192;
     static constexpr size_t max_steps = 98304;
     static constexpr size_t max_threads = 8;
 

@@ -39,10 +39,12 @@ def resources(root, host):
 
 def identity(pid):
     proc = Path('/proc') / str(pid)
+    argv = (proc / 'cmdline').read_bytes().decode().rstrip('\0').split('\0')
     fields = (proc / 'stat').read_text().rsplit(')', 1)[1].split()
     return dict(pid=pid, ppid=int(fields[1]), start_ticks=fields[19],
                 boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
-                argv=(proc / 'cmdline').read_bytes().decode().rstrip('\0').split('\0'))
+                argv=argv, executable=str((proc / 'exe').resolve(strict=True)),
+                argv_observed=bool(argv and argv[0]))
 
 
 def rows(path):
@@ -100,14 +102,27 @@ def prepare(args):
         shutil.copy2(repo / 'tools' / name, root / 'frozen_tools' / name)
     # The physical nonlocal horizon is 40um at every spatial level.
     values.update(horizon_ratio=4, pd_cfl=0.1, output_frames=40)
+    if args.surface_contact:
+        values.update(reference_surface_contact=1, surface_support=4e-5, contact_penalty_length=4e-5,
+                      surface_rings=128, surface_azimuths=16)
     cases = []
-    for name, edits in [
+    specifications = [
         ('baseline', {}), ('dt_half', {'pd_cfl': 0.05}), ('dt_quarter', {'pd_cfl': 0.025}),
         ('contact_half', {'pd_cfl': 0.025, 'friction_velocity': values['friction_velocity'] / 2}),
         ('contact_quarter', {'pd_cfl': 0.025, 'friction_velocity': values['friction_velocity'] / 4}),
-        ('space_coarse', {'pd_cfl': 0.025, 'spacing': 2e-5, 'horizon_ratio': 2}),
-        ('space_medium', {'pd_cfl': 0.025, 'spacing': 1.5e-5, 'horizon_ratio': 4e-5 / 1.5e-5}),
-    ]:
+    ]
+    if args.surface_contact:
+        specifications += [
+            ('quadrature_32', {'pd_cfl': 0.025, 'surface_rings': 32}),
+            ('quadrature_64', {'pd_cfl': 0.025, 'surface_rings': 64}),
+            ('space_medium', {'pd_cfl': 0.025, 'spacing': 7.5e-6, 'horizon_ratio': 4e-5 / 7.5e-6}),
+            ('space_fine', {'pd_cfl': 0.025, 'spacing': 5e-6, 'horizon_ratio': 8}),
+        ]
+    else:
+        specifications += [
+            ('space_coarse', {'pd_cfl': 0.025, 'spacing': 2e-5, 'horizon_ratio': 2}),
+            ('space_medium', {'pd_cfl': 0.025, 'spacing': 1.5e-5, 'horizon_ratio': 4e-5 / 1.5e-5})]
+    for name, edits in specifications:
         configuration = dict(values, **edits)
         file = root / (name + '.cfg')
         file.write_text(''.join(f'{key}={value:.17g}\n' for key, value in sorted(configuration.items())))
@@ -121,7 +136,10 @@ def prepare(args):
                 resource_limits=dict(host_free_GiB=120, output_free_GiB=150, memory_GiB=8, steps=98304,
                                      threads=8, particles=1000, seconds_per_case=3600, output_bytes_per_case=2 * 2**30),
                 policy='Stop on any execution/integrity/resource/accuracy failure; no retry, fallback or reference refresh.',
-                material_calibration_allowed=False)
+                reference_surface_contact=args.surface_contact, material_calibration_allowed=False)
+    if args.surface_contact:
+        plan['resource_limits'].update(particles=8192, output_bytes_per_case=4 * 2**30)
+        plan['prospective_cost_basis'] = '912 nodes/920 steps: 2.764s, 9.94MiB CP; fixed-horizon dx/2 predicts ~128x work/~64x neighbor storage; old R8 guard unchanged.'
     plan['support_sha256'] = {p.name: digest(p) for p in (root / 'frozen_tools').iterdir()}
     libraries = []
     for line in subprocess.check_output(['ldd', str(root / 'solver')]).decode().splitlines():
@@ -290,14 +308,21 @@ def run(root):
         for case in plan['cases'][3:5]: complete(case)
         compare('contact_regularization', 'dt_quarter', 'contact_quarter')
         compare('contact_regularization', 'contact_half', 'contact_quarter')
-        for case in plan['cases'][5:]: complete(case)
-        coarse_error = force_error(results['space_coarse'], results['dt_quarter'])
-        medium_error = force_error(results['space_medium'], results['dt_quarter'])
+        for case in plan['cases']:
+            if case['name'].startswith('quadrature_'): complete(case)
+        if plan.get('reference_surface_contact'):
+            compare('surface_quadrature', 'quadrature_64', 'dt_quarter')
+        for case in plan['cases']:
+            if case['name'].startswith('space_'): complete(case)
+        fine = 'space_fine' if plan.get('reference_surface_contact') else 'dt_quarter'
+        coarse = 'dt_quarter' if plan.get('reference_surface_contact') else 'space_coarse'
+        coarse_error = force_error(results[coarse], results[fine])
+        medium_error = force_error(results['space_medium'], results[fine])
         state['spatial_refinement'] = dict(coarse_to_fine=coarse_error, medium_to_fine=medium_error,
                                           physical_horizon_m=4e-5)
         if medium_error > coarse_error and medium_error > 1e-10:
             raise ValueError('spatial force error did not decrease under refinement')
-        compare('space_fixed_horizon', 'space_medium', 'dt_quarter')
+        compare('space_fixed_horizon', 'space_medium', fine)
         state.update(status='small_control_checks_passed', material_calibration_allowed=False)
     except Exception as error:
         state.update(status='validation_stopped_for_review', failure=str(error), material_calibration_allowed=False)
@@ -367,6 +392,7 @@ def review(root):
         if baseline_inputs:
             for name, effective in effective_inputs.items():
                 allowed = ({'pd_cfl', 'spacing', 'horizon_ratio'} if name.startswith('space_') else
+                           {'pd_cfl', 'surface_rings'} if name.startswith('quadrature_') else
                            {'pd_cfl', 'friction_velocity'} if name.startswith('contact_') else {'pd_cfl'})
                 if effective.keys() != baseline_inputs.keys() or any(
                         effective[key] != value for key, value in baseline_inputs.items() if key not in allowed):
@@ -417,6 +443,7 @@ def main():
     prep.add_argument('--executable', type=Path, required=True)
     prep.add_argument('--config', type=Path, required=True)
     prep.add_argument('--host-storage', type=Path, required=True)
+    prep.add_argument('--surface-contact', action='store_true', help='New independent surface quadrature and dx=10/7.5/5um spatial study')
     execute = sub.add_parser('run'); execute.add_argument('--root', type=Path, required=True)
     inspect = sub.add_parser('review'); inspect.add_argument('--root', type=Path, required=True)
     args = parser.parse_args()

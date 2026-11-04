@@ -4,10 +4,27 @@ import struct
 import tempfile
 import unittest
 from peri_gel_validation import force_error
-from peri_gel_audit import material_response, matrix, checkpoint_physical_digest
+from peri_gel_audit import material_response, matrix, checkpoint_physical_digest, surface_reference, surface_contact_fields
 
 
 class GelValidationTests(unittest.TestCase):
+    def test_surface_cache_rejects_clipped_partition_and_duplicate_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            file = Path(directory) / 'surface.csv'
+            header = 'sample,x,y,z,area,particle,weight\n'
+            file.write_text(header + '0,0,0,0,1,0,1.2\n0,0,0,0,1,1,-0.2\n')
+            self.assertEqual(len(surface_reference(file)), 1)
+            file.write_text(header + '0,0,0,0,1,0,1.2\n')
+            with self.assertRaises(ValueError): surface_reference(file)
+            file.write_text(header + '0,0,0,0,1,0,0.5\n0,0,0,0,1,0,0.5\n')
+            with self.assertRaises(ValueError): surface_reference(file)
+
+    def test_missing_full_surface_rule_is_not_a_zero_force_pass(self):
+        with self.assertRaisesRegex(ValueError, 'incomplete'):
+            surface_contact_fields({'Mass': [1]}, {}, dict(compression_stroke=1, compression_speed=1,
+                youngs_modulus=1, poisson_ratio=.3, relaxing_shear_ratio=1, contact_penalty_length=1,
+                surface_rings=4, surface_azimuths=8, radius=1), [dict(area=1)])
+
     def test_checkpoint_hash_excludes_wall_time_but_includes_internal_history_and_checks_prefix(self):
         def number(value): return struct.pack('<Q', value)
         def label(value): return number(len(value)) + value.encode()

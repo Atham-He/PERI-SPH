@@ -38,6 +38,11 @@ struct ParticleCompressionOptions
     {
         Real friction_mu = 0;
         Real friction_velocity = 0.005;
+        bool reference_surface = false;
+        Real surface_support = 40e-6;
+        Real penalty_length = 40e-6;
+        int surface_rings = 128;
+        int surface_azimuths = 16;
     } contact;
 
     struct Loading
@@ -74,6 +79,11 @@ struct ParticleCompressionOptions
         inputs.bind("plastic_viscosity", material.plastic_viscosity);
         inputs.bind("friction_mu", contact.friction_mu);
         inputs.bind("friction_velocity", contact.friction_velocity);
+        inputs.bind("reference_surface_contact", contact.reference_surface);
+        inputs.bind("surface_support", contact.surface_support);
+        inputs.bind("contact_penalty_length", contact.penalty_length);
+        inputs.bind("surface_rings", contact.surface_rings);
+        inputs.bind("surface_azimuths", contact.surface_azimuths);
         inputs.bind("compression_speed", loading.speed);
         inputs.bind("compression_stroke", loading.stroke);
         inputs.bind("output_frames", loading.output_frames);
@@ -91,7 +101,7 @@ struct ParticleCompressionOptions
                            material.youngs_modulus, material.poisson_ratio, material.yield_stress,
                            material.hardening_modulus, material.plastic_viscosity,
                            material.relaxing_shear_ratio, material.relaxation_time,
-                           contact.friction_mu, contact.friction_velocity, loading.speed,
+                           contact.friction_mu, contact.friction_velocity, contact.surface_support, contact.penalty_length, loading.speed,
                            loading.stroke, numerics.cfl, numerics.horizon_ratio,
                            numerics.hourglass_coefficient})
             if (!std::isfinite(value))
@@ -104,6 +114,8 @@ struct ParticleCompressionOptions
             material.yield_stress <= 0 || material.hardening_modulus < 0 || material.plastic_viscosity < 0 ||
             (material.viscoplastic && material.viscoelastic) || material.relaxing_shear_ratio < 0 || material.relaxation_time <= 0 ||
             contact.friction_mu < 0 || contact.friction_velocity <= 0 || loading.speed <= 0 ||
+            contact.surface_support <= 0 || contact.penalty_length <= 0 ||
+            contact.surface_rings < 4 || contact.surface_rings > 256 || contact.surface_azimuths < 8 || contact.surface_azimuths > 256 ||
             loading.stroke <= 2 * geometry.initial_gap || loading.stroke >= 2 * geometry.radius ||
             loading.output_frames < 1 || numerics.cfl <= 0 || numerics.cfl > 0.2 ||
             numerics.horizon_ratio < 2 || numerics.hourglass_coefficient < 0)

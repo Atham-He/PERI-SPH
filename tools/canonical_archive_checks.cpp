@@ -4,6 +4,7 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <sys/resource.h>
 using namespace SPH::peridynamics::canonical_archive;
 namespace
 {
@@ -96,9 +97,10 @@ int main(int argc,char **argv)
         std::ofstream output(argv[1],std::ios::binary|std::ios::out);
         output.write(reinterpret_cast<const char*>(bytes.data()),bytes.size());output.close();
         require(bool(output),"fixture write");
+        rusage usage{};require(getrusage(RUSAGE_SELF,&usage)==0,"resource witness");
         std::cout<<"{\"status\":\"byte_envelope_engineering_passed\","
             "\"fixture_bytes\":"<<bytes.size()<<",\"large_SHA256\":\""<<hex(large_digest)<<"\","
-            "\"physical_steps\":0,\"full_restart_qualified\":false}\n";return 0;
+            "\"peak_RSS_KiB\":"<<usage.ru_maxrss<<",\"physical_steps\":0,\"full_restart_qualified\":false}\n";return 0;
     }
     catch(const std::exception &error)
     {std::cerr<<error.what()<<'\n';return 1;}

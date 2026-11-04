@@ -108,9 +108,11 @@ void diagnostic(const std::exception &error,const DurableDriverCursor &cursor,co
     }
     std::fputs("}\n",stderr);std::fflush(stderr);
 }
-void seal(BoundedGenerationStore &store,const std::string &store_path,const Digest &trusted,const std::string &label,DurableDriverCursor &cursor)
+void seal(BoundedGenerationStore &store,const std::string &store_path,const Digest &trusted,const std::string &label,DurableDriverCursor &cursor,
+    uint64_t explicit_generation=0)
 {
-    const auto &candidate=store.live()->candidate();const uint64_t step=candidate.body.accepted.gel.steps,generation=step?step:1;
+    const auto &candidate=store.live()->candidate();const uint64_t step=candidate.body.accepted.gel.steps;
+    const uint64_t generation=explicit_generation?explicit_generation:(step?step:1);
     VerifiedBoundedMechanicalPrefix proof(store.live()->workingSourcePath(),candidate,generation,trusted,true);
     const auto branch="g_"+label+"_s"+std::to_string(step);
     cursor.publication_stage=3;
@@ -125,7 +127,8 @@ void seal(BoundedGenerationStore &store,const std::string &store_path,const Dige
 int execute(int argc,char **argv)
 {
     const std::string mode=argv[1];const bool fresh=mode=="--fresh",validate=mode=="--validate";
-    require((fresh && argc==7)||(!fresh && !validate && mode=="--resume" && argc==10)||(validate && argc==8),"checkpoint driver: execution argument count");
+    const bool noadvance=mode=="--restore-noadvance";
+    require((fresh && argc==7)||(mode=="--resume" && argc==10)||(validate && argc==8)||(noadvance && argc==9),"checkpoint driver: execution argument count");
     const std::string root=argv[2],store_path=argv[3];const Digest trusted=unhex(argv[4]);
     uint64_t target=0,generation=0;std::string label;std::optional<Bytes> expected;Bytes selected;
     if(fresh){target=integer(argv[5]);label=argv[6];}
@@ -134,9 +137,14 @@ int execute(int argc,char **argv)
         // Selection filename is an explicit safe leaf under this store; never
         // search HEAD/branches for a replacement on any validation failure.
         selected=readAt(store_path,argv[5],2048);generation=integer(argv[6]);
-        if(!validate){target=integer(argv[8]);label=argv[9];}
+        if(noadvance)label=argv[8];
+        else if(!validate){target=integer(argv[8]);label=argv[9];}
     }
-    if(!validate){gen::branchLeaf("g_"+label+"_s40");require(target>0 && target<=40,"checkpoint driver: prospective terminal step bound");}
+    if(!validate)
+    {
+        gen::branchLeaf("g_"+label+"_s40");
+        require(noadvance || (target>0 && target<=40),"checkpoint driver: prospective terminal step bound");
+    }
     BoundedGenerationStore store(store_path,trusted);DurableDriverCursor cursor;
     try
     {
@@ -166,7 +174,7 @@ int execute(int argc,char **argv)
             require(sha256(*expected,expected->size())==unhex(argv[7]),"checkpoint driver: expected HEAD digest mismatch");
             const auto selection=decodeBoundedSelection(selected,generation);const auto loaded=store.openExplicit(selection);
             bound.reset(new BoundedRunningContract(running(root,loaded.candidate.contract)));
-            require(validate || loaded.candidate.body.accepted.gel.steps<target,"checkpoint driver: resumed target must advance");
+            require(validate || noadvance || loaded.candidate.body.accepted.gel.steps<target,"checkpoint driver: resumed target must advance");
             if(validate)
             {
                 // No private branch, live owner or physical output mutation.
@@ -182,6 +190,22 @@ int execute(int argc,char **argv)
             cursor.accepted(store.live());
             io::begin("resume_header");io::field("selected_generation",generation);io::field("accepted_step",cursor.durable_step);
             io::field("accepted_time",cursor.durable_time);io::field("new_initial_state",false);io::field("contract_sha256",hex(trusted));io::finish();
+            if(noadvance)
+            {
+                // This is the ACTUAL owned restore path, not the read-only
+                // validator above. Re-encode/resave installed state with no
+                // solve, clock advance, initialState or reference rebuild.
+                require(encodeBoundedSessionCandidate(store.live()->candidate(),generation)==loaded.archive_bytes,
+                    "checkpoint driver: installed noadvance candidate bytes changed");
+                seal(store,store_path,trusted,label,cursor,generation);
+                require(store.live()->generation()==generation && encodeBoundedSessionCandidate(store.live()->candidate(),generation)==loaded.archive_bytes,
+                    "checkpoint driver: resaved noadvance candidate bytes changed");
+                io::begin("restored_noadvance");io::field("accepted_step",cursor.durable_step);io::field("accepted_time",cursor.durable_time);
+                io::field("selected_generation",generation);
+                io::field("archive_sha256",hex(sha256(loaded.archive_bytes,loaded.archive_bytes.size())));
+                io::field("actual_solver_calls",cursor.solver_calls);io::field("new_physical_steps",0);io::field("owned_state_installed_and_resaved",true);
+                io::field("full_restart_qualified",false);io::finish();return 0;
+            }
         }
         require(target<=store.live()->candidate().contract.protocol.steps(),"checkpoint driver: terminal protocol limit");
         while(store.live()->candidate().body.accepted.gel.steps<target)
@@ -236,6 +260,7 @@ int main(int argc,char **argv)
         {
             require(argc==2,"checkpoint driver: capability arguments");io::begin("capabilities");
             io::field("actual_PD_checkpoint_driver",true);io::field("initialization_only_preflight_available",true);
+            io::field("owned_restore_noadvance_resave",true);
             io::field("explicit_selected_generation",true);io::field("full_restart_qualified",false);io::field("S3_complete",false);io::finish();return 0;
         }
         if(mode=="--diagnostic-fixture")

@@ -56,6 +56,43 @@ def assess(root, baseline, build, native):
         full_restart_qualified=False,S3_complete=False,S4_complete=False,calibration_allowed=False)
 
 
+def restore_fixture(root,trusted):
+    """Explicit logicalG7 at physicalstep0,not a seven-step physical CP."""
+    _,fields=parse((root/'initial_candidate.bin').read_bytes());archive=encode(fields,7);physical=(root/'initial.phy').read_bytes()
+    store=root/'zero_restore_store';branch=store/'g_fixture';branch.mkdir(parents=True)
+    for name,data in [('state.bin',archive),('prefix.phy',physical)]:
+        with (branch/name).open('xb') as stream:stream.write(data)
+    selection=dict(SelectionSchema=packed(2,(),1),Branch=packed(1,(9,),list(b'g_fixture')),
+        ArchiveSHA256=packed(1,(32,),list(hashlib.sha256(archive).digest())),
+        PhysicalPrefixSHA256=packed(1,(32,),list(hashlib.sha256(physical).digest())),ContractSHA256=packed(1,(32,),list(bytes.fromhex(trusted))))
+    selected=encode(selection,7)
+    for name in ['HEAD','selected_input.bin']:
+        with (store/name).open('xb') as stream:stream.write(selected)
+    inputs=[record(branch/'state.bin'),record(branch/'prefix.phy'),record(store/'selected_input.bin')]
+    save(root/'restore_fixture_input_receipt.json',dict(recorded_at=stamp(),logical_generation=7,accepted_step=0,
+        expected_previous_pointer=record(store/'HEAD'),immutable_inputs=inputs,
+        scope='NEW zero-advance owned-install/resave format control. Explicitgeneration7 is independent of acceptedstep0;not a nonzero physical trajectory qualification.'))
+    args=['--restore-noadvance',str(root),str(store),trusted,'selected_input.bin','7',hashlib.sha256(selected).hexdigest(),'preflight']
+    return args,inputs,archive,physical
+
+
+def assess_restored(root,archive,physical,native):
+    assert native==dict(type='restored_noadvance',accepted_step=0,accepted_time=0,selected_generation=7,
+        archive_sha256=hashlib.sha256(archive).hexdigest(),actual_solver_calls=0,new_physical_steps=0,
+        owned_state_installed_and_resaved=True,full_restart_qualified=False)
+    store=root/'zero_restore_store'
+    for branch in ['g_fixture','g_preflight_resume','g_preflight_s0']:
+        assert (store/branch/'state.bin').read_bytes()==archive
+        assert (store/branch/'prefix.phy').read_bytes()==physical
+    for branch in ['g_preflight_resume','g_preflight_s0']:assert (store/branch/'active.phy').read_bytes()==physical
+    generation,fields=parse((store/'HEAD').read_bytes());assert generation==7 and fields['Branch']['raw']==b'g_preflight_s0'
+    assert fields['ArchiveSHA256']['raw']==hashlib.sha256(archive).digest() and fields['PhysicalPrefixSHA256']['raw']==hashlib.sha256(physical).digest()
+    assert (store/'selected_preflight_s0.bin').read_bytes()==(store/'HEAD').read_bytes()
+    return dict(status='owned_install_and_resave_explicit_G7_at_step0_bytes_matched_NOT_nonzero_physical_restart',
+        candidate_bytes=len(archive),physical_prefix_bytes=len(physical),logical_generation=7,accepted_step=0,actual_solver_calls=0,
+        original_fixture_and_both_new_owned_branches_full_bytes_equal=True,full_restart_qualified=False)
+
+
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--root',required=True);args=parser.parse_args()
     root=Path(args.root).resolve();repo=Path(__file__).resolve().parents[1]
@@ -79,7 +116,7 @@ def main():
         save(root/'plan.json',dict(prepared_at=stamp(),source_commit=source,source_snapshots=prepared['source_snapshots'],anchors=anchors,
             compile_command=prepared['compile_command'],link_command=prepared['link_command'],build_cwd=str(prepared['builddir']),
             compile_budget=dict(CPU_seconds=180,wall_seconds=240,AS_GiB=2),native_budget=dict(CPU_seconds=30,wall_seconds=45,AS_GiB=1,threads=1),
-            declared_modes=['--capabilities','--initialize','--diagnostic-fixture'],new_physical_steps=0,physical_dispatch_allowed=False,
+            declared_modes=['--capabilities','--initialize','--diagnostic-fixture','--restore-noadvance(logicalG7,physicalstep0)'],new_physical_steps=0,physical_dispatch_allowed=False,
             gates=['All original/actual includes/source/runtime/production/reference hashes unchanged',
                 'Compile actual original nonsymmetric Newton entry, but never invoke physical modes',
                 'Explicit initialized140field candidate/138field record and old t0 body independently byte-matched except new mu',
@@ -94,14 +131,18 @@ def main():
         inputs=[record(root/'original.input')]; frozen=dict(plan=record(root/'plan.json'),build=build,inputs=inputs,anchors=anchors)
         save(root/'frozen_execution.json',frozen)
         phases=[]
-        for label,arguments in [('capabilities',['--capabilities']),('initialize',['--initialize',str(root)]),('diagnostic_fixture',['--diagnostic-fixture'])]:
+        for label,arguments in [('capabilities',['--capabilities']),('initialize',['--initialize',str(root)]),('diagnostic_fixture',['--diagnostic-fixture']),('restore_noadvance',None)]:
+            if label=='restore_noadvance':
+                arguments,restore_inputs,restore_archive,restore_physical=restore_fixture(root,assessment['contract_sha256'])
+                inputs+=restore_inputs
             native=run(root,label,[build['ELF']['path']]+arguments,root,30,45,1)
             rows=[json.loads(x) for x in (root/(label+'.stdout')).read_text().splitlines()]
             assert native['peak_parent_threads']<=1
             for x in anchors+build['support']+build['source_snapshots']+inputs+[build['ELF'],build['source_manifest'],build['build_runtime_manifest']]:assert record(x['path'])==x
             phases.append(native)
-            if label=='capabilities':assert rows[-1]['actual_PD_checkpoint_driver'] and not rows[-1]['full_restart_qualified']
+            if label=='capabilities':assert rows[-1]['actual_PD_checkpoint_driver'] and rows[-1]['owned_restore_noadvance_resave'] and not rows[-1]['full_restart_qualified']
             elif label=='initialize':assessment=assess(root,baseline,build,rows[-1])
+            elif label=='restore_noadvance':assessment['owned_restore_noadvance_control']=assess_restored(root,restore_archive,restore_physical,rows[-1])
             else:
                 assert rows[-1]==dict(type='diagnostic_fixture',controlled_formatter_only=True,new_physical_steps=0)
                 diagnostic=json.loads((root/(label+'.stderr')).read_text())

@@ -26,6 +26,16 @@ source_manifest.json, build_runtime_manifest.json and initialized files.
 * `--validate ROOT STORE TRUST SELECTION_LEAF GENERATION EXPECTED_HEAD_SHA`:
   same detached validation, zero new steps, no branch or live owner publication.
   It uses the cooperating store lock, and may create its empty lock file.
+* `--restore-noadvance ROOT STORE TRUST SELECTION_LEAF GENERATION EXPECTED_HEAD_SHA LABEL`:
+  actually installs the restored owned body, then saves a new complete branch
+  without any solve or clock advance. The explicit logical generation is kept,
+  even if it differs from the physical step. Archive and entire physical prefix
+  must remain byte-identical. This is the required positive noadvance operation;
+  the read-only validator alone is insufficient to qualify owned restoration.
+
+The new zero-advance preflight uses explicit logicalG7 at physicalstep0 to check
+the installed/re-saved path and prevent implicit generation=step retagging. It
+does not replace required NONZERO press/hold/release physical restart tests.
 
 Resume never constructs a fresh scene, recomputes reference or initial material
 history, or guesses another generation. The entire old body is owned across

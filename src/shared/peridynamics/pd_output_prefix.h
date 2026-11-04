@@ -74,6 +74,7 @@ class VerifiedOutputPrefix
     }
     uint64_t bytes()const{return count_;}
     const Digest &digest()const{return digest_;}
+    void assertUnchanged()const{unchanged();}
 
     // Read semantic records through the SAME verified descriptor. Reopening a
     // pathname after hash validation would introduce a path-replacement race.

@@ -166,6 +166,12 @@ class Candidate
         return found->second;
     }
   public:
+    const std::vector<uint64_t> &dimensions(const std::string &name)const
+    {
+        const auto found=fields_.find(name);
+        if(found==fields_.end())throw std::invalid_argument("canonical archive: missing field dimensions");
+        return found->second.dimensions;
+    }
     Candidate(Bytes bytes,uint64_t explicit_generation):canonical_(std::move(bytes)),generation_(explicit_generation)
     {
         if(!generation_ || canonical_.size()<72 || canonical_.size()>maximum_bytes)

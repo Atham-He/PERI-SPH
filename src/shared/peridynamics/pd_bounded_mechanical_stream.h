@@ -224,9 +224,14 @@ class VerifiedBoundedMechanicalPrefix
         require(encodeBoundedArchiveBody(previous->body,1)==encodeBoundedArchiveBody(candidate.body,1),
             "mechanical stream: final archive/physical output body mismatch");
     }
-    void stageExclusiveCopy(const BoundedSessionCandidate &candidate,uint64_t generation,int private_directory,const std::string &leaf)const
+    void requireBoundCandidate(const BoundedSessionCandidate &candidate,uint64_t generation)const
     {
         bounded_session_detail::require(candidateDigest(candidate,generation)==candidate_digest_,"mechanical stream: candidate changed after verification");
+        prefix_.assertUnchanged();
+    }
+    void stageExclusiveCopy(const BoundedSessionCandidate &candidate,uint64_t generation,int private_directory,const std::string &leaf)const
+    {
+        requireBoundCandidate(candidate,generation);
         prefix_.stageExclusiveCopy(private_directory,leaf);
     }
 };

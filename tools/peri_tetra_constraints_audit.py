@@ -41,7 +41,9 @@ def inspect(case,native,code):
                 assert all(D(str(x))==-D(str(y)) for x,y in zip(a['C'],b['C']))
                 assert D(str(a['new']))+D(str(b['new']))>0
             else:
-                assert any(t['iteration']==case['max_newton'] and t['merit']>case['tolerance'] for t in native['trace'])
+                from peri_tetra_limit_witness import reconstruct_limit_witness
+                witness=reconstruct_limit_witness(case,native)
+                return dict(name=case['name'],status='declared_terminal_rejection_without_commit',reason=native['status'],independent_limit_witness=witness)
             return dict(name=case['name'],status='declared_terminal_rejection_without_commit',reason=native['status'])
         if case['mode']==1:
             qcase=dict(name=case['name'],mode=1,matrix=case['stiffness'],mass=case['mass'],position=case['position'],

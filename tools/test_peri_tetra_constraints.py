@@ -33,5 +33,16 @@ class GlobalConstraintAssessorTests(unittest.TestCase):
         case['node_mass'][0]=.01
         with self.assertRaises(AssertionError): inspect(case,dict(error='invalid mass'),1)
 
+    def test_terminal_limit_has_an_independent_nonconvergence_witness(self):
+        from peri_tetra_constraints import cases
+        from peri_tetra_limit_witness import reconstruct_limit_witness
+        case=next(c for c in cases() if c['name']=='Newton_limit')
+        raw=dict(status='Newton_iteration_limit',converged=False,old_history_unchanged=True,
+                 trace=[dict(mask=0,iteration=0,alpha=1,domain_rejections=0,linear_residual=0,merit=.06018276452680163)])
+        proof=reconstruct_limit_witness(case,raw)
+        self.assertGreater(D(proof['normalized_uncommitted_next_merit']),D('1e-6'))
+        self.assertEqual(D(proof['original_stopping_tolerance']),D('1e-12'))
+        self.assertFalse(proof['native_solver_called'])
+
 
 if __name__=='__main__': unittest.main()

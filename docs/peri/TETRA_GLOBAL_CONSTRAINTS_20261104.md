@@ -56,3 +56,14 @@ physical kinetic mass. A separate single immutable review is mandatory.
 Production PD sphere/neighbor-cache integration, scalability, full new history
 checkpoint, time/space/horizon/larger-strain/inertia qualification and0TO fitting
 remain gated. No production gel ELF or original sealed study is changed.
+
+Stopped v11 is preserved: native one-step-limit negative control correctly
+returned2/unchanged history, but the original reader wrongly expected a terminal
+residual trace entry (the native guard returns before writing that entry).
+A separate95-digit independent Jacobian reconstruction proves the recorded full
+Newton update leaves normalized merit1.39365e-5>original1e-12. A new assessor
+freezes this stronger mathematical guard witness, keeps all physical/input/ELF/
+threshold values unchanged, reuses11existingraw anchors and executes only the
+3unattempted invalid controls. Old state/terminal/raw/reader remain stopped,
+not passed. Complete termination/trial trace instrumentation is still required
+in the later trajectory/restart version, before production qualification.

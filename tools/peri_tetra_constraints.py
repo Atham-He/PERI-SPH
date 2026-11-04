@@ -85,7 +85,7 @@ def prepare(root,executable,prospective):
         'tests/3d_examples/extra_3d_PD_framework_tests/tetra_constraints_probe.cpp',
         'tests/3d_examples/extra_3d_PD_framework_tests/tetra_constraints_tests.cpp',
         'tests/3d_examples/extra_3d_PD_framework_tests/CMakeLists.txt',
-        'tools/peri_tetra_constraints.py','tools/peri_tetra_constraints_audit.py','tools/test_peri_tetra_constraints.py',
+        'tools/peri_tetra_constraints.py','tools/peri_tetra_constraints_audit.py','tools/peri_tetra_limit_witness.py','tools/test_peri_tetra_constraints.py',
         'tools/peri_gel_affine_audit.py','tools/peri_dense_contact_audit.py','tools/peri_normal_projection_audit.py',
         'tools/peri_elastic_normal.py','docs/peri/TETRA_GLOBAL_CONSTRAINTS_20261104.md']
     for source in files:
@@ -100,6 +100,14 @@ def prepare(root,executable,prospective):
     save(root/'plan.json',plan);artifacts.append(record(root/'plan.json'));inputs=[]
     for case in controls:
         path=root/(case['name']+'.input');path.write_text(encode(case));inputs.append(record(path))
+    for anchor in plan.get('raw_anchors',[]):
+        verify([anchor[k] for k in ['stdout','stderr','input','source_state','source_terminal','executable']])
+        assert record(root/(anchor['name']+'.input'))['sha256']==anchor['input']['sha256']
+        assert record(frozen_exe)['sha256']==anchor['executable']['sha256']
+        artifacts.extend([anchor[k] for k in ['stdout','stderr','input','source_state','source_terminal','executable']])
+    for original in plan.get('unchanged_physical_inputs',[]):
+        verify([original]);assert record(root/Path(original['path']).name)['sha256']==original['sha256'];artifacts.append(original)
+    if plan.get('failure_adjudication'):artifacts.append(record(plan['failure_adjudication']))
     save(root/'preparation.json',dict(artifacts=artifacts,inputs=inputs,executable=str(frozen_exe)))
     print(json.dumps(dict(status='prepared_not_passed',cases=len(controls),source_commit=plan['source_commit'])))
 
@@ -112,22 +120,34 @@ def limits():
 def run(root):
     assert not (root/'state.json').exists(),'attempted state cannot be redispatched'
     prep=read(root/'preparation.json');plan=read(root/'plan.json');attempts=[];failure=None;failure_traceback=None
+    anchors={a['name']:a for a in plan.get('raw_anchors',[])}
     save(root/'state.json',dict(status='attempted',started_at=stamp(),identity=identity(),preparation=record(root/'preparation.json')))
     try:
         verify(prep['artifacts']+prep['inputs'])
         for case in plan['cases']:
             reserves(root);out=root/(case['name']+'.json');err=root/(case['name']+'.stderr')
             command=[prep['executable'],str(root/(case['name']+'.input'))];started=time.monotonic();timeout=False
-            with out.open('xb') as stdout,err.open('xb') as stderr:
-                child=subprocess.Popen(command,stdout=stdout,stderr=stderr,preexec_fn=limits)
-                try:code=child.wait(timeout=5)
-                except subprocess.TimeoutExpired:child.kill();code=child.wait();timeout=True
+            anchor=anchors.get(case['name'])
+            if anchor:
+                verify([anchor[k] for k in ['stdout','stderr','input','source_state','source_terminal','executable']])
+                shutil.copy2(anchor['stdout']['path'],out);shutil.copy2(anchor['stderr']['path'],err)
+                code=anchor['return_code'];command=anchor['command']
+            else:
+                with out.open('xb') as stdout,err.open('xb') as stderr:
+                    child=subprocess.Popen(command,stdout=stdout,stderr=stderr,preexec_fn=limits)
+                    try:code=child.wait(timeout=5)
+                    except subprocess.TimeoutExpired:child.kill();code=child.wait();timeout=True
             attempt=dict(name=case['name'],command=command,return_code=code,timed_out=timeout,wall_seconds=time.monotonic()-started,
-                stdout=record(out),stderr=record(err),cumulative_child_maxRSS_KiB=resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)
+                stdout=record(out),stderr=record(err),cumulative_child_maxRSS_KiB=resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,
+                reused_existing_raw_no_native_dispatch=bool(anchor),source_anchor=anchor)
             attempts.append(attempt)
             assert not timeout and attempt['cumulative_child_maxRSS_KiB']<=256*1024
             raw=read(out);meta=raw['identity']
-            assert meta['pid']==child.pid and meta['ppid']==identity()['pid'] and meta['argv']==command and meta['boot_id']==identity()['boot_id']
+            assert meta['argv']==command
+            if anchor:
+                historical=read(anchor['source_state']['path'])['identity']
+                assert meta['ppid']==historical['pid'] and meta['boot_id']==historical['boot_id'] and meta['start_ticks'].isdigit()
+            else:assert meta['pid']==child.pid and meta['ppid']==identity()['pid'] and meta['boot_id']==identity()['boot_id']
             attempt['runtime_gate']=inspect(case,raw,code)
         verify(prep['artifacts']+prep['inputs'])
     except Exception as error:failure=repr(error);failure_traceback=traceback.format_exc()

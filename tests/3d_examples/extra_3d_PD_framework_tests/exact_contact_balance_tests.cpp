@@ -67,3 +67,13 @@ TEST(ExactContactBalance, WholeSolverRejectsInitialAndTrialPrecisionLossWithoutC
     ASSERT_TRUE(b.precision_rejection.present);EXPECT_TRUE(b.precision_rejection.during_line_search);
     EXPECT_EQ(b.precision_rejection.trial_alpha,1);EXPECT_GT(b.precision_rejection.roundoff_bounds[0],1e-12);
 }
+
+TEST(ExactContactBalance, CompletePlateProductBudgetRetainsExactCancellation)
+{
+    StdVec<Real> coefficients(32768,1),impulses(32768);
+    for(size_t i=0;i<impulses.size();++i)impulses[i]=(i%2?-1:1)*std::ldexp(Real(1),70);
+    const auto r=exactContactBalance(.0625,coefficients,impulses,1);
+    EXPECT_EQ(r.normalized_value,.0625);EXPECT_EQ(r.normalized_roundoff_bound,0);
+    coefficients.push_back(0);impulses.push_back(0);
+    EXPECT_THROW(exactContactBalance(.0625,coefficients,impulses,1),std::invalid_argument);
+}

@@ -80,7 +80,9 @@ inline ExactContactBalance exactContactBalance(Real momentum, const StdVec<Real>
     const StdVec<Real> &impulses, Real impulse_scale)
 {
     using namespace exact_contact_detail;
-    if(coefficients.size()!=impulses.size() || coefficients.size()>256 || !std::isfinite(impulse_scale) || impulse_scale<=0)
+    // A point residual has<=256rows. A complete plate ledger may concatenate
+    // up to128DOF*256 original products; it uses the same exact arithmetic.
+    if(coefficients.size()!=impulses.size() || coefficients.size()>32768 || !std::isfinite(impulse_scale) || impulse_scale<=0)
         throw std::invalid_argument("exact contact balance: dimensions/scale");
     const auto r=decode(momentum), scale=decode(impulse_scale);
     Integer sum=r.mantissa<<(r.exponent+2148);

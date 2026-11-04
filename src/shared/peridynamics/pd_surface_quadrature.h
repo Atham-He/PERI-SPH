@@ -75,6 +75,41 @@ struct SphereSurfaceRule
     }
 };
 
+/** Pole-inclusive positive-area fixed spherical quadrature for bounded
+ * constraint integration. Composite three-point Lobatto panels integrate
+ * dmu exactly through degree3, with a predeclared narrow polar cap. Shared
+ * latitudes are merged and each true pole has one positive-area sample.
+ * Coarse quadrature is not a surface-convergence certificate. */
+struct PolePanelSphereRule
+{
+    StdVec<SurfaceVector> position;
+    StdVec<Real> area;
+    PolePanelSphereRule(const SurfaceVector &center,Real radius,size_t azimuths=8,Real cap_width=1./64)
+    {
+        if(!center.allFinite() || !std::isfinite(radius) || radius<=0 || azimuths<8 || azimuths>256 ||
+            !std::isfinite(cap_width) || cap_width<=0 || cap_width>=.5)throw std::invalid_argument("invalid pole-panel sphere rule");
+        const Real pi=std::acos(Real(-1));
+        const Real mu[5]={0,(1-cap_width)/2,1-cap_width,1-cap_width/2,1};
+        const Real weights[5]={(1-cap_width)/6,2*(1-cap_width)/3,1./6,2*cap_width/3,cap_width/6};
+        for(size_t k=0;k<5;++k)for(int side:{-1,1})
+        {
+            if(k==0 && side==1)continue;
+            const Real latitude_weight=k==0?2*weights[k]:weights[k];
+            if(k==4)
+            {
+                position.push_back(center+SurfaceVector(0,side*radius,0));area.push_back(2*pi*radius*radius*latitude_weight);continue;
+            }
+            const Real radial=radius*std::sqrt((1-mu[k])*(1+mu[k]));
+            for(size_t a=0;a<azimuths;++a)
+            {
+                const Real angle=2*pi*(Real(a)+.5)/azimuths;
+                position.push_back(center+SurfaceVector(radial*std::cos(angle),side*radius*mu[k],radial*std::sin(angle)));
+                area.push_back(2*pi*radius*radius*latitude_weight/azimuths);
+            }
+        }
+    }
+};
+
 /** Fixed reference MLS map x_s=sum(phi_si*x_i), also used in the transpose
  * force transfer. Signed weights are retained: clipping would destroy affine
  * reproduction, torque balance and the contact-potential gradient identity.
@@ -87,12 +122,22 @@ class ReferenceSurfaceTransfer
     StdVec<SurfaceVector> reference;
     size_t particle_count = 0;
     uint64_t generation = 1;
+    Real reference_support=0;
+
+    ReferenceSurfaceTransfer()=default;
 
     ReferenceSurfaceTransfer(const SurfaceVector *particles, size_t count,
                              const SphereSurfaceRule &surface, Real support)
-        : areas(surface.area), reference(surface.position), particle_count(count)
+        :ReferenceSurfaceTransfer(particles,count,surface.position,surface.area,support){}
+
+    ReferenceSurfaceTransfer(const SurfaceVector *particles,size_t count,const PolePanelSphereRule &surface,Real support)
+        :ReferenceSurfaceTransfer(particles,count,surface.position,surface.area,support){}
+
+    ReferenceSurfaceTransfer(const SurfaceVector *particles,size_t count,const StdVec<SurfaceVector> &surface_position,
+        const StdVec<Real> &surface_area,Real support)
+        : areas(surface_area), reference(surface_position), particle_count(count),reference_support(support)
     {
-        if (!particles || count < 4 || !std::isfinite(support) || support <= 0)
+        if (!particles || count < 4 || reference.empty() || areas.size()!=reference.size() || !std::isfinite(support) || support <= 0)
             throw std::invalid_argument("invalid reference surface support");
         for (size_t i = 0; i < count; ++i)
             if (!particles[i].allFinite()) throw std::invalid_argument("non-finite reference particle");
@@ -100,6 +145,7 @@ class ReferenceSurfaceTransfer
         using Matrix4 = Eigen::Matrix<Real, 4, 4>;
         for (size_t s = 0; s < reference.size(); ++s)
         {
+            if(!reference[s].allFinite() || !std::isfinite(areas[s]) || areas[s]<=0)throw std::invalid_argument("invalid reference surface sample/area");
             Matrix4 moment = Matrix4::Zero();
             StdVec<Vector4> basis;
             StdVec<Real> kernel;
@@ -147,12 +193,49 @@ class ReferenceSurfaceTransfer
             particles[targets[j]] += weights[j] * value;
     }
 
+    /** Check stored reference data without modifying/rebuilding it. The input
+     * is the frozen PARTICLE REFERENCE, never accepted deformed positions. */
+    void validateStored(const SurfaceVector *particles,size_t count)const
+    {
+        if(!particles || count!=particle_count || count<4 || generation!=1 || !std::isfinite(reference_support) || reference_support<=0 ||
+            reference.empty() || areas.size()!=reference.size() || offsets.size()!=reference.size()+1 || offsets.front()!=0 || offsets.back()!=targets.size() ||
+            weights.size()!=targets.size())throw std::invalid_argument("incompatible stored surface transfer");
+        for(size_t i=0;i<count;++i)if(!particles[i].allFinite())throw std::invalid_argument("nonfinite stored particle reference");
+        using Vector4=Eigen::Matrix<Real,4,1>;using Matrix4=Eigen::Matrix<Real,4,4>;
+        for(size_t s=0;s<reference.size();++s)
+        {
+            if(!reference[s].allFinite() || !std::isfinite(areas[s]) || areas[s]<=0 || offsets[s]>=offsets[s+1] || offsets[s+1]>targets.size())
+                throw std::invalid_argument("invalid stored surface row");
+            Matrix4 moment=Matrix4::Zero();StdVec<Vector4> basis;StdVec<Real> kernel;StdVec<size_t> expected_targets;
+            for(size_t i=0;i<count;++i)
+            {
+                const SurfaceVector relative=(particles[i]-reference[s])/reference_support;const Real distance2=relative.squaredNorm();
+                if(distance2>=1)continue;Vector4 q;q<<1,relative;const Real value=std::pow(1-distance2,3);
+                moment+=value*q*q.transpose();basis.push_back(q);kernel.push_back(value);expected_targets.push_back(i);
+            }
+            if(expected_targets.size()!=offsets[s+1]-offsets[s])throw std::invalid_argument("stored surface support membership mismatch");
+            Eigen::SelfAdjointEigenSolver<Matrix4> spectrum(moment);
+            if(spectrum.info()!=Eigen::Success || spectrum.eigenvalues()[0]<=1e-12*spectrum.eigenvalues()[3])
+                throw std::invalid_argument("stored surface shape rank failure");
+            const Vector4 coefficients=moment.ldlt().solve(Vector4(1,0,0,0));Real partition=0;SurfaceVector reproduce=SurfaceVector::Zero();
+            for(size_t k=0;k<expected_targets.size();++k)
+            {
+                const size_t p=offsets[s]+k;const Real expected=kernel[k]*basis[k].dot(coefficients);
+                if(targets[p]!=expected_targets[k] || !std::isfinite(weights[p]) || std::abs(weights[p]-expected)>1e-10*(1+std::abs(expected)))
+                    throw std::invalid_argument("stored signed surface weight mismatch");
+                partition+=weights[p];reproduce+=weights[p]*(particles[targets[p]]-reference[s]);
+            }
+            if(std::abs(partition-1)>1e-10 || reproduce.norm()/reference_support>1e-10)throw std::invalid_argument("stored surface affine mismatch");
+        }
+    }
+
     /** Register every reference cache entry. Restore replaces stored values;
      * callers must never rebuild the map after loading an evolved checkpoint. */
     template<class Checkpoint> void registerCheckpoint(Checkpoint &checkpoint)
     {
         checkpoint.addScalar("SurfaceGeneration", generation);
         checkpoint.addScalar("SurfaceParticleCount", particle_count);
+        checkpoint.addScalar("SurfaceReferenceSupport",reference_support);
         checkpoint.addArray("SurfaceOffsets", offsets);
         checkpoint.addArray("SurfaceTargets", targets);
         checkpoint.addArray("SurfaceWeights", weights);

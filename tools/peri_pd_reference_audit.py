@@ -158,12 +158,12 @@ def expected_mls(particles,samples,support):
             targets.extend(local);weights.extend(phi);offsets.append(len(targets))
         return dict(offsets=offsets,targets=targets,weights=weights)
 
-def check_geometry(case,header):
+def check_geometry(case,header,expect_normal_only=True):
     with localcontext() as ctx:
         ctx.prec=95
         rotation=case['rotation'];r=header['reference'];n=33
         assert header['actual_volume_nodes']==n and r['generation']==1 and r['horizon']==1.25
-        assert header['normal_only'] and not header['full_S3_complete'] and header['normalized_benchmark']
+        assert header['normal_only']==expect_normal_only and not header['full_S3_complete'] and header['normalized_benchmark']
         expected=expected_reference(rotation,tuple(r['volume']),r['horizon']);maximum=0.
         def compare(actual,wanted):
             nonlocal maximum

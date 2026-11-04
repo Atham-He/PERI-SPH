@@ -88,9 +88,9 @@ def evaluate(ref,header,old,velocity,dt,zold,lossold,tangent,emitted=None):
         stabilization_work_residual=-dt*sum((dot(f,u) for f,u in zip(stabilization,v)),D(0))-(hg1-hg0))
 
 class Inspector:
-    def __init__(self,case,header,full):
+    def __init__(self,case,header,full,expect_normal_only=True):
         self.case=case;self.h=header;self.full=full;self.maximum=0.;self.trial_points=0
-        self.ref,self.geometry=check_geometry(case,header)
+        self.ref,self.geometry=check_geometry(case,header,expect_normal_only)
         self.mass=list(map(dec,header['physical_mass']));self.I=sum(self.mass,D(0));self.E=max(self.I,sum(self.ref['volume'],D(0))*max(map(dec,header['parameters'][:2])))
         self.C=[list(map(dec,row)) for row in header['C']]
         self.ids=header['plate_ids'];self.cache={}

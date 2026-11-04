@@ -20,12 +20,13 @@ struct SphereSurfaceRule
     StdVec<SurfaceVector> position;
     StdVec<Real> area;
 
-    SphereSurfaceRule(const SurfaceVector &center, Real radius, size_t rings, size_t azimuths)
+    SphereSurfaceRule(const SurfaceVector &center, Real radius, size_t rings, size_t azimuths, size_t polar_levels = 0)
     {
         if (!center.allFinite() || !std::isfinite(radius) || radius <= 0 ||
-            rings < 4 || rings > 256 || azimuths < 8 || azimuths > 256)
+            rings < 4 || rings > 256 || azimuths < 8 || azimuths > 256 || polar_levels > 20)
             throw std::invalid_argument("invalid sphere surface quadrature");
         const Real pi = std::acos(Real(-1));
+        StdVec<Real> nodes, weights;
         for (size_t k = 0; k < rings; ++k)
         {
             Real root = std::cos(pi * (Real(k) + 0.75) / (Real(rings) + 0.5));
@@ -46,18 +47,30 @@ struct SphereSurfaceRule
                 if (std::abs(change) < 2e-15) { converged = true; break; }
             }
             if (!converged) throw std::runtime_error("Gauss rule did not converge");
-            const Real z = 0.5 * (1 + root);
-            const Real weight = 1 / ((1 - root * root) * derivative * derivative);
-            const Real mu = 1 - z * z;
-            const Real radial = radius * std::sqrt((1 - mu) * (1 + mu));
-            for (int side : {-1, 1})
-                for (size_t a = 0; a < azimuths; ++a)
-                {
-                    const Real angle = 2 * pi * (Real(a) + 0.5) / Real(azimuths);
-                    position.push_back(center + SurfaceVector(radial * std::cos(angle), side * radius * mu,
-                                                              radial * std::sin(angle)));
-                    area.push_back(2 * radius * radius * z * weight * 2 * pi / Real(azimuths));
-                }
+            nodes.push_back(0.5 * (1 + root));
+            weights.push_back(1 / ((1 - root * root) * derivative * derivative));
+        }
+        // Fixed geometric panels resolve small contact caps without adapting or
+        // refreshing the reference surface during a run. levels=0 is the old rule.
+        for (size_t panel = 0; panel <= polar_levels; ++panel)
+        {
+            const Real lower = panel == 0 ? 0 : std::ldexp(Real(1), int(panel) - int(polar_levels) - 1);
+            const Real upper = std::ldexp(Real(1), int(panel) - int(polar_levels));
+            for (size_t k = 0; k < rings; ++k)
+            {
+                const Real z = lower + (upper - lower) * nodes[k];
+                const Real weight = (upper - lower) * weights[k];
+                const Real mu = 1 - z * z;
+                const Real radial = radius * std::sqrt((1 - mu) * (1 + mu));
+                for (int side : {-1, 1})
+                    for (size_t a = 0; a < azimuths; ++a)
+                    {
+                        const Real angle = 2 * pi * (Real(a) + 0.5) / Real(azimuths);
+                        position.push_back(center + SurfaceVector(radial * std::cos(angle), side * radius * mu,
+                                                                  radial * std::sin(angle)));
+                        area.push_back(2 * radius * radius * z * weight * 2 * pi / Real(azimuths));
+                    }
+            }
         }
     }
 };

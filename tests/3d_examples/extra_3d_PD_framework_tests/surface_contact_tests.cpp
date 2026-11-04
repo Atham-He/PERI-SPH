@@ -66,6 +66,37 @@ TEST(PDSurfaceContact, SignedReferenceTransferReproducesAffineFieldsWithoutClipp
     EXPECT_THROW(ReferenceSurfaceTransfer(points.data(), points.size(), rule, 0.01), std::runtime_error);
 }
 
+TEST(PDSurfaceContact, FixedGradedRuleResolvesTinyContactCapsWithoutReferenceAdaptation)
+{
+    const Real pi = std::acos(Real(-1));
+    StdVec<Real> force_errors, energy_errors;
+    for (size_t rings : {8, 16, 32})
+    {
+        SphereSurfaceRule rule(SurfaceVector(0, 1, 0), 1, rings, 8, 14);
+        ASSERT_EQ(rule.area.size(), 2 * rings * 8 * 15);
+        Real area = 0, max_force = 0, max_energy = 0;
+        for (Real value : rule.area) { EXPECT_GT(value, 0); area += value; }
+        EXPECT_NEAR(area, 4 * pi, 2e-12);
+        for (int k = 0; k <= 70; ++k)
+        {
+            const Real indentation = std::pow(Real(10), -8 + 0.1 * k);
+            Real force = 0, energy = 0;
+            for (size_t s = 0; s < rule.area.size(); ++s)
+            {
+                const auto response = surfacePlaneResponse(rule.position[s] - SurfaceVector(0, indentation, 0),
+                    SurfaceVector::Zero(), SurfaceVector(0, 1, 0), 0, SurfaceVector::Zero(), rule.area[s], 1, 0, 0.01);
+                force += response.force[1]; energy += response.energy;
+            }
+            max_force = std::max(max_force, std::abs(force / (pi * indentation * indentation) - 1));
+            max_energy = std::max(max_energy, std::abs(energy / (pi * std::pow(indentation, 3) / 3) - 1));
+        }
+        force_errors.push_back(max_force); energy_errors.push_back(max_energy);
+    }
+    EXPECT_LT(force_errors[1], 0.005); EXPECT_LT(energy_errors[1], 0.005);
+    EXPECT_LT(force_errors[2], 0.002); EXPECT_LT(energy_errors[2], 0.002);
+    EXPECT_LT(force_errors[2], force_errors[0]);
+}
+
 TEST(PDSurfaceContact, TransposeForceTransferConservesForceTorqueAndPotentialGradient)
 {
     auto points = cloud();

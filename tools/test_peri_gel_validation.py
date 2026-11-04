@@ -1,13 +1,37 @@
+import csv
 import math
 from pathlib import Path
 import struct
 import tempfile
 import unittest
-from peri_gel_validation import force_error
+from peri_gel_validation import force_error, validate_case
 from peri_gel_audit import material_response, matrix, checkpoint_physical_digest, surface_reference, surface_contact_fields
 
 
 class GelValidationTests(unittest.TestCase):
+    def test_forged_step_cap_and_two_wall_penetration_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); output = root / 'output'; output.mkdir()
+            config = dict(compression_stroke=1, compression_speed=1, relaxation_time=100, maximum_dt=1, spacing=1)
+            (output / 'effective_parameters.cfg').write_text(''.join(f'{key}={value}\n' for key, value in config.items()))
+            (output / 'run_status.txt').write_text('completed\n')
+            data = dict(time_s=1, stroke_m=1, pd_steps=1, mass_relative_error=0, particle_mass_error=0,
+                upper_penetration_over_spacing=0, upper_max_penetration_m=0, lower_max_penetration_m=0,
+                total_penetration_over_total_stroke=0, material_energy_available=1, gel_dissipation_J=0, mechanical_residual_J=0)
+            step = dict(time_s=1, dt_s=1, pd_steps=1, last_contact_sample_time_s=.5, material_history_time_s=1,
+                pd_wave_dt_s=2, configured_candidate_dt_s=1, output_limited_dt_s=1, contact_limited_dt_s=1)
+            def write():
+                for name, row in [('diagnostics.csv', data), ('step_trace.csv', step)]:
+                    with (output/name).open('w', newline='') as stream:
+                        writer = csv.DictWriter(stream, row.keys()); writer.writeheader(); writer.writerow(row)
+            tolerance = dict(mass_relative=1e-10, max_penetration_over_spacing=.1)
+            write(); self.assertEqual(validate_case(root, config, tolerance)['accepted_steps'], 1)
+            step['configured_candidate_dt_s'] = 2; write()
+            with self.assertRaisesRegex(ValueError, 'bounds'): validate_case(root, config, tolerance)
+            step['configured_candidate_dt_s'] = 1
+            data.update(upper_max_penetration_m=.05, lower_max_penetration_m=.05); write()
+            with self.assertRaisesRegex(ValueError, 'two-wall'): validate_case(root, config, tolerance)
+
     def test_surface_cache_rejects_clipped_partition_and_duplicate_targets(self):
         with tempfile.TemporaryDirectory() as directory:
             file = Path(directory) / 'surface.csv'

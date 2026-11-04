@@ -147,26 +147,32 @@ def surface_contact_fields(fields, row, config, cache):
     young, nu = config['youngs_modulus'], config['poisson_ratio']
     modulus = young / (3 * (1 - 2 * nu)) + 4 * young / (6 * (1 + nu)) * (1 + config['relaxing_shear_ratio'])
     stiffness = modulus / config['contact_penalty_length']
-    if len(cache) != 2 * int(config['surface_rings']) * int(config['surface_azimuths']) or not math.isclose(
+    if len(cache) != 2 * int(config['surface_rings']) * int(config['surface_azimuths']) * (1 + int(config.get('surface_polar_levels', 0))) or not math.isclose(
             math.fsum(s['area'] for s in cache), 4 * math.pi * config['radius']**2, rel_tol=1e-11):
         raise ValueError('incomplete reference sphere area rule')
     applied = [[[ ] for _ in range(3)] for _ in range(count)]
     friction = [[[ ] for _ in range(3)] for _ in range(count)]
     observed, last, potential = [], [], []
+    penetration_maxima = [0., 0.]
     def gather(item, name):
-        if any(i >= count for i, _ in item['links']): raise ValueError('surface target outside particle body')
         return [math.fsum(w * fields[name][3*i+d] for i, w in item['links']) for d in range(3)]
     for item in cache:
-        accepted = gather(item, 'Position')
-        if row['pd_steps'] == 0 and max(abs(a-b) for a, b in zip(accepted, item['reference'])) > 1e-10 * config['radius']:
-            raise ValueError('reference surface affine reproduction failed against initial raw positions')
+        if item['links'][-1][0] >= count: raise ValueError('surface target outside particle body')
+        if row['pd_steps'] == 0:
+            accepted = gather(item, 'Position')
+            if max(abs(a-b) for a, b in zip(accepted, item['reference'])) > 1e-10 * config['radius']:
+                raise ValueError('reference surface affine reproduction failed against initial raw positions')
+            relative = [item['reference'][0], item['reference'][1] - config['radius'] - config['initial_gap'], item['reference'][2]]
+            if abs(math.sqrt(dot(relative, relative)) / config['radius'] - 1) > 1e-10:
+                raise ValueError('reference surface sample is not on the declared sphere')
         for sample, time, position_name, velocity_name in [
                 (False, row['time_s'], 'Position', 'Velocity'),
                 (True, row['last_contact_sample_time_s'], 'GelContactSamplePosition', 'GelContactSampleVelocity')]:
             if sample and not row['pd_steps']: continue
-            position = gather(item, position_name)
             face = 2 * (config['radius'] + config['initial_gap']) - min(time / duration, 1) * config['compression_stroke']
-            if 0 <= position[1] <= face: continue
+            y = math.fsum(w * fields[position_name][3*i+1] for i, w in item['links'])
+            if 0 <= y <= face: continue
+            position = gather(item, position_name)
             if max(abs(position[0]), abs(position[2])) >= config['plate_half_width']:
                 raise ValueError('surface sample outside finite plate support')
             velocity = gather(item, velocity_name)
@@ -187,6 +193,7 @@ def surface_contact_fields(fields, row, config, cache):
                     if wall: last.append(-force[1])
                 else:
                     potential.append(0.5 * stiffness * item['area'] * penetration**2)
+                    penetration_maxima[wall] = max(penetration_maxima[wall], penetration)
                     if wall: observed.append(-force[1])
     error = 0
     if row['pd_steps']:
@@ -197,7 +204,7 @@ def surface_contact_fields(fields, row, config, cache):
                 if abs(fields['LowerPlateReaction'][3*i+d] + fields['UpperPlateReaction'][3*i+d] +
                        fields['ContactRepulsionFromWall'][3*i+d]) > 1e-10 * young * config['spacing']**2:
                     raise ValueError('mapped body/plate reaction balance failed')
-    return observed, last, potential, error / (young * config['spacing']**2)
+    return observed, last, potential, error / (young * config['spacing']**2), penetration_maxima
 
 
 def audit_frames(directory, config):
@@ -271,8 +278,12 @@ def audit_frames(directory, config):
                         max(abs(reaction[d] + sample_force[d]) for d in range(3)) / (young * spacing**2))
                 applied_upper.append(reaction[1])
         if cache is not None:
-            observed_upper, sample_upper, potential, contact_error = surface_contact_fields(fields, row, config, cache)
+            observed_upper, sample_upper, potential, contact_error, penetration = surface_contact_fields(fields, row, config, cache)
             error['contact_force_over_Edp2'] = max(error['contact_force_over_Edp2'], contact_error)
+            if 'lower_max_penetration_m' in row and (abs(row['lower_max_penetration_m'] - penetration[0]) > 1e-10 * spacing or
+                    abs(row['upper_max_penetration_m'] - penetration[1]) > 1e-10 * spacing or
+                    abs(row['total_penetration_over_total_stroke'] - math.fsum(penetration) / config['compression_stroke']) > 1e-10):
+                raise ValueError('independent two-wall penetration reconstruction failed')
             if row['pd_steps'] and abs(math.fsum(sample_upper) - math.fsum(applied_upper)) > 1e-10 * young * spacing**2:
                 raise ValueError('independent mapped upper plate reaction failed')
         energy_scale = young * math.fsum(fields['VolumetricMeasure'])

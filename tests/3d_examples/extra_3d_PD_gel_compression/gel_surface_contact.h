@@ -14,7 +14,7 @@ class SurfaceContact
 {
   public:
     SurfaceContact(SPH::SPHBody &body, SPH::Real radius, SPH::Real height, SPH::Real support,
-                   SPH::Real penalty_length, int rings, int azimuths, SPH::Real mu, SPH::Real veps,
+                   SPH::Real penalty_length, int rings, int azimuths, int polar_levels, SPH::Real mu, SPH::Real veps,
                    SPH::Real half_width)
         : particles_(body.getBaseParticles()), count_(particles_.TotalRealParticles()),
           x_(particles_.getVariableDataByName<SPH::Vecd>("Position")),
@@ -30,7 +30,7 @@ class SurfaceContact
           upper_(particles_.getVariableDataByName<SPH::Vecd>("UpperPlateReaction")),
           modulus_(dynamic_cast<SPH::HughesWingetSolid &>(body.getMatterMaterial()).ContactStiffness()),
           stiffness_(modulus_ / penalty_length), mu_(mu), veps_(veps), half_width_(half_width),
-          rule_(SPH::Vecd(0, height, 0), radius, rings, azimuths),
+          rule_(SPH::Vecd(0, height, 0), radius, rings, azimuths, polar_levels),
           transfer_(x_, count_, rule_, support), active_(rule_.area.size(), 0),
           last_x_(rule_.area.size(), SPH::Vecd::Zero()), last_v_(last_x_),
           last_lower_(last_x_), last_upper_(last_x_)

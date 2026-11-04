@@ -43,6 +43,7 @@ struct ParticleCompressionOptions
         Real penalty_length = 40e-6;
         int surface_rings = 128;
         int surface_azimuths = 16;
+        int surface_polar_levels = 0;
     } contact;
 
     struct Loading
@@ -57,6 +58,7 @@ struct ParticleCompressionOptions
         Real cfl = 0.1;
         Real horizon_ratio = 3.015;
         Real hourglass_coefficient = 0.5;
+        Real maximum_dt = 0; // Zero disables this optional temporal refinement cap.
     } numerics;
 
     CaseParameters bindings()
@@ -84,12 +86,14 @@ struct ParticleCompressionOptions
         inputs.bind("contact_penalty_length", contact.penalty_length);
         inputs.bind("surface_rings", contact.surface_rings);
         inputs.bind("surface_azimuths", contact.surface_azimuths);
+        inputs.bind("surface_polar_levels", contact.surface_polar_levels);
         inputs.bind("compression_speed", loading.speed);
         inputs.bind("compression_stroke", loading.stroke);
         inputs.bind("output_frames", loading.output_frames);
         inputs.bind("pd_cfl", numerics.cfl);
         inputs.bind("horizon_ratio", numerics.horizon_ratio);
         inputs.bind("hourglass_coefficient", numerics.hourglass_coefficient);
+        inputs.bind("maximum_dt", numerics.maximum_dt);
         return inputs;
     }
 
@@ -103,7 +107,7 @@ struct ParticleCompressionOptions
                            material.relaxing_shear_ratio, material.relaxation_time,
                            contact.friction_mu, contact.friction_velocity, contact.surface_support, contact.penalty_length, loading.speed,
                            loading.stroke, numerics.cfl, numerics.horizon_ratio,
-                           numerics.hourglass_coefficient})
+                           numerics.hourglass_coefficient, numerics.maximum_dt})
             if (!std::isfinite(value))
                 throw std::invalid_argument("particle compression requires finite inputs");
 
@@ -116,9 +120,10 @@ struct ParticleCompressionOptions
             contact.friction_mu < 0 || contact.friction_velocity <= 0 || loading.speed <= 0 ||
             contact.surface_support <= 0 || contact.penalty_length <= 0 ||
             contact.surface_rings < 4 || contact.surface_rings > 256 || contact.surface_azimuths < 8 || contact.surface_azimuths > 256 ||
+            contact.surface_polar_levels < 0 || contact.surface_polar_levels > 20 ||
             loading.stroke <= 2 * geometry.initial_gap || loading.stroke >= 2 * geometry.radius ||
             loading.output_frames < 1 || numerics.cfl <= 0 || numerics.cfl > 0.2 ||
-            numerics.horizon_ratio < 2 || numerics.hourglass_coefficient < 0)
+            numerics.horizon_ratio < 2 || numerics.hourglass_coefficient < 0 || numerics.maximum_dt < 0)
             throw std::invalid_argument("invalid particle geometry, material, contact or loading inputs");
 
         if (!std::isfinite(duration()) || duration() <= 0 || !std::isfinite(horizon()) || horizon() <= 0 ||

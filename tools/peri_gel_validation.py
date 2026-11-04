@@ -13,9 +13,11 @@ import math
 import os
 from pathlib import Path
 import shutil
+import statistics
 import subprocess
 import sys
 import tarfile
+import time
 
 from peri_run import digest, parameters, source_snapshot_files
 
@@ -28,6 +30,11 @@ def save(path, value):
 
 def read(path):
     return json.loads(path.read_text(encoding='utf-8'))
+
+
+def verify_prerequisites(plan):
+    for name, expected in plan.get('prerequisite_sha256', {}).items():
+        if digest(Path(name)) != expected: raise ValueError('prerequisite evidence changed: ' + name)
 
 
 def resources(root, host):
@@ -90,6 +97,15 @@ def prepare(args):
     repo = Path(__file__).resolve().parents[1]
     if subprocess.check_output(['git', 'status', '--porcelain'], cwd=repo).strip():
         raise ValueError('Commit the reviewed source before freezing validation inputs')
+    prerequisites = {}
+    if args.normal_penalty:
+        if args.prior_review is None: raise ValueError('Normal-penalty qualification requires the prior independent review')
+        prior = args.prior_review.resolve(strict=True)
+        prior_state, prior_plan = prior.parent / 'state.json', prior.parent / 'plan.json'
+        receipt = read(prior)
+        if receipt['status'] != 'independent_small_control_checks_passed' or receipt['state_sha256'] != digest(prior_state) or receipt['plan_sha256'] != digest(prior_plan):
+            raise ValueError('Prior numerical control lacks a matching passed independent receipt')
+        prerequisites = {str(path): digest(path) for path in [prior, prior_state, prior_plan]}
     root.mkdir()
     source_files = source_snapshot_files(repo)
     source_hashes = {str(path.relative_to(repo)): digest(path) for path in source_files}
@@ -102,7 +118,7 @@ def prepare(args):
         shutil.copy2(repo / 'tools' / name, root / 'frozen_tools' / name)
     # The physical nonlocal horizon is 40um at every spatial level.
     values.update(horizon_ratio=4, pd_cfl=0.1, output_frames=40)
-    if args.surface_contact:
+    if args.surface_contact or args.normal_penalty:
         values.update(reference_surface_contact=1, surface_support=4e-5, contact_penalty_length=4e-5,
                       surface_rings=128, surface_azimuths=16)
     cases = []
@@ -111,7 +127,17 @@ def prepare(args):
         ('contact_half', {'pd_cfl': 0.025, 'friction_velocity': values['friction_velocity'] / 2}),
         ('contact_quarter', {'pd_cfl': 0.025, 'friction_velocity': values['friction_velocity'] / 4}),
     ]
-    if args.surface_contact:
+    if args.normal_penalty:
+        values.update(surface_rings=16, surface_azimuths=16, surface_polar_levels=14, maximum_dt=4e-9)
+        specifications = [(f'penalty_{i}', {'contact_penalty_length': length})
+                          for i, length in enumerate([1e-7, 2.5e-8, 6.25e-9, 1.5625e-9])]
+        values['contact_penalty_length'] = 3.90625e-10
+        specifications += [('baseline', {}), ('dt_half', {'maximum_dt': 2e-9}), ('dt_quarter', {'maximum_dt': 1e-9}),
+            ('quadrature_8', {'maximum_dt': 1e-9, 'surface_rings': 8}),
+            ('quadrature_32', {'maximum_dt': 1e-9, 'surface_rings': 32}),
+            ('space_medium', {'maximum_dt': 1e-9, 'spacing': 7.5e-6, 'horizon_ratio': 4e-5 / 7.5e-6}),
+            ('space_fine', {'maximum_dt': 1e-9, 'spacing': 5e-6, 'horizon_ratio': 8})]
+    elif args.surface_contact:
         specifications += [
             ('quadrature_32', {'pd_cfl': 0.025, 'surface_rings': 32}),
             ('quadrature_64', {'pd_cfl': 0.025, 'surface_rings': 64}),
@@ -136,10 +162,17 @@ def prepare(args):
                 resource_limits=dict(host_free_GiB=120, output_free_GiB=150, memory_GiB=8, steps=98304,
                                      threads=8, particles=1000, seconds_per_case=3600, output_bytes_per_case=2 * 2**30),
                 policy='Stop on any execution/integrity/resource/accuracy failure; no retry, fallback or reference refresh.',
-                reference_surface_contact=args.surface_contact, material_calibration_allowed=False)
-    if args.surface_contact:
+                reference_surface_contact=args.surface_contact or args.normal_penalty, material_calibration_allowed=False)
+    if args.normal_penalty:
+        plan.update(study_kind='normal_penalty', prerequisite_sha256=prerequisites,
+                    normal_penalty_target=dict(maximum_total_penetration_over_total_stroke=0.01, finest_pair_force_relative=0.02),
+                    time_refinement_requires_initial_and_median_halving=True,
+                    scope='Small gel normal-penalty/time/quadrature/space control; horizon, larger deformation and experimental calibration remain pending')
+    if args.surface_contact or args.normal_penalty:
         plan['resource_limits'].update(particles=8192, output_bytes_per_case=4 * 2**30)
         plan['prospective_cost_basis'] = '912 nodes/920 steps: 2.764s, 9.94MiB CP; fixed-horizon dx/2 predicts ~128x work/~64x neighbor storage; old R8 guard unchanged.'
+    if args.normal_penalty:
+        plan['prospective_cost_basis'] = 'Prior surface case: 7208 nodes/1889 steps, 139.825s, 589.476MiB CP. 1.875x surface rule and 5000 fine temporal steps predict about 694s; existing 3600s/8GiB/4GiB output budgets retained.'
     plan['support_sha256'] = {p.name: digest(p) for p in (root / 'frozen_tools').iterdir()}
     libraries = []
     for line in subprocess.check_output(['ldd', str(root / 'solver')]).decode().splitlines():
@@ -187,8 +220,26 @@ def validate_case(directory, configuration, tolerance):
             raise ValueError('actual step length does not match the time cursor')
         if not math.isclose(row['material_history_time_s'], row['time_s'], rel_tol=1e-12, abs_tol=1e-20):
             raise ValueError('accepted material memory has a different time cursor')
+        if not math.isclose(row['last_contact_sample_time_s'], prior + 0.5 * row['dt_s'], rel_tol=1e-12, abs_tol=1e-20):
+            raise ValueError('contact midpoint has a different time cursor')
+        if 'pd_wave_dt_s' in row:
+            cap = configuration.get('maximum_dt', 0)
+            candidate = min(row['pd_wave_dt_s'], 0.1 * configuration['relaxation_time'], cap if cap else math.inf)
+            if not math.isclose(row['configured_candidate_dt_s'], candidate, rel_tol=1e-12) or \
+                    row['dt_s'] != row['contact_limited_dt_s'] or row['dt_s'] > row['output_limited_dt_s'] or \
+                    row['output_limited_dt_s'] > candidate:
+                raise ValueError('actual step violates recorded wave/relaxation/cap/contact/output bounds')
         prior = row['time_s']
+    if 'total_penetration_over_total_stroke' in data[0]:
+        for row in data:
+            expected = (row['upper_max_penetration_m'] + row['lower_max_penetration_m']) / configuration['compression_stroke']
+            if not math.isclose(row['total_penetration_over_total_stroke'], expected, rel_tol=1e-12, abs_tol=1e-15):
+                raise ValueError('two-wall penetration cursor is inconsistent')
+            if row['lower_max_penetration_m'] / configuration['spacing'] > tolerance['max_penetration_over_spacing']:
+                raise ValueError('lower contact penetration accuracy failed')
     return dict(accepted_steps=len(trace), initial_actual_dt_s=trace[0]['dt_s'],
+                median_actual_dt_s=statistics.median(row['dt_s'] for row in trace),
+                max_total_penetration_over_total_stroke=max(row.get('total_penetration_over_total_stroke', 0) for row in data),
                 max_penetration_over_spacing=max(row['upper_penetration_over_spacing'] for row in data),
                 final_gel_dissipation_J=data[-1]['gel_dissipation_J'],
                 final_mechanical_residual_J=data[-1]['mechanical_residual_J'])
@@ -206,6 +257,7 @@ def run(root):
             raise ValueError('Frozen verification support changed')
     for name, expected in plan['runtime_library_sha256'].items():
         if digest(Path(name)) != expected: raise ValueError('Frozen dynamic dependency changed')
+    verify_prerequisites(plan)
     host = Path(plan['host_storage'])
     environment = dict(os.environ, PERI_HOST_STORAGE=str(host))
     state.update(status='running', controller=identity(os.getpid()))
@@ -214,6 +266,7 @@ def run(root):
 
     def execute(name, configuration, *, steps=0, stop=False, resume=False, expected_code=0):
         resources(root, host)
+        verify_prerequisites(plan)
         frozen_case = next(case for case in plan['cases'] if root / case['configuration'] == configuration)
         if digest(configuration) != frozen_case['configuration_sha256'] or digest(root / 'solver') != plan['executable_sha256']:
             raise ValueError('frozen solver/case changed before dispatch')
@@ -232,9 +285,23 @@ def run(root):
         with (directory / 'run.log').open('a') as log:
             process = subprocess.Popen(command, cwd=directory, env=environment, stdout=log, stderr=subprocess.STDOUT)
             try:
-                state['active_process'] = identity(process.pid)
+                snapshot = identity(process.pid)
+                for _ in range(10):
+                    if snapshot['argv_observed'] or process.poll() is not None: break
+                    time.sleep(0.005)
+                    snapshot = identity(process.pid)
+                state['active_process'] = snapshot
             except FileNotFoundError:
                 state['active_process'] = None
+            snapshot = state['active_process']
+            if process.poll() is None and (snapshot is None or snapshot['argv'] != command or
+                    snapshot['ppid'] != os.getpid() or snapshot['executable'] != str(root / 'solver') or
+                    snapshot['boot_id'] != state['controller']['boot_id']):
+                process.terminate()
+                try: process.wait(timeout=10)
+                except subprocess.TimeoutExpired: process.kill(); process.wait()
+                state['last_return_code'] = process.returncode
+                raise ValueError('live child identity/complete argv could not be verified; stopped without retry')
             save(root / 'state.json', state)
             try:
                 code = process.wait(timeout=3605)
@@ -272,14 +339,33 @@ def run(root):
         return directory / 'checkpoints' / (directory / 'checkpoints/LATEST').read_text().strip()
 
     try:
-        for case in plan['cases'][:3]: complete(case)
-        initial = [row['initial_actual_dt_s'] for row in state['results']]
+        if plan.get('study_kind') == 'normal_penalty':
+            for case in plan['cases']:
+                if case['name'].startswith('penalty_') or case['name'] == 'baseline': complete(case)
+            compare('normal_penalty', 'penalty_3', 'baseline')
+            finest = next(result for result in state['results'] if result['name'] == 'baseline')
+            state['normal_penalty_checks'] = dict(maximum_total_penetration_over_total_stroke=finest['max_total_penetration_over_total_stroke'],
+                target=plan['normal_penalty_target']['maximum_total_penetration_over_total_stroke'])
+            save(root / 'state.json', state)
+            if finest['max_total_penetration_over_total_stroke'] > plan['normal_penalty_target']['maximum_total_penetration_over_total_stroke']:
+                raise ValueError('normal penalty: two-wall penetration exceeds predefined 1% of physical stroke')
+            for case in plan['cases']:
+                if case['name'] in ('dt_half', 'dt_quarter'): complete(case)
+        else:
+            for case in plan['cases'][:3]: complete(case)
+        time_results = [next(result for result in state['results'] if result['name'] == name)
+                        for name in ('baseline', 'dt_half', 'dt_quarter')]
+        initial = [row['initial_actual_dt_s'] for row in time_results]
         if not math.isclose(initial[1] / initial[0], 0.5, rel_tol=1e-12) or not math.isclose(initial[2] / initial[1], 0.5, rel_tol=1e-12):
             raise ValueError('actual initial steps were not halved')
+        if plan.get('time_refinement_requires_initial_and_median_halving'):
+            medians = [result['median_actual_dt_s'] for result in time_results]
+            if not math.isclose(medians[1] / medians[0], 0.5, rel_tol=1e-12) or not math.isclose(medians[2] / medians[1], 0.5, rel_tol=1e-12):
+                raise ValueError('actual median steps were not halved')
         compare('time', 'baseline', 'dt_quarter'); compare('time', 'dt_half', 'dt_quarter')
 
         baseline = root / 'runs/baseline'
-        split = execute('restart_split', root / 'baseline.cfg', steps=max(1, state['results'][0]['accepted_steps'] // 2), stop=True, expected_code=75)
+        split = execute('restart_split', root / 'baseline.cfg', steps=max(1, time_results[0]['accepted_steps'] // 2), stop=True, expected_code=75)
         saved = read(latest(split) / 'manifest.json')
         evidence = root / 'restart_evidence'
         shutil.copytree(latest(split), evidence / 'before_noadvance')
@@ -305,12 +391,16 @@ def run(root):
         state['restart_checks'] = flags
         save(root / 'state.json', state)
         if not all(flags.values()): raise ValueError('split-continuous or tail rollback failed')
-        for case in plan['cases'][3:5]: complete(case)
-        compare('contact_regularization', 'dt_quarter', 'contact_quarter')
-        compare('contact_regularization', 'contact_half', 'contact_quarter')
+        for case in plan['cases']:
+            if case['name'].startswith('contact_'): complete(case)
+        if 'contact_quarter' in results:
+            compare('contact_regularization', 'dt_quarter', 'contact_quarter')
+            compare('contact_regularization', 'contact_half', 'contact_quarter')
         for case in plan['cases']:
             if case['name'].startswith('quadrature_'): complete(case)
-        if plan.get('reference_surface_contact'):
+        if plan.get('study_kind') == 'normal_penalty':
+            compare('surface_quadrature', 'dt_quarter', 'quadrature_32')
+        elif plan.get('reference_surface_contact'):
             compare('surface_quadrature', 'quadrature_64', 'dt_quarter')
         for case in plan['cases']:
             if case['name'].startswith('space_'): complete(case)
@@ -361,6 +451,7 @@ def review(root):
     try:
         if receipt['plan_sha256'] != state['plan_sha256'] or digest(root / 'solver') != plan['executable_sha256']:
             raise ValueError('plan or executable integrity failed')
+        verify_prerequisites(plan)
         if digest(root / 'source_snapshot.tar.gz') != plan['source_snapshot_sha256']:
             raise ValueError('source snapshot integrity failed')
         with tarfile.open(root / 'source_snapshot.tar.gz', 'r:gz') as archive:
@@ -391,9 +482,11 @@ def review(root):
         baseline_inputs = effective_inputs.get('baseline')
         if baseline_inputs:
             for name, effective in effective_inputs.items():
-                allowed = ({'pd_cfl', 'spacing', 'horizon_ratio'} if name.startswith('space_') else
-                           {'pd_cfl', 'surface_rings'} if name.startswith('quadrature_') else
+                allowed = ({'pd_cfl', 'maximum_dt', 'spacing', 'horizon_ratio'} if name.startswith('space_') else
+                           {'pd_cfl', 'maximum_dt', 'surface_rings'} if name.startswith('quadrature_') else
+                           {'contact_penalty_length'} if name.startswith('penalty_') else
                            {'pd_cfl', 'friction_velocity'} if name.startswith('contact_') else {'pd_cfl'})
+                if plan.get('study_kind') == 'normal_penalty' and name in ('dt_half', 'dt_quarter'): allowed = {'maximum_dt'}
                 if effective.keys() != baseline_inputs.keys() or any(
                         effective[key] != value for key, value in baseline_inputs.items() if key not in allowed):
                     raise ValueError('uncontrolled effective parameter change: ' + name)
@@ -403,6 +496,11 @@ def review(root):
             receipt['effective_parameter_control_checked'] = True
         receipt['force_comparisons'] = [dict(item, independently_recomputed_error=force_error(fresh[item['coarse']], fresh[item['fine']]))
                                         for item in state.get('comparisons', [])]
+        if plan.get('study_kind') == 'normal_penalty' and 'baseline' in fresh:
+            receipt['normal_penalty_checks'] = dict(
+                maximum_total_penetration_over_total_stroke=max(row['total_penetration_over_total_stroke'] for row in fresh['baseline']),
+                finest_pair_force_relative=force_error(fresh['penalty_3'], fresh['baseline']),
+                targets=plan['normal_penalty_target'])
         if state.get('restart_checks'):
             baseline, split = root / 'runs/baseline', root / 'runs/restart_split'
             for name in ['diagnostics.csv', 'step_trace.csv']:
@@ -444,6 +542,8 @@ def main():
     prep.add_argument('--config', type=Path, required=True)
     prep.add_argument('--host-storage', type=Path, required=True)
     prep.add_argument('--surface-contact', action='store_true', help='New independent surface quadrature and dx=10/7.5/5um spatial study')
+    prep.add_argument('--normal-penalty', action='store_true', help='Predeclared five-level normal penalty, actual-dt and two-wall penetration qualification')
+    prep.add_argument('--prior-review', type=Path, help='Matching independent review of the prior surface numerical study')
     execute = sub.add_parser('run'); execute.add_argument('--root', type=Path, required=True)
     inspect = sub.add_parser('review'); inspect.add_argument('--root', type=Path, required=True)
     args = parser.parse_args()

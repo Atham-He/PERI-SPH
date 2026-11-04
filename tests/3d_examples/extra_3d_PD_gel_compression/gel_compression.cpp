@@ -117,7 +117,8 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
     if (options.contact.reference_surface)
         surface_contact = makeUnique<gel_compression::SurfaceContact>(particle, geometry.radius, options.centerHeight(),
             options.contact.surface_support, options.contact.penalty_length, options.contact.surface_rings,
-            options.contact.surface_azimuths, options.contact.friction_mu, options.contact.friction_velocity,
+            options.contact.surface_azimuths, options.contact.surface_polar_levels,
+            options.contact.friction_mu, options.contact.friction_velocity,
             geometry.plate_half_width);
     auto *contact_sample_position = particles.registerStateVariableData<Vecd>("GelContactSamplePosition");
     auto *contact_sample_velocity = particles.registerStateVariableData<Vecd>("GelContactSampleVelocity");
@@ -174,7 +175,7 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
     // All registered material/integrator state and reference bonds are retained.
     // This schema is not a claim that new material memories have been validated.
     particles.getParticleGroupManager();
-    const std::string identity = "gel-solid-sphere-v3-surface\n" + inputs.serialize() +
+    const std::string identity = "gel-solid-sphere-v4-graded-contact\n" + inputs.serialize() +
         "\nrecording=" + std::to_string(system.StateRecording()) +
         "\nexecutable=" + std::to_string(peridynamics::checkpoint_detail::fileHash(fs::canonical(argv[0])));
     peridynamics::DiskCheckpoint checkpoint(restart.directory, identity);
@@ -270,7 +271,8 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
                     << boxes[upper_box].max_penetration / geometry.spacing << ','
                     << contact.normalPenaltyModulus() << ',' << applied_contact_work << ',' << applied_friction_loss << ','
                     << plastic << ',' << hg_work << ',' << pd_damping_work << ',' << material.viscoelastic << ','
-                    << gel_energy << ',' << gel_dissipation << ',' << residual << '\n';
+                    << gel_energy << ',' << gel_dissipation << ',' << residual << ',' << boxes[0].max_penetration << ','
+                    << (boxes[0].max_penetration + boxes[upper_box].max_penetration) / options.loading.stroke << '\n';
         flush();
         states.writeToFile(frame);
     };
@@ -289,7 +291,7 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
             inputs.save("output/effective_parameters.cfg");
             diagnostics.open("output/diagnostics.csv");
             step_trace.open("output/step_trace.csv");
-            step_trace << std::setprecision(17) << "time_s,dt_s,pd_steps,last_contact_sample_time_s,material_history_time_s\n";
+            step_trace << std::setprecision(17) << "time_s,dt_s,pd_steps,last_contact_sample_time_s,material_history_time_s,pd_wave_dt_s,configured_candidate_dt_s,output_limited_dt_s,contact_limited_dt_s\n";
             diagnostics << std::setprecision(17)
                 << "time_s,stroke_m,pd_steps,solid_count,solid_mass_kg,mass_relative_error,particle_mass_error,"
                    "upper_observed_Fy_N,upper_last_applied_Fy_N,last_contact_sample_time_s,lower_observed_Fy_N,"
@@ -297,7 +299,7 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
                    "observed_contact_potential_J,upper_face_y_m,upper_penetration_over_spacing,"
                    "contact_penalty_modulus_Pa,applied_contact_work_J,applied_friction_loss_J,plastic_work_J,"
                    "hourglass_work_J,pd_damping_work_J,material_energy_available,gel_stored_energy_J,"
-                   "gel_dissipation_J,mechanical_residual_J\n";
+                   "gel_dissipation_J,mechanical_residual_J,lower_max_penetration_m,total_penetration_over_total_stroke\n";
             observe(0);
         }
         else
@@ -342,9 +344,11 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
             while (time < target)
             {
                 limits.check(steps, wall_offset);
-                const Real candidate = material.viscoelastic ?
-                    std::min(timestep.exec(), 0.1 * material.relaxation_time) : timestep.exec();
+                const Real wave_dt = timestep.exec();
+                Real candidate = material.viscoelastic ? std::min(wave_dt, 0.1 * material.relaxation_time) : wave_dt;
+                if (options.numerics.maximum_dt > 0) candidate = std::min(candidate, options.numerics.maximum_dt);
                 Real dt = peridynamics::boundedTimeStep(candidate, {target - time});
+                const Real output_limited_dt = dt;
                 if (surface_contact)
                 {
                     bool stable = false;
@@ -384,7 +388,8 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
                 time = dt == target - time ? target : time + dt;
                 synchronize_plate(time);
                 const Real history_time = material.viscoelastic ? particles.getVariableDataByName<Real>("GelHistoryTime")[0] : time;
-                step_trace << time << ',' << dt << ',' << steps << ',' << last_contact_time << ',' << history_time << '\n';
+                step_trace << time << ',' << dt << ',' << steps << ',' << last_contact_time << ',' << history_time << ','
+                           << wave_dt << ',' << candidate << ',' << output_limited_dt << ',' << dt << '\n';
                 if (save_checkpoint(false))
                     return 75;
             }

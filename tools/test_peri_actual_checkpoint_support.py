@@ -1,7 +1,7 @@
 """New parser/import boundaries, not another material/raw review or solver run."""
 import copy,hashlib,json,struct,tempfile,unittest
 from pathlib import Path
-from peri_actual_checkpoint_support import trace_index,compare_new_branch,initial_contract,selected,file_tree,assert_preserved
+from peri_actual_checkpoint_support import trace_index,compare_new_branch,initial_contract,selected,file_tree,assert_preserved,restored_noadvance_metadata
 from peri_bounded_session_archive_audit import encode
 from peri_bounded_mechanical_stream_audit import packed
 
@@ -61,6 +61,16 @@ class CompletePacketTests(unittest.TestCase):
         p=self.root/'partial';p.write_bytes(self.base.read_bytes()[:-1])
         with self.assertRaises(AssertionError):trace_index(p,1,40)
         with self.assertRaises(RuntimeError):trace_index(self.write('missing',self.rows[:-1]),1,40)
+    def test_noadvance_requires_owned_restore_and_preserves_explicit_generation(self):
+        rows=[dict(self.rows[0]),dict(type='resume_header',selected_generation=7,accepted_step=0,accepted_time=0.,new_initial_state=False),
+              dict(type='restored_noadvance',selected_generation=7,accepted_step=0,accepted_time=0.,actual_solver_calls=0,new_physical_steps=0,
+                   owned_state_installed_and_resaved=True,full_restart_qualified=False,archive_sha256='ab'*32)]
+        arguments=dict(generation=7,step=0,time=0.,archive_sha256='ab'*32)
+        self.assertEqual(restored_noadvance_metadata(self.write('owned_noadvance',rows),**arguments)['actual_solver_calls'],0)
+        for name,change in [('read_only',dict(type='validated_noadvance')),('retagged_generation',dict(selected_generation=1)),
+                            ('hidden_advance',dict(actual_solver_calls=1)),('not_installed',dict(owned_state_installed_and_resaved=False))]:
+            bad=copy.deepcopy(rows);bad[-1].update(change)
+            with self.subTest(name=name),self.assertRaises(AssertionError):restored_noadvance_metadata(self.write(name,bad),**arguments)
     def test_selected_generation_and_complete_physical_bytes(self):
         # Immutable t0 fixture is input for this NEW parser-format test only.
         # No old native, material computation or previous raw review is called.

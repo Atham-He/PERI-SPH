@@ -22,13 +22,21 @@ remain mandatory. A differing Newton path is never justification for relaxing
 state/output comparison or silently treating endpoint-only agreement as proof.
 No old already-qualified raw reference is rerun just to generate new receipts.
 
-The8 new parser unit checks cover entire trial packet identity, tangent change
+The9 new parser unit checks cover entire trial packet identity, tangent change
 with equal endpoints, removed trial data, planned seed prefixes, header change,
 structural clock/count/commit/extra-record rejection, truncated records, and
 selected-generation/full-prefix integrity. They use synthetic trace packets and
 the immutable zero-advance initial fixture as NEW format inputs; no native
 solver, constitutive calculation or old physical review is called. These tests
 do not qualify an actual physical restart or S3 as a whole.
+
+Positive noadvance requires the actual owned restore-and-resave path. Read-only
+validation alone is insufficient. Metadata must report zero solves/zero new
+steps, installed-and-resaved ownership and the unchanged explicit logical
+generation; full archive/physical bytes and preservation of prior files are
+checked separately. The new parser refuses a read-only receipt, hidden solve,
+missing installed state or generation retagging. The native preflight uses
+logicalG7 at physicalstep0; actual nonzero press/hold/release tests remain due.
 
 The native persistent state inventory was also checked against declarations:
 `FixedPDReference` registers generation/horizon/positions/volumes/directed

@@ -166,3 +166,26 @@ def assert_preserved(before,after,*,allowed_changes=frozenset()):
     assert set(before)<=set(after),'prior checkpoint input/output file disappeared'
     for name,value in before.items():
         if name not in allowed_changes:assert after[name]==value,('prior data changed',name)
+
+
+def restored_noadvance_metadata(path,*,generation,step,time,archive_sha256):
+    """Metadata is only ONE part of proof; selected() must check full bytes.
+
+Read-only --validate is deliberately not accepted as positive owned-state
+noadvance evidence. Logical generation and physical step are independent.
+"""
+    raw=Path(path).read_bytes();lines=raw.splitlines(keepends=True)
+    assert len(lines)==3 and all(line.endswith(b'\n') for line in lines)
+    identity,header,end=[loads(line) for line in lines]
+    assert identity['type']=='identity' and header['type']=='resume_header' and end['type']=='restored_noadvance'
+    for value in [header,end]:
+        assert type(value['selected_generation']) is int and value['selected_generation']==generation
+        assert type(value['accepted_step']) is int and value['accepted_step']==step
+        assert struct.pack('<d',value['accepted_time'])==struct.pack('<d',time)
+    assert header['new_initial_state'] is False
+    assert type(end['actual_solver_calls']) is int and end['actual_solver_calls']==0
+    assert type(end['new_physical_steps']) is int and end['new_physical_steps']==0
+    assert end['owned_state_installed_and_resaved'] is True and end['full_restart_qualified'] is False
+    assert end['archive_sha256']==archive_sha256
+    return dict(status='native_reports_owned_install_resave_without_advance_full_bytes_still_required',
+        generation=generation,accepted_step=step,actual_solver_calls=0,identity=identity,raw=record(path),full_restart_qualified=False)

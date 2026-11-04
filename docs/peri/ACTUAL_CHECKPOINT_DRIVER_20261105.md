@@ -11,6 +11,10 @@ computed full contract digest and every artifact must be frozen before any
 physical mode. The zero-advance preflight is not a physical qualification.
 The shared observer extraction preserves the original full Newton/point tangent
 record. The fresh physical mode emits its original t0 header using stored data.
+Checkpoint publication metadata goes to its separate immutable selection files,
+not extra JSON rows in that original identity/header/steps/end debug protocol.
+Resume has an explicit resume_header and requires the preregistered branch trace
+comparison/import policy; it never pretends to be a fresh t0 full trajectory.
 
 Commands use absolute ROOT/STORE paths. ROOT supplies frozen original.input,
 source_manifest.json, build_runtime_manifest.json and initialized files.

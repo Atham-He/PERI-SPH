@@ -118,8 +118,8 @@ void seal(BoundedGenerationStore &store,const std::string &store_path,const Dige
     cursor.publication_error_number=result.error_number;cursor.accepted(store.live());
     require(result.status==BoundedPublishStatus::PublishedDurable,"checkpoint driver: checkpoint publication durability uncertain");
     writeAt(store_path,"selected_"+label+"_s"+std::to_string(step)+".bin",store.currentPointerBytes().value());
-    io::begin("checkpoint");io::field("generation",generation);io::field("accepted_step",step);
-    io::field("branch",branch);io::field("full_restart_qualified",false);io::finish();
+    // Selection files carry transaction metadata. The full Newton debug stream
+    // remains identity/header/steps/end, as required by the ORIGINAL reader.
 }
 
 int execute(int argc,char **argv)

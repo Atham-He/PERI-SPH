@@ -28,6 +28,9 @@ inline void addCompensatedContactValue(Real x,Real &sum,Real &correction)
 struct BoundedGelFrictionState
 {
     BoundedGelState gel;
+    // tangent_slip_* is ALL-row relative tangent travel, including open rows.
+    // It is a kinematic diagnostic, not a plastic slip variable or a source
+    // of dissipation. Physical friction loss is solely -tau dot relative_v.
     StdVec<ContactTangentVector> last_tangent_impulse,tangent_slip_sum,tangent_slip_correction;
     StdVec<Real> ledger_sum=StdVec<Real>(size_t(ContactLedger::Count),0);
     StdVec<Real> ledger_correction=StdVec<Real>(size_t(ContactLedger::Count),0);

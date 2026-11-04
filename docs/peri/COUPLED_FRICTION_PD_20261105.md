@@ -49,6 +49,8 @@ geometry and durable output commit are additional caller gates.
 BoundedGelFrictionState records point material state, last normal/tangent
 impulses, compensated cumulative slip and12 compensated plate/work/loss
 ledgers. Registration hooks alone are NOT the complete checkpoint.
+The tangent_slip fields are all-row relative tangent travel, including open
+rows; they are kinematic diagnostics, not plastic slip or frictional loss.
 The old state remains unchanged after every failed solve or post-solve
 gate; a complete uncommitted candidate is explicitly distinguished.
 The caller must never commit solely because the nonlinear solver converges.

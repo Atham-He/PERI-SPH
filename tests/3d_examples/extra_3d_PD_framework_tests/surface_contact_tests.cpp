@@ -1,6 +1,7 @@
 #include "sphinxsys.h"
 #include "pd_checkpoint.h"
 #include "pd_surface_quadrature.h"
+#include "pd_contact_impulse.h"
 #include <gtest/gtest.h>
 
 using namespace SPH;
@@ -168,5 +169,55 @@ TEST(PDSurfaceContact, CompleteReferenceCacheRestoresBitwiseWithoutRefresh)
     EXPECT_EQ(transfer.weights, expected); EXPECT_EQ(transfer.generation, 1);
     const auto second = checkpoint.save({0.2, 0, 1, 1, 0});
     EXPECT_EQ(checkpoint_detail::fileHash(first / "state.bin"), checkpoint_detail::fileHash(second / "state.bin"));
+    std::filesystem::remove_all(root);
+}
+
+TEST(PDContactImpulse, TracksEachNonzeroWallAndRejectsDuplicateOrWrongPhaseUpdates)
+{
+    ContactImpulseLedger ledger;
+    const Vecd initial(0.2, -0.3, 0.1), lower(-0.1, -2, 0.1), upper(0.2, 3, -0.2);
+    ledger.initialize(initial);
+    ledger.advance(0.1, 0.1, 0.05, lower, upper);
+    EXPECT_LT((ledger.lower() - 0.1 * lower).norm(), 1e-16);
+    EXPECT_LT((ledger.upper() - 0.1 * upper).norm(), 1e-16);
+    const auto before = ledger.lower();
+    EXPECT_LT(ledger.momentumResidual(initial - 0.1 * (lower + upper)).norm(), 1e-16);
+    EXPECT_EQ((ledger.lower() - before).squaredNorm(), 0);
+    EXPECT_TRUE(ledger.matchesCursor(0.1, 1));
+    EXPECT_THROW(ledger.advance(0.1, 0.1, 0.05, lower, upper), std::invalid_argument);
+    EXPECT_THROW(ledger.advance(0.2, 0.1, 0.2, lower, upper), std::invalid_argument);
+    EXPECT_THROW(ledger.initialize(initial), std::invalid_argument);
+}
+
+TEST(PDContactImpulse, CheckpointRetainsCompensationAndCursorForBitwiseSplitContinuation)
+{
+    ContactImpulseLedger continuous, split;
+    const Vecd initial(0.2, -0.3, 0.1);
+    continuous.initialize(initial); split.initialize(initial);
+    Real time = 0, continuous_time = 0;
+    auto advance = [](ContactImpulseLedger &ledger, Real &cursor, int step)
+    {
+        const Real dt = 0.001 + 1e-6 * (step % 7);
+        const Vecd lower(0.1 * std::sin(step), -2, 0.03), upper(-0.01, 3 + 0.2 * std::cos(step), -0.03);
+        ledger.advance(cursor + dt, dt, cursor + 0.5 * dt, lower, upper);
+        cursor += dt;
+    };
+    for (int k = 0; k < 200; ++k) advance(continuous, continuous_time, k);
+    for (int k = 0; k < 100; ++k) advance(split, time, k);
+    const auto root = std::filesystem::temp_directory_path() / ("contact-impulse-unit-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(root / "output");
+    DiskCheckpoint checkpoint(root, "contact-impulse-history", root / "output");
+    split.registerCheckpoint(checkpoint); checkpoint.addScalar("DriverTime", time);
+    const auto first = checkpoint.save({time, 0, 100, 100, 0});
+    advance(split, time, 100);
+    checkpoint.restore(root);
+    EXPECT_TRUE(split.matchesCursor(time, 100));
+    const auto second = checkpoint.save({time, 0, 100, 100, 0});
+    EXPECT_EQ(checkpoint_detail::fileHash(first / "state.bin"), checkpoint_detail::fileHash(second / "state.bin"));
+    for (int k = 100; k < 200; ++k) advance(split, time, k);
+    EXPECT_TRUE(split.matchesCursor(continuous_time, 200));
+    EXPECT_EQ((split.lower() - continuous.lower()).squaredNorm(), 0);
+    EXPECT_EQ((split.upper() - continuous.upper()).squaredNorm(), 0);
     std::filesystem::remove_all(root);
 }

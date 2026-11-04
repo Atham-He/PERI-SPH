@@ -5,11 +5,22 @@ import struct
 import tempfile
 import unittest
 from peri_gel_validation import force_error, validate_case
-from peri_gel_audit import material_response, matrix, checkpoint_physical_digest, surface_reference, surface_contact_fields
+from peri_gel_audit import material_response, matrix, checkpoint_physical_digest, surface_reference, surface_contact_fields, audit_contact_impulse_trace
 from peri_gel_contact_time import require_time_only_inputs
 
 
 class GelValidationTests(unittest.TestCase):
+    def test_each_wall_impulse_is_checked_even_when_net_force_and_momentum_are_zero(self):
+        row = dict(dt_s=.1)
+        for axis in 'xyz':
+            force = 2 if axis == 'y' else 0
+            row.update({f'lower_last_applied_F{axis}_N': -force, f'upper_last_applied_F{axis}_N': force,
+                        f'lower_impulse_{axis}_Ns': -.1 * force, f'upper_impulse_{axis}_Ns': .1 * force,
+                        f'accepted_momentum_{axis}_kg_m_per_s': 0, f'momentum_balance_residual_{axis}_kg_m_per_s': 0})
+        self.assertEqual(audit_contact_impulse_trace([row], [0, 0, 0])['accepted_steps'], 1)
+        changed = dict(row, lower_impulse_y_Ns=0, upper_impulse_y_Ns=0)
+        with self.assertRaisesRegex(ValueError, 'impulse'): audit_contact_impulse_trace([changed], [0, 0, 0])
+
     def test_contact_diagnosis_cannot_change_speed_mass_material_or_penalty(self):
         anchor = dict(pd_cfl=.1, maximum_dt=4e-9, compression_speed=.1, density=1000, youngs_modulus=1e6, contact_penalty_length=1e-9)
         fine = dict(anchor, pd_cfl=.05, maximum_dt=2e-9)
@@ -36,6 +47,7 @@ class GelValidationTests(unittest.TestCase):
                         writer = csv.DictWriter(stream, row.keys()); writer.writeheader(); writer.writerow(row)
             tolerance = dict(mass_relative=1e-10, max_penetration_over_spacing=.1)
             write(); self.assertEqual(validate_case(root, config, tolerance)['accepted_steps'], 1)
+            with self.assertRaisesRegex(ValueError, 'impulse trace'): validate_case(root, config, tolerance, expected_contact_trace_format=1)
             step['configured_candidate_dt_s'] = 2; write()
             with self.assertRaisesRegex(ValueError, 'bounds'): validate_case(root, config, tolerance)
             step['configured_candidate_dt_s'] = 1

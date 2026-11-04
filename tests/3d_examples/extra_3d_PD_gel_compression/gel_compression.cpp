@@ -7,6 +7,7 @@
 #include "pd_particle_compression.h"
 #include "execution_limits.h"
 #include "gel_surface_contact.h"
+#include "pd_contact_impulse.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -171,11 +172,23 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
     const Vecd *velocity = particles.getVariableDataByName<Vecd>("Velocity");
     const Vecd *position = particles.getVariableDataByName<Vecd>("Position");
     StdVec<Real> initial_masses(mass, mass + count);
+    peridynamics::ContactImpulseLedger contact_impulses;
+    const Vecd *lower_reaction = particles.getVariableDataByName<Vecd>("LowerPlateReaction");
+    const Vecd *upper_reaction = particles.getVariableDataByName<Vecd>("UpperPlateReaction");
+    const Real *reference_volume = particles.getVariableDataByName<Real>("VolumetricMeasure");
+    const Real *accepted_energy = material.viscoelastic ? particles.getVariableDataByName<Real>("GelEnergyDensity") : nullptr;
+    const Real *accepted_dissipation = material.viscoelastic ? particles.getVariableDataByName<Real>("GelDissipationDensity") : nullptr;
+    auto momentum = [&]()
+    {
+        Vecd value = Vecd::Zero();
+        for (size_t i = 0; i < count; ++i) value += mass[i] * velocity[i];
+        return value;
+    };
 
     // All registered material/integrator state and reference bonds are retained.
     // This schema is not a claim that new material memories have been validated.
     particles.getParticleGroupManager();
-    const std::string identity = "gel-solid-sphere-v4-graded-contact\n" + inputs.serialize() +
+    const std::string identity = "gel-solid-sphere-v5-impulse-history\n" + inputs.serialize() +
         "\nrecording=" + std::to_string(system.StateRecording()) +
         "\nexecutable=" + std::to_string(peridynamics::checkpoint_detail::fileHash(fs::canonical(argv[0])));
     peridynamics::DiskCheckpoint checkpoint(restart.directory, identity);
@@ -188,6 +201,7 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
     checkpoint.addScalar("initial_stored_energy", initial_stored_energy);
     checkpoint.addArray("initial_masses", initial_masses);
     if (surface_contact) surface_contact->registerCheckpoint(checkpoint);
+    contact_impulses.registerCheckpoint(checkpoint);
     checkpoint.addOutput("effective_parameters.cfg");
     checkpoint.addOutput("diagnostics.csv");
     checkpoint.addOutput("step_trace.csv");
@@ -288,10 +302,18 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
         {
             synchronize_plate(time);
             if (surface_contact) surface_contact->referenceFile(false);
+            contact_impulses.initialize(momentum());
             inputs.save("output/effective_parameters.cfg");
             diagnostics.open("output/diagnostics.csv");
             step_trace.open("output/step_trace.csv");
-            step_trace << std::setprecision(17) << "time_s,dt_s,pd_steps,last_contact_sample_time_s,material_history_time_s,pd_wave_dt_s,configured_candidate_dt_s,output_limited_dt_s,contact_limited_dt_s\n";
+            step_trace << std::setprecision(17)
+                << "time_s,dt_s,pd_steps,last_contact_sample_time_s,material_history_time_s,pd_wave_dt_s,configured_candidate_dt_s,output_limited_dt_s,contact_limited_dt_s,"
+                   "lower_last_applied_Fx_N,lower_last_applied_Fy_N,lower_last_applied_Fz_N,"
+                   "upper_last_applied_Fx_N,upper_last_applied_Fy_N,upper_last_applied_Fz_N,"
+                   "lower_impulse_x_Ns,lower_impulse_y_Ns,lower_impulse_z_Ns,upper_impulse_x_Ns,upper_impulse_y_Ns,upper_impulse_z_Ns,"
+                   "accepted_momentum_x_kg_m_per_s,accepted_momentum_y_kg_m_per_s,accepted_momentum_z_kg_m_per_s,"
+                   "momentum_balance_residual_x_kg_m_per_s,momentum_balance_residual_y_kg_m_per_s,momentum_balance_residual_z_kg_m_per_s,"
+                   "accepted_kinetic_J,accepted_gel_stored_J,accepted_gel_dissipation_J,accepted_material_energy_available\n";
             diagnostics << std::setprecision(17)
                 << "time_s,stroke_m,pd_steps,solid_count,solid_mass_kg,mass_relative_error,particle_mass_error,"
                    "upper_observed_Fy_N,upper_last_applied_Fy_N,last_contact_sample_time_s,lower_observed_Fy_N,"
@@ -307,7 +329,8 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
             const auto loaded = checkpoint.restore(restart.resume);
             if (time != loaded.time || steps != loaded.pd_steps || steps != loaded.acoustic_steps ||
                 completed_frame != loaded.completed_frame || completed_frame > uint64_t(options.loading.output_frames) ||
-                time < 0 || time > options.duration() || last_contact_time < 0 || last_contact_time > time)
+                time < 0 || time > options.duration() || last_contact_time < 0 || last_contact_time > time ||
+                !contact_impulses.matchesCursor(time, steps))
                 throw std::runtime_error("inconsistent gel checkpoint cursor");
             wall_offset = loaded.wall_seconds;
             last_checkpoint_wall = wall_offset;
@@ -388,8 +411,26 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
                 time = dt == target - time ? target : time + dt;
                 synchronize_plate(time);
                 const Real history_time = material.viscoelastic ? particles.getVariableDataByName<Real>("GelHistoryTime")[0] : time;
+                Vecd lower_force = Vecd::Zero(), upper_force = Vecd::Zero();
+                Real accepted_kinetic = 0, accepted_gel = 0, accepted_loss = 0;
+                for (size_t i = 0; i < count; ++i)
+                {
+                    lower_force += lower_reaction[i]; upper_force += upper_reaction[i];
+                    accepted_kinetic += 0.5 * mass[i] * velocity[i].squaredNorm();
+                    if (material.viscoelastic)
+                    {
+                        accepted_gel += reference_volume[i] * accepted_energy[i];
+                        accepted_loss += reference_volume[i] * accepted_dissipation[i];
+                    }
+                }
+                contact_impulses.advance(time, dt, last_contact_time, lower_force, upper_force);
+                const Vecd accepted_momentum = momentum();
+                const Vecd momentum_balance = contact_impulses.momentumResidual(accepted_momentum);
                 step_trace << time << ',' << dt << ',' << steps << ',' << last_contact_time << ',' << history_time << ','
-                           << wave_dt << ',' << candidate << ',' << output_limited_dt << ',' << dt << '\n';
+                           << wave_dt << ',' << candidate << ',' << output_limited_dt << ',' << dt;
+                for (const auto &value : {lower_force, upper_force, contact_impulses.lower(), contact_impulses.upper(), accepted_momentum, momentum_balance})
+                    for (int d = 0; d < Dimensions; ++d) step_trace << ',' << value[d];
+                step_trace << ',' << accepted_kinetic << ',' << accepted_gel << ',' << accepted_loss << ',' << material.viscoelastic << '\n';
                 if (save_checkpoint(false))
                     return 75;
             }
@@ -437,7 +478,7 @@ int main(int argc, char **argv)
                          "\"format\":1,\"full_pd_state\":true,\"default_threads\":" << restart.threads
                       << ",\"duration_s\":" << options.duration() << ",\"spacing_m\":" << options.geometry.spacing
                       << ",\"max_particles\":" << ExecutionLimits::max_particles
-                      << ",\"restart_qualified\":false}\n";
+                      << ",\"contact_trace_format\":1,\"restart_qualified\":false}\n";
             return 0;
         }
         return simulate(argc, argv, options, inputs, restart);

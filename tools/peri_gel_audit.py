@@ -207,11 +207,45 @@ def surface_contact_fields(fields, row, config, cache):
     return observed, last, potential, error / (young * config['spacing']**2), penetration_maxima
 
 
+def audit_contact_impulse_trace(trace, initial_momentum):
+    """Integrate every emitted wall reaction with independent Neumaier sums.
+    Checks arithmetic/cursors, not unrecorded per-pair forces at every step."""
+    if not trace or 'lower_impulse_x_Ns' not in trace[0]:
+        return dict(status='not_emitted_by_this_legacy_executable')
+    sums, corrections, magnitudes = [0.]*6, [0.]*6, [0.]*6
+    maximum_integral_error, maximum_balance = 0., 0.
+    for row in trace:
+        for side, name in enumerate(('lower', 'upper')):
+            for d, axis in enumerate('xyz'):
+                at = 3 * side + d
+                term = row[f'{name}_last_applied_F{axis}_N'] * row['dt_s']
+                old, total = sums[at], sums[at] + term
+                corrections[at] += (old - total) + term if abs(old) >= abs(term) else (term - total) + old
+                sums[at] = total; magnitudes[at] += abs(term)
+                error = abs(total + corrections[at] - row[f'{name}_impulse_{axis}_Ns'])
+                if error > 1e-30 + 1e-10 * magnitudes[at]: raise ValueError('accepted-step wall impulse arithmetic failed')
+                maximum_integral_error = max(maximum_integral_error, error)
+        balance = []
+        for d, axis in enumerate('xyz'):
+            expected = row[f'accepted_momentum_{axis}_kg_m_per_s'] - initial_momentum[d] + sums[d] + corrections[d] + sums[d+3] + corrections[d+3]
+            reported = row[f'momentum_balance_residual_{axis}_kg_m_per_s']
+            if abs(expected - reported) > 1e-30 + 1e-10 * (magnitudes[d] + magnitudes[d+3] + abs(initial_momentum[d])):
+                raise ValueError('accepted-step momentum residual arithmetic failed')
+            balance.append(reported)
+        maximum_balance = max(maximum_balance, math.sqrt(dot(balance, balance)))
+    return dict(status='emitted_step_reaction_integrals_and_momentum_arithmetic_checked', accepted_steps=len(trace),
+                maximum_integral_arithmetic_error_Ns=maximum_integral_error,
+                maximum_reported_physical_momentum_residual_kg_m_per_s=maximum_balance,
+                scope='Each wall separately; not a convergence test on zero net force or full-step independent pair/energy audit')
+
+
 def audit_frames(directory, config):
     with (directory / 'output/diagnostics.csv').open() as stream:
         diagnostics = [{key: float(value) for key, value in row.items()} for row in csv.DictReader(stream)]
     with (directory / 'output/step_trace.csv').open() as stream:
-        trace = {int(row['pd_steps']): float(row['dt_s']) for row in csv.DictReader(stream)}
+        trace_rows = [{key: float(value) for key, value in row.items()} for row in csv.DictReader(stream)]
+    trace = {int(row['pd_steps']): row['dt_s'] for row in trace_rows}
+    trace_by_step = {int(row['pd_steps']): row for row in trace_rows}
     files = sorted((directory / 'output').glob('GelParticle_ite_*.vtp'))
     if len(files) != len(diagnostics): raise ValueError('full accepted frames are missing or duplicated')
     young, spacing = config['youngs_modulus'], config['spacing']
@@ -221,6 +255,7 @@ def audit_frames(directory, config):
     initial_masses = None
     previous_loss = None
     checked = 0
+    impulse_checks = None
     cache = surface_reference(directory / 'output/surface_reference.csv') if config.get('reference_surface_contact') else None
     for file, row in zip(files, diagnostics):
         fields = {node.get('Name'): [float(value) for value in (node.text or '').split()]
@@ -231,7 +266,10 @@ def audit_frames(directory, config):
             raise ValueError('non-finite full raw field')
         masses = fields['Mass']
         if len(masses) != count: raise ValueError('raw particle count changed')
-        if initial_masses is None: initial_masses = masses
+        if initial_masses is None:
+            initial_masses = masses
+            initial_momentum = [math.fsum(m * fields['Velocity'][3*i+d] for i, m in enumerate(masses)) for d in range(3)]
+            impulse_checks = audit_contact_impulse_trace(trace_rows, initial_momentum)
         if initial_masses != masses: raise ValueError('raw particle masses changed')
         if previous_loss is not None and any(b < a for a, b in zip(previous_loss, fields['GelDissipationDensity'])):
             raise ValueError('a particle lost accumulated viscous dissipation')
@@ -296,7 +334,18 @@ def audit_frames(directory, config):
         for name, independent, scale in checks:
             if abs(row[name] - independent) > 1e-10 * scale:
                 raise ValueError(f'{file.name}: independent {name} reconstruction failed')
+        if row['pd_steps'] and 'lower_impulse_x_Ns' in trace_rows[0]:
+            stored = trace_by_step[int(row['pd_steps'])]
+            for d, axis in enumerate('xyz'):
+                value = math.fsum(m * fields['Velocity'][3*i+d] for i, m in enumerate(masses))
+                if abs(value - stored[f'accepted_momentum_{axis}_kg_m_per_s']) > 1e-10 * math.fsum(masses) * config['compression_speed']:
+                    raise ValueError('stored raw particle momentum differs from accepted-step aggregate')
+            kinetic = math.fsum(.5 * m * dot(fields['Velocity'][3*i:3*i+3], fields['Velocity'][3*i:3*i+3]) for i, m in enumerate(masses))
+            for name, value in [('accepted_kinetic_J', kinetic), ('accepted_gel_stored_J', math.fsum(energy_sum)),
+                                ('accepted_gel_dissipation_J', math.fsum(loss_sum))]:
+                if abs(value - stored[name]) > 1e-10 * energy_scale: raise ValueError('stored raw frame differs from step aggregate: ' + name)
         checked += count
     if any(value > 1e-10 for value in error.values()): raise ValueError('independent full-raw material/contact arithmetic failed: ' + str(error))
     return dict(stored_frames=len(files), particle_states_reconstructed=checked, maximum_normalized_errors=error,
+                contact_impulse_trace_checks=impulse_checks,
                 scope='every stored full-precision frame; sparse raw is not independent full-step energy')

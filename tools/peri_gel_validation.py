@@ -97,6 +97,9 @@ def prepare(args):
     repo = Path(__file__).resolve().parents[1]
     if subprocess.check_output(['git', 'status', '--porcelain'], cwd=repo).strip():
         raise ValueError('Commit the reviewed source before freezing validation inputs')
+    description = json.loads(subprocess.check_output([str(args.executable.resolve()), '--describe-model', '--case-config', str(args.config.resolve())]))
+    if args.contact_trace_restart and description.get('contact_trace_format') != 1:
+        raise ValueError('Contact-trace qualification requires the new impulse-history executable')
     prerequisites = {}
     if args.normal_penalty:
         if args.prior_review is None: raise ValueError('Normal-penalty qualification requires the prior independent review')
@@ -118,7 +121,7 @@ def prepare(args):
         shutil.copy2(repo / 'tools' / name, root / 'frozen_tools' / name)
     # The physical nonlocal horizon is 40um at every spatial level.
     values.update(horizon_ratio=4, pd_cfl=0.1, output_frames=40)
-    if args.surface_contact or args.normal_penalty:
+    if args.surface_contact or args.normal_penalty or args.contact_trace_restart:
         values.update(reference_surface_contact=1, surface_support=4e-5, contact_penalty_length=4e-5,
                       surface_rings=128, surface_azimuths=16)
     cases = []
@@ -127,7 +130,11 @@ def prepare(args):
         ('contact_half', {'pd_cfl': 0.025, 'friction_velocity': values['friction_velocity'] / 2}),
         ('contact_quarter', {'pd_cfl': 0.025, 'friction_velocity': values['friction_velocity'] / 4}),
     ]
-    if args.normal_penalty:
+    if args.contact_trace_restart:
+        values.update(surface_rings=16, surface_polar_levels=14, maximum_dt=4e-9,
+                      contact_penalty_length=1e-7, compression_stroke=3e-7, output_frames=12)
+        specifications = [('baseline', {})]
+    elif args.normal_penalty:
         values.update(surface_rings=16, surface_azimuths=16, surface_polar_levels=14, maximum_dt=4e-9)
         specifications = [(f'penalty_{i}', {'contact_penalty_length': length})
                           for i, length in enumerate([1e-7, 2.5e-8, 6.25e-9, 1.5625e-9])]
@@ -162,13 +169,17 @@ def prepare(args):
                 resource_limits=dict(host_free_GiB=120, output_free_GiB=150, memory_GiB=8, steps=98304,
                                      threads=8, particles=1000, seconds_per_case=3600, output_bytes_per_case=2 * 2**30),
                 policy='Stop on any execution/integrity/resource/accuracy failure; no retry, fallback or reference refresh.',
-                reference_surface_contact=args.surface_contact or args.normal_penalty, material_calibration_allowed=False)
+                reference_surface_contact=args.surface_contact or args.normal_penalty or args.contact_trace_restart, material_calibration_allowed=False)
+    plan['expected_contact_trace_format'] = description.get('contact_trace_format', 0)
     if args.normal_penalty:
         plan.update(study_kind='normal_penalty', prerequisite_sha256=prerequisites,
                     normal_penalty_target=dict(maximum_total_penetration_over_total_stroke=0.01, finest_pair_force_relative=0.02),
                     time_refinement_requires_initial_and_median_halving=True,
                     scope='Small gel normal-penalty/time/quadrature/space control; horizon, larger deformation and experimental calibration remain pending')
-    if args.surface_contact or args.normal_penalty:
+    if args.contact_trace_restart:
+        plan.update(study_kind='contact_trace_restart',
+                    scope='New 0.3um/3us contact-observation and complete restart qualification only; not normal-penalty/time/space or material release')
+    if args.surface_contact or args.normal_penalty or args.contact_trace_restart:
         plan['resource_limits'].update(particles=8192, output_bytes_per_case=4 * 2**30)
         plan['prospective_cost_basis'] = '912 nodes/920 steps: 2.764s, 9.94MiB CP; fixed-horizon dx/2 predicts ~128x work/~64x neighbor storage; old R8 guard unchanged.'
     if args.normal_penalty:
@@ -187,7 +198,7 @@ def prepare(args):
     print(json.dumps(dict(root=str(root), status='prepared', source_commit=plan['source_commit'])))
 
 
-def validate_case(directory, configuration, tolerance):
+def validate_case(directory, configuration, tolerance, expected_contact_trace_format=0):
     data, trace = rows(directory / 'output/diagnostics.csv'), rows(directory / 'output/step_trace.csv')
     status = (directory / 'output/run_status.txt').read_text().splitlines()
     if not status or status[0] != 'completed':
@@ -200,6 +211,9 @@ def validate_case(directory, configuration, tolerance):
         raise ValueError('incomplete actual time/stroke support')
     if not trace or len(trace) != int(data[-1]['pd_steps']):
         raise ValueError('missing accepted-step trace')
+    actual_trace_format = int('lower_impulse_x_Ns' in trace[0])
+    if expected_contact_trace_format and actual_trace_format != expected_contact_trace_format:
+        raise ValueError('required accepted-step contact impulse trace is missing')
     for row in data + trace:
         if not all(math.isfinite(value) for value in row.values()):
             raise ValueError('non-finite independent diagnostic value')
@@ -238,6 +252,7 @@ def validate_case(directory, configuration, tolerance):
             if row['lower_max_penetration_m'] / configuration['spacing'] > tolerance['max_penetration_over_spacing']:
                 raise ValueError('lower contact penetration accuracy failed')
     return dict(accepted_steps=len(trace), initial_actual_dt_s=trace[0]['dt_s'],
+                contact_trace_format=actual_trace_format,
                 median_actual_dt_s=statistics.median(row['dt_s'] for row in trace),
                 max_total_penetration_over_total_stroke=max(row.get('total_penetration_over_total_stroke', 0) for row in data),
                 max_penetration_over_spacing=max(row['upper_penetration_over_spacing'] for row in data),
@@ -322,7 +337,7 @@ def run(root):
         if digest(file) != case['configuration_sha256']:
             raise ValueError('frozen case inputs changed')
         directory = execute(case['name'], file)
-        metrics = validate_case(directory, parameters(file), plan['tolerances'])
+        metrics = validate_case(directory, parameters(file), plan['tolerances'], plan.get('expected_contact_trace_format', 0))
         state['results'].append(dict(name=case['name'], status='checked', **metrics))
         results[case['name']] = rows(directory / 'output/diagnostics.csv')
         save(root / 'state.json', state)
@@ -339,7 +354,9 @@ def run(root):
         return directory / 'checkpoints' / (directory / 'checkpoints/LATEST').read_text().strip()
 
     try:
-        if plan.get('study_kind') == 'normal_penalty':
+        if plan.get('study_kind') == 'contact_trace_restart':
+            complete(plan['cases'][0])
+        elif plan.get('study_kind') == 'normal_penalty':
             for case in plan['cases']:
                 if case['name'].startswith('penalty_') or case['name'] == 'baseline': complete(case)
             compare('normal_penalty', 'penalty_3', 'baseline')
@@ -353,16 +370,18 @@ def run(root):
                 if case['name'] in ('dt_half', 'dt_quarter'): complete(case)
         else:
             for case in plan['cases'][:3]: complete(case)
-        time_results = [next(result for result in state['results'] if result['name'] == name)
-                        for name in ('baseline', 'dt_half', 'dt_quarter')]
-        initial = [row['initial_actual_dt_s'] for row in time_results]
-        if not math.isclose(initial[1] / initial[0], 0.5, rel_tol=1e-12) or not math.isclose(initial[2] / initial[1], 0.5, rel_tol=1e-12):
-            raise ValueError('actual initial steps were not halved')
-        if plan.get('time_refinement_requires_initial_and_median_halving'):
-            medians = [result['median_actual_dt_s'] for result in time_results]
-            if not math.isclose(medians[1] / medians[0], 0.5, rel_tol=1e-12) or not math.isclose(medians[2] / medians[1], 0.5, rel_tol=1e-12):
-                raise ValueError('actual median steps were not halved')
-        compare('time', 'baseline', 'dt_quarter'); compare('time', 'dt_half', 'dt_quarter')
+        if plan.get('study_kind') != 'contact_trace_restart':
+            time_results = [next(result for result in state['results'] if result['name'] == name)
+                            for name in ('baseline', 'dt_half', 'dt_quarter')]
+            initial = [row['initial_actual_dt_s'] for row in time_results]
+            if not math.isclose(initial[1] / initial[0], 0.5, rel_tol=1e-12) or not math.isclose(initial[2] / initial[1], 0.5, rel_tol=1e-12):
+                raise ValueError('actual initial steps were not halved')
+            if plan.get('time_refinement_requires_initial_and_median_halving'):
+                medians = [result['median_actual_dt_s'] for result in time_results]
+                if not math.isclose(medians[1] / medians[0], 0.5, rel_tol=1e-12) or not math.isclose(medians[2] / medians[1], 0.5, rel_tol=1e-12):
+                    raise ValueError('actual median steps were not halved')
+            compare('time', 'baseline', 'dt_quarter'); compare('time', 'dt_half', 'dt_quarter')
+        else: time_results = state['results']
 
         baseline = root / 'runs/baseline'
         split = execute('restart_split', root / 'baseline.cfg', steps=max(1, time_results[0]['accepted_steps'] // 2), stop=True, expected_code=75)
@@ -391,6 +410,9 @@ def run(root):
         state['restart_checks'] = flags
         save(root / 'state.json', state)
         if not all(flags.values()): raise ValueError('split-continuous or tail rollback failed')
+        if plan.get('study_kind') == 'contact_trace_restart':
+            state['status'] = 'contact_trace_restart_checks_passed'
+            return
         for case in plan['cases']:
             if case['name'].startswith('contact_'): complete(case)
         if 'contact_quarter' in results:
@@ -475,7 +497,7 @@ def review(root):
             config_path = root / case['configuration']
             if digest(config_path) != case['configuration_sha256']: raise ValueError('frozen case changed')
             directory = root / 'runs' / name
-            validate_case(directory, parameters(config_path), plan['tolerances'])
+            validate_case(directory, parameters(config_path), plan['tolerances'], plan.get('expected_contact_trace_format', 0))
             effective_inputs[name] = parameters(directory / 'output/effective_parameters.cfg')
             receipt['raw_frame_checks'][name] = audit_frames(directory, parameters(config_path))
             fresh[name] = rows(directory / 'output/diagnostics.csv')
@@ -520,8 +542,9 @@ def review(root):
             if digests['continuous'] != digests['split'] or digests['before_noadvance'] != digests['after_noadvance']:
                 raise ValueError('independent full-state SHA/cursor restart comparison failed')
             receipt['restart_checks'] = dict(state['restart_checks'], independent_full_physical_bytes=digests)
-        receipt['status'] = ('independent_small_control_checks_passed' if state['status'] == 'small_control_checks_passed'
-                             else 'independent_review_completed_case_remains_unqualified')
+        receipt['status'] = ('independent_contact_trace_restart_checks_passed' if state['status'] == 'contact_trace_restart_checks_passed' else
+                             'independent_small_control_checks_passed' if state['status'] == 'small_control_checks_passed' else
+                             'independent_review_completed_case_remains_unqualified')
         receipt['runtime_failure'] = state.get('failure')
         receipt['scope'] = plan['scope']
     except Exception as error:
@@ -544,6 +567,7 @@ def main():
     prep.add_argument('--surface-contact', action='store_true', help='New independent surface quadrature and dx=10/7.5/5um spatial study')
     prep.add_argument('--normal-penalty', action='store_true', help='Predeclared five-level normal penalty, actual-dt and two-wall penetration qualification')
     prep.add_argument('--prior-review', type=Path, help='Matching independent review of the prior surface numerical study')
+    prep.add_argument('--contact-trace-restart', action='store_true', help='New short observation/impulse-history and complete restart qualification; no physical convergence claim')
     execute = sub.add_parser('run'); execute.add_argument('--root', type=Path, required=True)
     inspect = sub.add_parser('review'); inspect.add_argument('--root', type=Path, required=True)
     args = parser.parse_args()

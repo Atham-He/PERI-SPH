@@ -130,21 +130,35 @@ inline BoundedGenerationSelection decodeBoundedSelection(const canonical_archive
 }
 
 class BoundedGenerationStore;
+class BoundedAcceptedWriter;
+enum class BoundedAppendStage{Idle,Preparing,Writing,Readback,Syncing,Accepted,Stopped};
+struct BoundedAppendWitness
+{
+    BoundedAppendStage stage=BoundedAppendStage::Idle;
+    BoundedAppendStage failure_stage=BoundedAppendStage::Idle;
+    uint64_t old_committed_bytes=0,old_step=0,proposed_step=0,frame_bytes=0,written_bytes=0;
+    Real old_time=0,proposed_time=0;
+    int error_number=0;
+    bool injected=false,committed=false;
+};
 /** Owned checkpoint state/output handles. No physical advance API yet: the
  * eventual native driver must separately bind its running ELF/contract.
  */
 class BoundedOwnedCheckpoint
 {
     friend class BoundedGenerationStore;
-    BoundedSessionCandidate candidate_;
+    friend class BoundedAcceptedWriter;
+    std::unique_ptr<BoundedSessionCandidate> candidate_;
     uint64_t generation_;
     std::string branch_;
     std::shared_ptr<canonical_archive::Descriptor> root_,lock_;
     std::unique_ptr<canonical_archive::Descriptor> directory_,working_;
     bool publication_uncertain_=false;
+    bool writer_stopped_=false;
+    BoundedAppendWitness append_witness_;
     BoundedOwnedCheckpoint(const BoundedSessionCandidate &candidate,uint64_t generation,std::string branch,
         std::shared_ptr<canonical_archive::Descriptor> root,std::shared_ptr<canonical_archive::Descriptor> lock,int directory)
-        :candidate_(candidate),generation_(generation),branch_(std::move(branch)),root_(std::move(root)),lock_(std::move(lock)),
+        :candidate_(new BoundedSessionCandidate(candidate)),generation_(generation),branch_(std::move(branch)),root_(std::move(root)),lock_(std::move(lock)),
          directory_(new canonical_archive::Descriptor(::fcntl(directory,F_DUPFD_CLOEXEC,0))),
          working_(new canonical_archive::Descriptor(::openat(directory_->get(),"active.phy",O_RDWR|O_APPEND|O_NOFOLLOW|O_CLOEXEC)))
     {
@@ -152,10 +166,13 @@ class BoundedOwnedCheckpoint
             bounded_session_detail::digestArray(candidate.output.prefix_sha256),"generation store: working copy digest");
     }
   public:
-    const BoundedSessionCandidate &candidate()const noexcept{return candidate_;}
+    const BoundedSessionCandidate &candidate()const noexcept{return *candidate_;}
     uint64_t generation()const noexcept{return generation_;}
     const std::string &branch()const noexcept{return branch_;}
     bool publicationUncertain()const noexcept{return publication_uncertain_;}
+    bool writerStopped()const noexcept{return writer_stopped_;}
+    const BoundedAppendWitness &lastAppend()const noexcept{return append_witness_;}
+    std::string workingSourcePath()const{return std::string("/proc/self/fd/")+std::to_string(directory_->get())+"/active.phy";}
 };
 
 struct BoundedSelectedCheckpoint
@@ -180,6 +197,7 @@ struct BoundedPublishResult
  */
 class BoundedGenerationStore
 {
+    friend class BoundedAcceptedWriter;
     using Descriptor=canonical_archive::Descriptor;
     std::shared_ptr<Descriptor> root_,lock_;
     canonical_archive::Digest trusted_;
@@ -222,6 +240,7 @@ class BoundedGenerationStore
     {
         using namespace canonical_archive;using namespace bounded_generation_detail;
         bounded_session_detail::require(!live_ || !live_->publication_uncertain_,"generation store: publication uncertain; explicit recovery required");
+        bounded_session_detail::require(!live_ || !live_->writer_stopped_,"generation store: accepted writer stopped; explicit recovery required");
         branchLeaf(new_branch);candidate.validateCandidate(trusted_);proof.requireBoundCandidate(candidate,generation);
         bounded_session_detail::require(currentPointerBytes()==expected_current,"generation store: expected-current pointer mismatch");
         if(fault==BoundedPublishFault::BeforeStage)throw std::runtime_error("generation store: injected before stage");

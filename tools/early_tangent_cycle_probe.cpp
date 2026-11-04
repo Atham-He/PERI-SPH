@@ -18,7 +18,8 @@ int main()
         for(int i=0;i<=1000;++i)
         {
             const double time=double(i)/1000*(40*dt);
-            if(!first)std::cout<<',';first=false;
+            if(!first)std::cout<<',';
+            first=false;
             std::cout<<'['<<dt<<','<<time<<','<<EarlyTangentCycle{dt}.at(time)<<']';
         }
     std::cout<<"]}\n";

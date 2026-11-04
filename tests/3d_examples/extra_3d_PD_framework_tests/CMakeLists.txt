@@ -1,4 +1,4 @@
-add_executable(extra_3d_PD_framework_tests framework_tests.cpp compression_tests.cpp gel_material_tests.cpp surface_contact_tests.cpp normal_projection_tests.cpp elastic_normal_tests.cpp)
+add_executable(extra_3d_PD_framework_tests framework_tests.cpp compression_tests.cpp gel_material_tests.cpp surface_contact_tests.cpp normal_projection_tests.cpp elastic_normal_tests.cpp visco_friction_tests.cpp)
 target_link_libraries(extra_3d_PD_framework_tests PRIVATE sphinxsys_3d GTest::gtest_main)
 set_target_properties(extra_3d_PD_framework_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin")
 add_test(NAME extra_3d_PD_framework_tests COMMAND extra_3d_PD_framework_tests)
@@ -14,3 +14,6 @@ set_tests_properties(peri_normal_probe_protocol PROPERTIES TIMEOUT 10 LABELS per
 add_executable(extra_3d_PD_elastic_normal_probe elastic_normal_probe.cpp)
 target_link_libraries(extra_3d_PD_elastic_normal_probe PRIVATE sphinxsys_3d)
 set_target_properties(extra_3d_PD_elastic_normal_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin")
+add_executable(extra_3d_PD_visco_friction_probe visco_friction_probe.cpp)
+target_link_libraries(extra_3d_PD_visco_friction_probe PRIVATE sphinxsys_3d)
+set_target_properties(extra_3d_PD_visco_friction_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin")

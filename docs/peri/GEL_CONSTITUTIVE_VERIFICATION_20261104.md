@@ -74,6 +74,13 @@ energy densities, accepted material time, force-stage arrays, contact sample
 positions/velocities and all original PD state/reference configurations. The
 driver also commits the output prefix of the accepted-step trace.
 
+Fresh reference packets are sorted by target particle ID before the initial shape
+matrix is accumulated, preserving every packet's kernel values, geometry and bond
+flag. The initialization rejects evolved material history and is never invoked
+on restore. This removes floating-point ordering differences caused by parallel
+cell insertion when comparing two fresh eight-thread runs. The v1 failed strict
+restart comparison and its diagnosis remain preserved; no tolerance was relaxed.
+
 ## Independent verification
 
 Framework checks cover energy-gradient stress, superposed rotation, exact fixed-

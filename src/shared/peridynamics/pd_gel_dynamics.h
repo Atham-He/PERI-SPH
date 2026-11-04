@@ -7,6 +7,11 @@
 
 namespace SPH::solid_dynamics
 {
+/** Canonical packet order before shape construction at a fresh t=0 only.
+ * All reference geometry/weights/bond flags stay attached to their target ID.
+ * Never call this on a restored/advanced state. */
+void canonicalizeInitialGelReference(BaseInnerRelation &relation, Real time);
+
 /** Midpoint force prediction never commits accepted history. Commit reconstructs
  * accepted geometry after the final drift, integrates the second half segment,
  * and leaves last-applied force/stress fields distinct from accepted stress. */

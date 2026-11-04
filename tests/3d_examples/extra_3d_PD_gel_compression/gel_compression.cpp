@@ -269,6 +269,8 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
     {
         system.initializeSystemCellLinkedLists();
         system.initializeSystemConfigurations();
+        if (material.viscoelastic && restart.resume.empty())
+            solid_dynamics::canonicalizeInitialGelReference(reference, time);
         shape.exec();
         if (restart.resume.empty())
         {

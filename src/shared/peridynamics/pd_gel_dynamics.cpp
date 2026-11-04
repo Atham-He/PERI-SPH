@@ -1,9 +1,43 @@
 #include "pd_gel_dynamics.h"
 #include "base_particles.hpp"
 #include "pd_numerics.h"
+#include <algorithm>
 
 namespace SPH::solid_dynamics
 {
+void canonicalizeInitialGelReference(BaseInnerRelation &relation, Real time)
+{
+    auto &particles = relation.getSPHBody().getBaseParticles();
+    if (time != 0)
+        throw std::invalid_argument("gel reference ordering is only initialized at fresh time zero");
+    const size_t count = particles.TotalRealParticles();
+    const Real *history_time = particles.getVariableDataByName<Real>("GelHistoryTime");
+    const Matd *green = particles.getVariableDataByName<Matd>("GelGreenStrain");
+    const Matd *viscous = particles.getVariableDataByName<Matd>("GelViscousStrain");
+    const Matd *shape = particles.getVariableDataByName<Matd>("ShapeTensorK");
+    for (size_t i = 0; i < count; ++i)
+        if (history_time[i] != 0 || green[i].squaredNorm() != 0 || viscous[i].squaredNorm() != 0 || shape[i].squaredNorm() != 0)
+            throw std::invalid_argument("cannot reorder an evolved or already constructed gel reference");
+    struct Packet { size_t j; Real W, dW, r; Vecd e; bool live; };
+    for (size_t i = 0; i < count; ++i)
+    {
+        auto &row = relation.inner_configuration_[i];
+        StdVec<Packet> packets;
+        packets.reserve(row.current_size_);
+        for (size_t n = 0; n < row.current_size_; ++n)
+            packets.push_back({row.j_[n], row.W_ij_[n], row.dW_ij_[n], row.r_ij_[n], row.e_ij_[n], row.bondLive_[n]});
+        std::sort(packets.begin(), packets.end(), [](const auto &a, const auto &b) { return a.j < b.j; });
+        for (size_t n = 0; n < packets.size(); ++n)
+        {
+            if (packets[n].j >= count || !packets[n].live || (n && packets[n-1].j == packets[n].j))
+                throw std::invalid_argument("invalid initial gel reference packet");
+            const auto &p = packets[n];
+            row.j_[n] = p.j; row.W_ij_[n] = p.W; row.dW_ij_[n] = p.dW;
+            row.r_ij_[n] = p.r; row.e_ij_[n] = p.e; row.bondLive_[n] = p.live;
+        }
+    }
+}
+
 GelConstitutiveUpdate::GelConstitutiveUpdate(BaseInnerRelation &relation, Stage stage)
     : LocalDynamics(relation.getSPHBody()), DataDelegateInner(relation), stage_(stage),
       material_(DynamicCast<GelViscoelasticSolid>(this, relation.getSPHBody().getMatterMaterial())),

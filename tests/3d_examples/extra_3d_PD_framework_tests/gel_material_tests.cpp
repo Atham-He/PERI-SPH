@@ -238,3 +238,46 @@ TEST(PDGelCheckpoint, NonzeroViscousMemoryAndDissipationRestoreWithoutAdvancing)
     EXPECT_EQ(checkpoint_detail::fileHash(first / "state.bin"), checkpoint_detail::fileHash(second / "state.bin"));
     std::filesystem::remove_all(root);
 }
+
+TEST(PDGelReference, CanonicalInitialOrderPreservesEveryPacketAndRejectsConstructedReference)
+{
+    SPHSystem system(BoundingBoxd(Vecd(-1, -1, -1), Vecd(1, 1, 1)), 0.1);
+    PDBody body(system, makeShared<GeometricShapeBox>(Transform(), Vecd(0.3, 0.3, 0.3), "GelOrderedReference"));
+    body.defineMatterMaterial<GelViscoelasticSolid>(1000, 1e6, 0.35, 1.2, 0.7);
+    body.generateParticles<BaseParticles, Lattice>();
+    InnerRelation reference(body);
+    system.initializeSystemCellLinkedLists(); system.initializeSystemConfigurations();
+    const auto original = reference.inner_configuration_;
+    solid_dynamics::canonicalizeInitialGelReference(reference, 0);
+    const auto canonical = reference.inner_configuration_;
+    for (size_t i = 0; i < body.getBaseParticles().TotalRealParticles(); ++i)
+    {
+        auto &row = reference.inner_configuration_[i];
+        EXPECT_TRUE(std::is_sorted(row.j_.begin(), row.j_.begin() + row.current_size_));
+        for (size_t n = 0; n < row.current_size_; ++n)
+        {
+            const auto &old = original[i];
+            const size_t at = std::find(old.j_.begin(), old.j_.begin() + old.current_size_, row.j_[n]) - old.j_.begin();
+            ASSERT_LT(at, old.current_size_);
+            EXPECT_DOUBLE_EQ(row.W_ij_[n], old.W_ij_[at]); EXPECT_DOUBLE_EQ(row.dW_ij_[n], old.dW_ij_[at]);
+            EXPECT_DOUBLE_EQ(row.r_ij_[n], old.r_ij_[at]); EXPECT_EQ(row.bondLive_[n], old.bondLive_[at]);
+            EXPECT_EQ((row.e_ij_[n] - old.e_ij_[at]).squaredNorm(), 0);
+        }
+        std::reverse(row.j_.begin(), row.j_.begin() + row.current_size_);
+        std::reverse(row.W_ij_.begin(), row.W_ij_.begin() + row.current_size_);
+        std::reverse(row.dW_ij_.begin(), row.dW_ij_.begin() + row.current_size_);
+        std::reverse(row.r_ij_.begin(), row.r_ij_.begin() + row.current_size_);
+        std::reverse(row.e_ij_.begin(), row.e_ij_.begin() + row.current_size_);
+        std::reverse(row.bondLive_.begin(), row.bondLive_.begin() + row.current_size_);
+    }
+    solid_dynamics::canonicalizeInitialGelReference(reference, 0);
+    for (size_t i = 0; i < body.getBaseParticles().TotalRealParticles(); ++i)
+    {
+        const auto &row = reference.inner_configuration_[i], &expected = canonical[i];
+        EXPECT_EQ(row.j_, expected.j_); EXPECT_EQ(row.W_ij_, expected.W_ij_);
+        EXPECT_EQ(row.dW_ij_, expected.dW_ij_); EXPECT_EQ(row.r_ij_, expected.r_ij_);
+    }
+    EXPECT_THROW(solid_dynamics::canonicalizeInitialGelReference(reference, 0.1), std::invalid_argument);
+    InteractionWithUpdate<solid_dynamics::NosbPDShapeMatrix> shape(reference); shape.exec();
+    EXPECT_THROW(solid_dynamics::canonicalizeInitialGelReference(reference, 0), std::invalid_argument);
+}

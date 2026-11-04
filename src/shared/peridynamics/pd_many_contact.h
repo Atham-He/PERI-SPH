@@ -19,10 +19,12 @@ struct ConsistentLinearSolution
     Real relative_residual = 0;
 };
 
-inline ConsistentLinearSolution solveConsistentContactSystem(const DenseContactMatrix &matrix, const StdVec<Real> &rhs)
+inline ConsistentLinearSolution solveBoundedConsistentContactSystem(const DenseContactMatrix &matrix,
+    const StdVec<Real> &rhs, size_t maximum_dimension)
 {
     const size_t n = rhs.size();
-    if (!n || n > 384 || matrix.size() != n) throw std::invalid_argument("consistent contact solve: dimensions");
+    if (!maximum_dimension || maximum_dimension>1024 || !n || n>maximum_dimension || matrix.size()!=n)
+        throw std::invalid_argument("consistent contact solve: dimensions");
     Eigen::MatrixXd a(n, n); Eigen::VectorXd b(n);
     Real norm = 0, norm_b = 0;
     for (size_t i = 0; i < n; ++i)
@@ -56,6 +58,12 @@ inline ConsistentLinearSolution solveConsistentContactSystem(const DenseContactM
     result.relative_residual = scale > 0 ? error / scale : 0;
     if (result.relative_residual > 1e-12) throw std::runtime_error("consistent contact solve: inconsistent or inaccurate original linear system");
     return result;
+}
+
+// The previously qualified normal-only API keeps its original size bound.
+inline ConsistentLinearSolution solveConsistentContactSystem(const DenseContactMatrix &matrix, const StdVec<Real> &rhs)
+{
+    return solveBoundedConsistentContactSystem(matrix,rhs,384);
 }
 
 struct ComplementarityValue

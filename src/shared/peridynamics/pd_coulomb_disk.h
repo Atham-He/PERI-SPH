@@ -5,6 +5,7 @@
 #include "base_data_type.h"
 #include <boost/multiprecision/cpp_bin_float.hpp>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -85,37 +86,35 @@ inline Real convert(const Wide &x, const Wide &envelope, Real &bound, CoulombDis
 }
 } // namespace coulomb_disk_detail
 
-inline CoulombDiskValue coulombDiskNaturalMap(Real normal_impulse,
-    const ContactTangentVector &impulse, const ContactTangentVector &relative_velocity, Real mu)
+namespace coulomb_disk_detail
 {
-    using namespace coulomb_disk_detail;
-    if (!std::isfinite(normal_impulse) || !impulse.allFinite() || !relative_velocity.allFinite() ||
-        !std::isfinite(mu) || mu < 0)
-        throw std::invalid_argument("Coulomb disk: nonfinite input or negative coefficient");
-
+/** The caller certifies the branch against its original exact inputs.
+ * y is converted from the original exact difference, not a rounded t-w.
+ * 256-bit rational conversion errors are covered by the same conservative
+ * envelopes. This entry avoids an intermediate binary64 normalization.
+ */
+inline CoulombDiskValue evaluateWideDisk(const Wide &l, const std::array<Wide,2> &t,
+    const std::array<Wide,2> &w, const std::array<Wide,2> &y, const Wide &coefficient,
+    CoulombDiskBranch selected_branch)
+{
     CoulombDiskValue result;
-    const Wide l(normal_impulse), coefficient(mu);
     const Wide radius = coefficient * (l > 0 ? l : Wide(0));
-    Wide t[2], w[2], y[2], dt[2][2]{}, dw[2][2]{}, dl[2]{}, value[2];
-    for (size_t i = 0; i < 2; ++i)
-    {
-        t[i] = Wide(impulse[i]); w[i] = Wide(relative_velocity[i]); y[i] = t[i] - w[i];
-    }
+    Wide dt[2][2]{}, dw[2][2]{}, dl[2]{}, value[2];
     const Wide size = boost::multiprecision::sqrt(y[0]*y[0] + y[1]*y[1]);
     const Wide scalar_magnitude = absolute(t[0]) + absolute(t[1]) + absolute(w[0]) + absolute(w[1]) + radius;
     const Wide scalar_envelope = arithmeticEnvelope(scalar_magnitude);
-    if (size < radius)
+    if (selected_branch == CoulombDiskBranch::StickInterior)
     {
         result.branch = CoulombDiskBranch::StickInterior;
         for (size_t i = 0; i < 2; ++i) { value[i] = w[i]; dw[i][i] = 1; }
     }
-    else if (size == 0)
+    else if (selected_branch == CoulombDiskBranch::ZeroRadiusOrigin)
     {
         // A valid limiting derivative from l<0, radius=0. No division by zero.
         result.branch = CoulombDiskBranch::ZeroRadiusOrigin;
         for (size_t i = 0; i < 2; ++i) { value[i] = t[i]; dt[i][i] = 1; }
     }
-    else
+    else if (selected_branch == CoulombDiskBranch::SlipExterior && size > 0)
     {
         result.branch = CoulombDiskBranch::SlipExterior;
         const Wide h[2]{y[0]/size, y[1]/size}, fraction = radius/size;
@@ -130,6 +129,7 @@ inline CoulombDiskValue coulombDiskNaturalMap(Real normal_impulse,
             }
         }
     }
+    else throw std::invalid_argument("Coulomb disk: invalid branch certificate");
     const Wide derivative_envelope = arithmeticEnvelope(1 + coefficient);
     auto derivative = [&](const Wide &x)
     {
@@ -155,6 +155,51 @@ inline CoulombDiskValue coulombDiskNaturalMap(Real normal_impulse,
     result.cone_excess_upper = outwardPositive((tnorm > radius ? tnorm-radius : Wide(0)) + scalar_envelope, result);
     result.maximum_dissipation_error_upper = outwardPositive(absolute(product + radius*wnorm) + work_envelope, result);
     return result;
+}
+} // namespace coulomb_disk_detail
+
+inline CoulombDiskValue coulombDiskNaturalMap(Real normal_impulse,
+    const ContactTangentVector &impulse, const ContactTangentVector &relative_velocity, Real mu)
+{
+    using namespace coulomb_disk_detail;
+    if (!std::isfinite(normal_impulse) || !impulse.allFinite() || !relative_velocity.allFinite() ||
+        !std::isfinite(mu) || mu < 0)
+        throw std::invalid_argument("Coulomb disk: nonfinite input or negative coefficient");
+    const Wide l(normal_impulse), coefficient(mu), radius = coefficient*(l>0 ? l : Wide(0));
+    std::array<Wide,2> t,w,y;
+    for (size_t i=0;i<2;++i) { t[i]=Wide(impulse[i]);w[i]=Wide(relative_velocity[i]);y[i]=t[i]-w[i]; }
+    const Wide size=boost::multiprecision::sqrt(y[0]*y[0]+y[1]*y[1]);
+    const auto branch=size<radius ? CoulombDiskBranch::StickInterior :
+        (size==0 ? CoulombDiskBranch::ZeroRadiusOrigin : CoulombDiskBranch::SlipExterior);
+    return evaluateWideDisk(l,t,w,y,coefficient,branch);
+}
+
+using ContactExactScalar = boost::multiprecision::cpp_rational;
+inline coulomb_disk_detail::Wide contactExactToWide(const ContactExactScalar &x)
+{
+    using Wide=coulomb_disk_detail::Wide;
+    return numerator(x).convert_to<Wide>()/denominator(x).convert_to<Wide>();
+}
+
+/** Original rational normal impulse/I, tangent impulse/I and (Gv-wall)/speed.
+ * Branch comparison uses exact squared norms before any 256-bit conversion.
+ * Both binary64 gathering and normalization are thereby excluded from the
+ * constitutive inputs. Material evaluation itself still needs its own audit.
+ */
+inline CoulombDiskValue coulombDiskNaturalMapExact(const ContactExactScalar &l,
+    const std::array<ContactExactScalar,2> &t, const std::array<ContactExactScalar,2> &w,
+    const ContactExactScalar &mu)
+{
+    if (mu<0) throw std::invalid_argument("Coulomb disk: negative exact coefficient");
+    const ContactExactScalar radius=mu*(l>0 ? l : ContactExactScalar(0));
+    std::array<ContactExactScalar,2> y{t[0]-w[0],t[1]-w[1]};
+    const ContactExactScalar squared=y[0]*y[0]+y[1]*y[1];
+    const auto branch=squared<radius*radius ? CoulombDiskBranch::StickInterior :
+        (squared==0 ? CoulombDiskBranch::ZeroRadiusOrigin : CoulombDiskBranch::SlipExterior);
+    std::array<coulomb_disk_detail::Wide,2> tw,ww,yw;
+    for (size_t i=0;i<2;++i)
+    { tw[i]=contactExactToWide(t[i]);ww[i]=contactExactToWide(w[i]);yw[i]=contactExactToWide(y[i]); }
+    return coulomb_disk_detail::evaluateWideDisk(contactExactToWide(l),tw,ww,yw,contactExactToWide(mu),branch);
 }
 } // namespace SPH::peridynamics
 #endif

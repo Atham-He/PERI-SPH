@@ -20,6 +20,9 @@ def qualification_prerequisite(prior_root, adjudication_root):
     assert len(stop['attempts']) == 3
     case_list = continuation_controls([a['name'] for a in stop['attempts']])
     adjudication = read(adjudication_root/'independent_stop_adjudication.json')
+    adjudication_plan = read(adjudication_root/'adjudication_plan.json')
+    verify(adjudication_plan['artifacts'])
+    verify([adjudication['plan'],adjudication['state'],adjudication['coverage_events']])
     assert adjudication['status'] == 'original_equations_independently_consistent_required_reversal_coverage_FAILED'
     assert adjudication['required_reversal_coverage'] == 'FAILED' and not adjudication['study_passed']
     assert adjudication['all_trial_point_tangents_checked'] and adjudication['accepted_steps'] == 40
@@ -37,6 +40,7 @@ def qualification_prerequisite(prior_root, adjudication_root):
     for a in stop['attempts']:
         verify([a['stdout'],a['stderr']]);artifacts.extend([a['stdout'],a['stderr']])
     for a in stop['attempts'][:2]:
+        verify([a['independent_review']])
         p = prior_root/(a['name']+'.independent_review.json');receipt = read(p)
         assert receipt['status'] == 'actual_PD_friction_case_independently_passed'
         artifacts.append(record(p))

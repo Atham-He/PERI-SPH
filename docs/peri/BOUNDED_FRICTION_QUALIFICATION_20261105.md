@@ -29,6 +29,10 @@ physical and algorithmic losses, cumulative compensation and full true-cubic
 geometry are retained. Force means impulse over actual interval dt. Full
 reference evaluates every point path and numerical tangent independently at
 95 digits; exact Fraction handles original gather/scatter/normalization/branch.
+New frame/normal-limit comparisons retain1e-10 normalized gates using physical
+I for impulses,I/actualdt for reactions,E for work/loss and constitutive stress
+scale for stress/dissipation density. They do not require nonunique individual
+dual equality and do not change any old qualified comparison.
 
 Each native case is followed by a SEPARATE independent full-review process
 before the next physical initial case may start. Each attempt and case review

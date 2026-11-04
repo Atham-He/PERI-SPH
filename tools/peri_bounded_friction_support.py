@@ -97,21 +97,24 @@ def compare_rotated(base_path,rotated_path):
     with localcontext() as ctx:
         ctx.prec=95;maximum=0.;a=step_stream(base_path);b=step_stream(rotated_path)
         ha,hb=next(a),next(b);assert ha['steps_requested']==hb['steps_requested']==16
+        I=D.from_float(ha['normalization_impulse_scale'])
+        E=max(I,sum(map(D.from_float,ha['reference']['volume']))*max(map(D.from_float,ha['parameters'][:2])))
+        P=max(map(D.from_float,ha['parameters'][:3]))
         count=0
         for x,y in zip(a,b,strict=True):
             assert x['state']['time']==y['state']['time'] and x['interval']==y['interval']
             for field in ['position','velocity']:
                 maximum=max(maximum,close_tree(y['state'][field],[rotate_vector(v) for v in x['state'][field]]))
             for field in ['green','viscous','accepted_stress']:
-                maximum=max(maximum,close_tree(y['state'][field],[rotate_tensor(v) for v in x['state'][field]]))
-            for field in ['density','dissipation']:maximum=max(maximum,close_tree(y['state'][field],x['state'][field]))
+                maximum=max(maximum,close_tree(y['state'][field],[rotate_tensor(v) for v in x['state'][field]],P if field=='accepted_stress' else D(1)))
+            for field in ['density','dissipation']:maximum=max(maximum,close_tree(y['state'][field],x['state'][field],P if field=='dissipation' else D.from_float(ha['rho0'])))
             for field in ['contact_impulse','particle_plate_impulse','normal_plate_impulse','tangent_plate_impulse','plate_reaction_interval']:
-                maximum=max(maximum,close_tree(y[field],[rotate_vector(v) for v in x[field]]))
+                maximum=max(maximum,close_tree(y[field],[rotate_vector(v) for v in x[field]],I/D.from_float(x['interval']['actual_dt']) if field=='plate_reaction_interval' else I))
             for field in ['normal_plate_work','tangent_plate_work','kinetic_old','kinetic_new','algorithmic_loss','normal_contact_loss','friction_loss','energy_residual']:
-                maximum=max(maximum,close_tree(y[field],x[field]))
+                maximum=max(maximum,close_tree(y[field],x[field],E))
             count+=1
         assert count==16
-        return dict(status='new_actual_PD_frame_covariance_passed',steps=count,maximum_absolute_error=maximum,individual_dual_equality_required=False)
+        return dict(status='new_actual_PD_frame_covariance_passed',steps=count,maximum_normalized_error=maximum,individual_dual_equality_required=False)
 
 
 def compare_normal_anchor(new_path,anchor):
@@ -123,19 +126,24 @@ def compare_normal_anchor(new_path,anchor):
             assert ha[field]==hb[field],('same_discrete_normal_model',field)
         assert len(hb['surface']['reference'])==114 and len(hb['plate_ids'])==228 and hb['unknowns']==783
         assert hb['mu']==[0,0] and hb['tangent_stroke']==[0,0]
+        I=D.from_float(hb['normalization_impulse_scale'])
+        E=max(I,sum(map(D.from_float,hb['reference']['volume']))*max(map(D.from_float,hb['parameters'][:2])))
+        P=max(map(D.from_float,hb['parameters'][:3]))
         count=0
         for old,new in zip(a,b,strict=True):
             assert old['actual_dt']==new['interval']['actual_dt']
             assert old['state']['time']==new['state']['time']
             for field in ['position','velocity','green','viscous','accepted_stress','density','dissipation']:
-                maximum=max(maximum,close_tree(new['state'][field],old['state'][field]))
+                scale=P if field in ['accepted_stress','dissipation'] else (D.from_float(hb['rho0']) if field=='density' else D(1))
+                maximum=max(maximum,close_tree(new['state'][field],old['state'][field],scale))
             for field in ['contact_impulse','particle_plate_impulse','plate_reaction_interval','kinetic_new','kinetic_old','algorithmic_loss','normal_contact_loss']:
-                maximum=max(maximum,close_tree(new[field],old[field]))
+                scale=I/D.from_float(old['actual_dt']) if field=='plate_reaction_interval' else (I if field in ['contact_impulse','particle_plate_impulse'] else E)
+                maximum=max(maximum,close_tree(new[field],old[field],scale))
             for field in ['material_stored_old','material_stored_new','physical_material_loss','material_work','stabilization_stored_old','stabilization_stored_new']:
-                maximum=max(maximum,close_tree(new['evaluation'][field],old['evaluation'][field]))
-            assert max(abs(p) for p in new['solve']['impulses'][1::3]+new['solve']['impulses'][2::3])<=1e-10
-            assert abs(new['friction_loss'])<=1e-10
+                maximum=max(maximum,close_tree(new['evaluation'][field],old['evaluation'][field],E))
+            assert max(abs(D.from_float(p)) for p in new['solve']['impulses'][1::3]+new['solve']['impulses'][2::3])<=D('1e-10')*I
+            assert abs(D.from_float(new['friction_loss']))<=D('1e-10')*E
             count+=1
         assert count==16
         return dict(status='new_zero_mu_same114sample_normal_limit_passed',steps=count,
-            maximum_absolute_error=maximum,old_qualified_review_imported=anchor['review'],old_solver_dispatched=False,old_review_repeated=False)
+            maximum_normalized_error=maximum,old_qualified_review_imported=anchor['review'],old_solver_dispatched=False,old_review_repeated=False)

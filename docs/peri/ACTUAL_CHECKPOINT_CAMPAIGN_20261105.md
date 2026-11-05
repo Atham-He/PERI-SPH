@@ -15,8 +15,9 @@ candidate field and complete physical prefix must match authenticated continuous
 bytes. All previous files remain unchanged except the explicitly moved HEAD;
 new branches/previous pointers retain provenance. Read-only validation cannot
 substitute for positive owned restoration. Correct-SHA semantic refusal fixture
-implementation is still required before admission; preparation explicitly rejects
-its absence. The real campaign has NOT been dispatched by implementing this code.
+implementation and its separate zero-step preflight are required before admission;
+preparation explicitly rejects missing evidence or changed semantic helper code.
+The real campaign has NOT been dispatched by implementing this code.
 
 The reference executable chooses frozen pure Python decimal BEFORE any
 reference/Fraction import and explicitly sets the process context to95 digits.
@@ -56,3 +57,21 @@ and1s wall-stop controls. The synthetic error/wall cases are deliberate negative
 inputs, not actual scientific/resource failures. They perform zero material or
 native solver calls and do not qualify a physical restart. Actual nonzero
 owned/split/rollback/semantic CP evidence and S3-wide audit remain required.
+
+`peri_actual_checkpoint_negative.py` now declares one valid binding and16
+correct-SHA refusals: density, Maxwell viscous history, directed neighbor, active
+mask, nonaffine cache, contact order, normal/tangent dual, ledger/travel correction,
+clock, explicit generation, external trust, expected HEAD, interior physical
+record and actual executable identity. Footer, selected archive and physical
+prefix hashes are recomputed where appropriate. The interior mutation changes
+accepted record1 in a nonzero CP (record0 only in zero-step engineering) while
+keeping final state, so the loader must inspect full historical physical data.
+The executable-identity mutation uses an internally consistent synthetic
+contract/header/prefix to reach the real running-ELF check, not just a bad SHA.
+Each expected error cause is frozen; every input/pointer/file remains unchanged,
+no live owner/append appears, and no Newton solve runs.
+
+The separate semantic preflight uses logicalG7 at physicalstep0; it is not the
+real nonzero16-case result. The actual campaign repeats the protocol on its NEW
+independently qualified physicalG8, requiring meaningful nonzero Maxwell memory
+and both normal/tangent duals, and cannot mark restart qualified from zero data.

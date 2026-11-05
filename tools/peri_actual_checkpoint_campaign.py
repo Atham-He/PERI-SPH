@@ -16,6 +16,12 @@ def prepare(root):
     assert (repo/'tools/peri_actual_checkpoint_negative.py').is_file(),'semantic CP rejection implementation required before admission'
     from peri_actual_checkpoint_negative import specification
     negative_specification=specification();assert negative_specification['schema']==1 and negative_specification['positive_binding_control']
+    execution_component=verified_execution_component(base)
+    semantic=base/'engineering-CP-semantic-validator';semantic_receipt=read(semantic/'engineering_receipt.json');semantic_terminal=read(semantic/'terminal.json')
+    assert semantic_terminal['return_code']==0 and semantic_receipt['semantic_rejections']==16 and semantic_receipt['positive_binding_controls']==1
+    verify([semantic_terminal['receipt'],semantic_receipt['plan'],semantic_receipt['review']])
+    for name in ['peri_actual_checkpoint_negative.py','peri_actual_checkpoint_support.py','peri_canonical_archive_audit.py','peri_bounded_session_archive_audit.py','peri_bounded_mechanical_stream_audit.py']:
+        assert record(repo/'tools'/name)['sha256']==record(semantic/'frozen'/name)['sha256'],'semantic component changed;new preflight required'
     terminal=read(tail/'terminal.json');assert terminal['status']=='two_original_never_attempted_friction_tails_independently_qualified' and terminal['failure'] is None
     prerequisites=[record(tail/'terminal.json'),record(tail/'plan.json')]
     for name in ['actual_PD_strict_stick_hold_release','same114sample_zero_mu']:
@@ -33,6 +39,8 @@ def prepare(root):
     assert subprocess.check_output(['git','status','--porcelain'],cwd=repo,text=True)==''
     root.mkdir(mode=0o700);frozen=root/'frozen';reference=frozen/'reference';reference.mkdir(parents=True)
     artifacts=prerequisites+build['support']+build['source_snapshots']+native_inputs+[build['ELF'],record(producer/'independent_preflight.json'),record(producer/'terminal.json')]
+    artifacts += [execution_component['receipt'],execution_component['frozen_controller']]
+    artifacts += [record(semantic/'engineering_receipt.json'),record(semantic/'terminal.json'),semantic_receipt['plan'],semantic_receipt['review']]
     for source in sorted((cross/'frozen/reference').glob('*.py')):
         target=reference/source.name;shutil.copy2(source,target);artifacts += [record(source),record(target)]
     for name in ['peri_actual_checkpoint_campaign.py','peri_actual_checkpoint_reference.py','peri_actual_checkpoint_support.py',
@@ -54,6 +62,8 @@ def prepare(root):
         native_producer_source=proof['source_commit'],native_producer_ELF=build['ELF'],executable=str(executable),case=case,
         trusted_contract=initial['trusted'].hex(),artifacts=artifacts,resources=resources,
         negative_specification=negative_specification,
+        execution_component=execution_component,
+        zero_step_semantic_preflight=record(semantic/'engineering_receipt.json'),
         native_CPU_seconds=900,native_wall_seconds=900,native_AS_GiB=1,threads=1,file_bound_GiB=4,total_output_GiB=4,
         host_reserve_GiB=120,output_reserve_GiB=150,reference_AS_GiB=8,reference_max_CPU_seconds=36000,
         reference_cost_formula='max(7200,ceil(2*actual_native_trial_material_points+2000))CPU;wall=CPU+600;freeze admission BEFORE each new assessment. No failed audit extension.',
@@ -67,6 +77,8 @@ def prepare(root):
         failure_policy='Preserve exact exception/returncode/raw/resource/acceptedvsdebug/appendwitness andstop dependentphases. Neverredispatch state,reset/fallback,force/mass/speed/reference changes or relax gates.',
         new_input_scope='New CP-specific two-axis input,zero-advance preflight only previously;plannedsplit replicate is required restart experiment,notoldraw recovery.',
         S3_complete=False,full_restart_qualified=False,S4_complete=False,calibration_allowed=False)
+    plan['critical_runtime']=[record(executable)]+[record(root/name) for name in ['source_manifest.json','build_runtime_manifest.json','original.input']]
+    plan['critical_runtime'] += [x for x in build['support'] if '.so' in Path(x['path']).name]
     verify(artifacts);save(root/'plan.json',plan)
     print(json.dumps(dict(status='actual_complete_CP_campaign_prepared_NOT_passed',root=str(root))))
 
@@ -133,15 +145,39 @@ class Execution:
         return result
 
 
+def verified_execution_component(base):
+    """Import the scoped guardian proof only if its class/imports are EXACT.
+
+    Legitimate changes to prepare/assessment outside this class do not require
+    rerunning an already passed guardian state. A changed guardian does.
+    """
+    import ast
+    from peri_elastic_normal import read,record,verify
+    old=Path(base)/'engineering-CP-execution-guardian';receipt=read(old/'engineering_receipt.json');plan=read(old/'plan.json');terminal=read(old/'terminal.json')
+    assert terminal['return_code']==0 and terminal['status']==receipt['status'];verify([terminal['receipt'],receipt['plan']])
+    assert receipt['control_count']==5 and receipt['native_solver_calls']==0
+    frozen=old/'frozen/peri_actual_checkpoint_campaign.py'
+    expected=next(x for x in plan['artifacts'] if x['path']==str(frozen));verify([expected])
+    def pieces(path):
+        text=Path(path).read_text();tree=ast.parse(text);lines=text.splitlines(keepends=True)
+        cls=next(x for x in tree.body if isinstance(x,ast.ClassDef) and x.name=='Execution')
+        imports=[ast.dump(x,include_attributes=False) for x in tree.body if isinstance(x,(ast.Import,ast.ImportFrom))]
+        return ''.join(lines[cls.lineno-1:cls.end_lineno]),imports
+    before=pieces(frozen);current=pieces(__file__);assert before==current,'guardian component changed;new preflight required'
+    return dict(status='exact_guardian_class_and_top_imports_match_previously_qualified_component',
+        class_SHA256=hashlib.sha256(current[0].encode()).hexdigest(),receipt=record(old/'engineering_receipt.json'),frozen_controller=record(frozen),
+        control_count=5,old_preflight_not_repeated=True)
+
+
 def run(root):
     sys.path.insert(0,str(root/'frozen/reference'))
     from peri_elastic_normal import read,record,verify,save,identity,stamp
     from peri_actual_checkpoint_support import derive_continuous,selected,file_tree,assert_preserved,restored_noadvance_metadata,trace_packets
-    plan=read(root/'plan.json');assert not (root/'state.json').exists(),'never redispatch campaign'
+    plan=read(root/'plan.json');plan_record=record(root/'plan.json');assert not (root/'state.json').exists(),'never redispatch campaign'
     resource.setrlimit(resource.RLIMIT_AS,(8*2**30,8*2**30))
     save(root/'state.json',dict(status='actual_complete_CP_campaign_attempted',started_at=stamp(),identity=identity(),plan=record(root/'plan.json')))
     execution=Execution(root,plan);results=[];failure=None;trusted=bytes.fromhex(plan['trusted_contract']);exe=plan['executable']
-    def verify_all():verify(plan['artifacts'])
+    def verify_all():verify([plan_record]+plan['artifacts'])
     def native(label,args):
         verify_all();result=execution.run(label,[exe]+args,wall=900,cpu=900,gib=1)
         with Path(result['stdout']['path']).open() as stream:meta=json.loads(next(stream))
@@ -190,7 +226,9 @@ def run(root):
             results.append(bytes_assessment(label,split,[20,32,40] if step==8 else [32,40],derived))
             results.append(reference(label,step+1,40))
         from peri_actual_checkpoint_negative import run_controls
-        results.append(run_controls(root,plan,execution,derived))
+        negative_review=run_controls(root,plan,execution,derived);negative=read(negative_review['path'])
+        assert negative['qualified_physical_nonzero_seed'] and negative['accepted_step']==8 and negative['semantic_rejections']==16
+        results.append(negative_review)
         verify_all();status='actual_bounded_PD_complete_material_reference_contact_history_restart_independently_qualified'
     except Exception as error:
         failure=dict(error=repr(error),traceback=traceback.format_exc());status='actual_complete_CP_campaign_stopped_preserve_failure'

@@ -37,7 +37,8 @@ def run(root,label):
     from peri_coulomb_contact_audit import dec,frac
     plan=read(root/'plan.json');attempt=read(root/(label+'.attempt.json'));budget=read(root/(label+'.reference_admission.json'))
     assert not (root/(label+'.reference_state.json')).exists(),'never repeat an attempted reference state'
-    verify(plan['artifacts']);verify([attempt['stdout'],attempt['stderr'],budget['attempt']])
+    plan_record=read(root/'state.json')['plan']
+    verify([plan_record]+plan['artifacts']);verify([attempt['stdout'],attempt['stderr'],budget['attempt']])
     assert attempt['return_code']==0 and attempt['stop_reason'] is None
     save(root/(label+'.reference_state.json'),dict(status='new_actual_CP_reference_attempted',identity=identity(),started_at=stamp(),admission=record(root/(label+'.reference_admission.json'))))
     resource.setrlimit(resource.RLIMIT_AS,(8*2**30,8*2**30));resource.setrlimit(resource.RLIMIT_CPU,(budget['CPU_seconds'],budget['CPU_seconds']))
@@ -107,7 +108,7 @@ def run(root,label):
                     new_reference_trial_points=audit.trial_points,maximum_normalized_error=max(audit.maximum,audit.geometry['maximum_normalized_cache_error']),
                     all_new_trial_point_tangents_checked=True,reference_seed='Authenticated selected CP exactbinary viscous/dissipation/kinematics/travel+correction+ledger;no native history reset or replay of passed prefix math.',
                     independently_assessed_new_segment=[first,last],old_full_reference_repeated=False)
-        verify(plan['artifacts']);verify([attempt['stdout'],attempt['stderr'],budget['attempt']])
+        verify([plan_record]+plan['artifacts']);verify([attempt['stdout'],attempt['stderr'],budget['attempt']])
         receipt.update(raw=attempt['stdout'],attempt=record(root/(label+'.attempt.json')))
     except Exception as error:receipt.update(failure=repr(error),failure_traceback=traceback.format_exc(),last_cursor=cursor)
     finally:FrictionInspector.step=old_step

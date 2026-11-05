@@ -50,3 +50,9 @@ set_target_properties(extra_3d_PD_bounded_gel_friction_probe PROPERTIES RUNTIME_
 add_executable(extra_3d_PD_coulomb_contact_probe coulomb_contact_probe.cpp)
 target_link_libraries(extra_3d_PD_coulomb_contact_probe PRIVATE sphinxsys_3d)
 set_target_properties(extra_3d_PD_coulomb_contact_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin")
+
+# Schedule-only S4 probe: no PD physics or production library dependency.
+add_executable(extra_3d_PD_physical_time_probe physical_time_schedule_probe.cpp)
+target_include_directories(extra_3d_PD_physical_time_probe PRIVATE "${SPHINXSYS_PROJECT_DIR}/src/shared/peridynamics")
+target_compile_features(extra_3d_PD_physical_time_probe PRIVATE cxx_std_17)
+set_target_properties(extra_3d_PD_physical_time_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin")

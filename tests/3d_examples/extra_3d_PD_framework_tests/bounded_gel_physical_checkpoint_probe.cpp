@@ -278,6 +278,22 @@ int main(int argc,char **argv)
             io::begin("diagnostic_fixture");io::field("controlled_formatter_only",true);io::field("new_physical_steps",0);io::finish();return 0;
         }
         io::identity();
+        if(mode=="--describe-initial")
+        {
+            require(argc==4,"physical PD driver: describe ROOT EXTERNAL_TRUSTED_CONTRACT");
+            const std::string root=argv[2];const auto trusted=unhex(argv[3]);
+            const auto bytes=readAt(root,"initial_candidate.bin");
+            const auto candidate=decodeBoundedSessionCandidate(bytes,1,trusted);
+            require(candidate.contract.schema==2 && candidate.body.accepted.gel.steps==0,
+                "physical PD driver: authenticated initial v2 header only");
+            const auto producer=running(root,candidate.contract);producer.requireFor(candidate.contract);
+            VerifiedBoundedMechanicalPrefix proof(root+"/initial.phy",candidate,1,trusted,true);
+            const auto input=obs::readInput((root+"/original.input").c_str());
+            const BoundedStoredSceneView view(candidate.body);
+            obs::header(input,view,candidate.body.accepted,candidate.body.plate_ids);
+            io::begin("initial_header_only");io::field("physical_solver_calls",0);
+            io::field("new_physical_steps",0);io::field("owned_state_installed",false);io::finish();return 0;
+        }
         if(mode=="--inspect-detached" || mode=="--roundtrip-legacy-t0")
         {
             require(argc==6,"physical PD driver: detached ROOT LEAF GENERATION TRUSTED");

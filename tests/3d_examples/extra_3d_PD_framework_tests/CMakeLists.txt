@@ -56,3 +56,7 @@ add_executable(extra_3d_PD_physical_time_probe physical_time_schedule_probe.cpp)
 target_include_directories(extra_3d_PD_physical_time_probe PRIVATE "${SPHINXSYS_PROJECT_DIR}/src/shared/peridynamics")
 target_compile_features(extra_3d_PD_physical_time_probe PRIVATE cxx_std_17)
 set_target_properties(extra_3d_PD_physical_time_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin")
+
+add_executable(extra_3d_PD_physical_checkpoint_probe bounded_gel_physical_checkpoint_probe.cpp)
+target_link_libraries(extra_3d_PD_physical_checkpoint_probe PRIVATE sphinxsys_3d)
+set_target_properties(extra_3d_PD_physical_checkpoint_probe PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin")

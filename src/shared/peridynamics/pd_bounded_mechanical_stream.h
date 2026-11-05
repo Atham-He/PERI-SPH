@@ -60,10 +60,15 @@ struct BoundedMechanicalRecord
 {
     BoundedArchiveBody body;
     BoundedMechanicalObservation observation;
-    uint64_t kind=0,interval_phase=0;
+    uint64_t kind=0,interval_phase=0,schema=1,old_tick=0,accepted_tick=0,time_denominator=0;
     Real old_time=0;
     template<class Registry>void registerCheckpoint(Registry &cp)
     {
+        if(schema==2)
+        {
+            cp.addScalar("RecordSchema",schema);cp.addScalar("OldTick",old_tick);
+            cp.addScalar("AcceptedTick",accepted_tick);cp.addScalar("TimeDenominator",time_denominator);
+        }
         auto b=cp.scope("body");body.registerCheckpoint(b);auto o=cp.scope("observation");observation.registerCheckpoint(o);
         cp.addScalar("RecordKind",kind);cp.addScalar("IntervalPhase",interval_phase);cp.addScalar("OldTime",old_time);
     }
@@ -74,10 +79,14 @@ inline canonical_archive::Bytes encodeBoundedMechanicalRecord(BoundedMechanicalR
     canonical_archive::Builder builder(record.body.accepted.gel.steps+1);canonical_archive::FieldWriter fields(builder);
     record.registerCheckpoint(fields);return builder.finish();
 }
-inline BoundedMechanicalRecord decodeBoundedMechanicalRecord(const canonical_archive::Bytes &bytes,uint64_t expected_step)
+inline BoundedMechanicalRecord decodeBoundedMechanicalRecord(const canonical_archive::Bytes &bytes,uint64_t expected_step,uint64_t record_schema=1)
 {
+    bounded_session_detail::require(record_schema==1 || record_schema==2,"mechanical stream: explicit record schema");
     const canonical_archive::Candidate candidate(bytes,expected_step+1);
-    return canonical_archive::decodeDetached<BoundedMechanicalRecord>(candidate,[](const auto &record){record.body.validateStored();});
+    BoundedMechanicalRecord result;result.schema=record_schema;canonical_archive::FieldReader fields(candidate);
+    result.registerCheckpoint(fields);fields.finish();
+    bounded_session_detail::require(result.schema==record_schema,"mechanical stream: record schema mismatch");
+    result.body.validateStored();return result;
 }
 
 inline BoundedMechanicalObservation boundedMechanicalObservation(const BoundedGelFrictionStepResult &r,
@@ -98,9 +107,10 @@ inline BoundedMechanicalObservation boundedMechanicalObservation(const BoundedGe
     o.angular_drift_minus_external=r.angular_drift_minus_external;o.internal_old_torque=r.internal_old_torque;return o;
 }
 
-inline canonical_archive::Bytes boundedPhysicalStreamHeader(const canonical_archive::Digest &trusted_contract)
+inline canonical_archive::Bytes boundedPhysicalStreamHeader(const canonical_archive::Digest &trusted_contract,uint64_t schema=1)
 {
-    canonical_archive::Bytes bytes{'P','E','R','I','P','H','Y','1'};canonical_archive::appendU64(bytes,1);
+    bounded_session_detail::require(schema==1 || schema==2,"mechanical stream: header schema");
+    canonical_archive::Bytes bytes{'P','E','R','I','P','H','Y',uint8_t('0'+schema)};canonical_archive::appendU64(bytes,schema);
     bytes.insert(bytes.end(),trusted_contract.begin(),trusted_contract.end());return bytes;
 }
 
@@ -130,7 +140,9 @@ inline void validateInitial(const BoundedMechanicalRecord &record)
     }
     for(const auto *ledger:{&record.body.accepted.ledger_sum,&record.body.accepted.ledger_correction})
         for(Real x:*ledger)require(x==0,"mechanical stream: initial cumulative ledger");
-    BoundedMechanicalRecord expected;expected.body=record.body;
+    if(record.schema==2)require(record.old_tick==0 && record.accepted_tick==0 && record.time_denominator>0,
+        "mechanical stream: initial rational clock");
+    BoundedMechanicalRecord expected;expected.body=record.body;expected.schema=record.schema;expected.time_denominator=record.time_denominator;
     requireBytes(encodeBoundedMechanicalRecord(expected),encodeBoundedMechanicalRecord(record),
         "mechanical stream: initial physical observation");
 }
@@ -142,7 +154,12 @@ inline void validateAdjacent(const BoundedMechanicalRecord &previous,const Bound
     const BoundedSessionContract &contract)
 {
     const auto &old=previous.body;const auto &state=record.body.accepted.gel;
-    const auto interval=contract.protocol.interval(old.accepted.gel.steps,old.accepted.gel.time);
+    const auto interval=contract.interval(old.accepted.gel.steps,old.accepted.gel.time);
+    require(previous.schema==contract.physical_stream_schema && record.schema==contract.physical_stream_schema,
+        "mechanical stream: contract/record version");
+    if(contract.schema==2)require(previous.accepted_tick==interval.old_tick && record.old_tick==interval.old_tick &&
+        record.accepted_tick==interval.new_tick && record.time_denominator==contract.physical_protocol.physical.denominator &&
+        previous.time_denominator==record.time_denominator,"mechanical stream: adjacent rational clock");
     require(record.kind==1 && record.interval_phase==interval.phase && sameBits(record.old_time,interval.old_time) &&
         state.steps==old.accepted.gel.steps+1 && sameBits(state.time,interval.new_time) && sameBits(state.last_dt,interval.actual_dt),
         "mechanical stream: adjacent exact clock");
@@ -170,7 +187,7 @@ inline void validateAdjacent(const BoundedMechanicalRecord &previous,const Bound
         "mechanical stream: accepted history byte mismatch");
     const auto whole=boundedFrictionIntervalGaps(scene,old.accepted.gel.position,proposal.next.gel.position,interval);
     const auto endpoint=boundedFrictionIntervalGaps(scene,old.accepted.gel.position,proposal.next.gel.position,interval,false);
-    require(std::min(whole[0],whole[1])>=-contract.penetration_stroke_gate*contract.protocol.normal_stroke,
+    require(std::min(whole[0],whole[1])>=-contract.penetration_stroke_gate*contract.normalStroke(),
         "mechanical stream: whole-cubic penetration gate");
     auto expected=record;expected.observation=boundedMechanicalObservation(proposal,interval.actual_dt,whole,endpoint);
     requireBytes(encodeBoundedMechanicalRecord(expected),encodeBoundedMechanicalRecord(record),
@@ -197,7 +214,7 @@ class VerifiedBoundedMechanicalPrefix
     {
         using namespace bounded_session_detail;using namespace canonical_archive;
         candidate.validateCandidate(external_trusted_contract);
-        const auto header=boundedPhysicalStreamHeader(external_trusted_contract);Bytes stored(header.size());prefix_.readAt(0,stored.data(),stored.size());
+        const auto header=boundedPhysicalStreamHeader(external_trusted_contract,candidate.contract.physical_stream_schema);Bytes stored(header.size());prefix_.readAt(0,stored.data(),stored.size());
         require(stored==header && sha256(header,header.size())==digestArray(candidate.output.header_sha256),
             "mechanical stream: trusted physical header");
         uint64_t offset=header.size();std::optional<BoundedMechanicalRecord> previous;
@@ -210,7 +227,10 @@ class VerifiedBoundedMechanicalPrefix
             Bytes bytes(size_t(length),0);prefix_.readAt(offset,bytes.data(),bytes.size());offset+=length;
             try
             {
-                auto record=decodeBoundedMechanicalRecord(bytes,step);
+                auto record=decodeBoundedMechanicalRecord(bytes,step,candidate.contract.physical_stream_schema);
+                require(record.schema==candidate.contract.physical_stream_schema,"mechanical stream: record version");
+                if(candidate.contract.schema==2)require(record.time_denominator==candidate.contract.physical_protocol.physical.denominator,
+                    "mechanical stream: physical denominator");
                 require(record.body.accepted.gel.steps==step,"mechanical stream: record accepted index");
                 bounded_mechanical_detail::validateStatic(record.body,candidate.contract);
                 if(previous)bounded_mechanical_detail::validateAdjacent(*previous,record,candidate.contract);

@@ -2,7 +2,7 @@
 #ifndef PD_BOUNDED_SESSION_ARCHIVE_H
 #define PD_BOUNDED_SESSION_ARCHIVE_H
 #include "pd_bounded_archive_body.h"
-#include "pd_bounded_friction_protocol.h"
+#include "pd_bounded_physical_protocol.h"
 #include "pd_output_prefix.h"
 #include <cfenv>
 #if defined(__x86_64__)
@@ -70,8 +70,10 @@ struct BoundedSessionContract
         compensation_version=1,floating_point_profile=1,physical_stream_schema=1;
     uint64_t mode=1,normal_base_steps=16,rotation=0,azimuths=8;
     Real cap_width=1./64,penetration_stroke_gate=.01;
-    BoundedFrictionProtocol protocol;
+    BoundedFrictionProtocol protocol; // explicit schema1 only
+    BoundedPhysicalTimeProtocol physical_protocol; // explicit schema2 only
     ManyContactSettings solver;
+    StdVec<uint64_t> checkpoint_steps; // schema2 explicit publication cursors
     StdVec<uint8_t> source_manifest_sha256,ELF_sha256,build_runtime_manifest_sha256,
         input_sha256,static_body_sha256;
 
@@ -81,22 +83,58 @@ struct BoundedSessionContract
         cp.addScalar("AffineFMaterialPathVersion",material_path_version);cp.addScalar("SignedTransferVersion",transfer_version);
         cp.addScalar("CompensationVersion",compensation_version);cp.addScalar("FloatingPointProfile",floating_point_profile);
         cp.addScalar("PhysicalStreamSchema",physical_stream_schema);cp.addScalar("SceneMode",mode);
-        cp.addScalar("NormalBaseSteps",normal_base_steps);cp.addScalar("Rotation",rotation);cp.addScalar("Azimuths",azimuths);
+        if(schema==1)cp.addScalar("NormalBaseSteps",normal_base_steps);
+        cp.addScalar("Rotation",rotation);cp.addScalar("Azimuths",azimuths);
         cp.addScalar("CapWidth",cap_width);cp.addScalar("PenetrationStrokeGate",penetration_stroke_gate);
-        cp.addScalar("ProtocolKind",protocol.kind);cp.addScalar("NominalDt",protocol.nominal_dt);
-        cp.addScalar("NormalStroke",protocol.normal_stroke);cp.addScalar("TwoTangentStrokes",protocol.tangent_stroke);
+        if(schema==1)
+        {
+            cp.addScalar("ProtocolKind",protocol.kind);cp.addScalar("NominalDt",protocol.nominal_dt);
+            cp.addScalar("NormalStroke",protocol.normal_stroke);cp.addScalar("TwoTangentStrokes",protocol.tangent_stroke);
+        }
+        else
+        {
+            bounded_session_detail::require(schema==2,"bounded session: unsupported explicit schema");
+            auto &p=physical_protocol;cp.addArray("CheckpointSteps",checkpoint_steps);cp.addScalar("TimeDenominator",p.physical.denominator);
+            cp.addScalar("NominalTicks",p.nominal_ticks);
+            for(size_t k=0;k<3;++k)
+            {
+                cp.addScalar("NormalEvent"+std::to_string(k),p.physical.normal_ends[k]);
+                cp.addScalar("TangentEvent"+std::to_string(k),p.physical.tangent_ends[k]);
+            }
+            cp.addScalar("PhysicalNormalStroke",p.physical.normal_stroke);
+            for(size_t k=0;k<2;++k)cp.addScalar("PhysicalTangentStroke"+std::to_string(k),p.physical.tangent_stroke[k]);
+        }
         cp.addScalar("SolverVelocityScale",solver.velocity_scale);cp.addScalar("SolverRelativeTolerance",solver.relative_tolerance);
         cp.addScalar("MaxNewton",solver.max_newton_steps);cp.addScalar("MaxLineSearch",solver.max_line_search);
         cp.addArray("SourceManifestSHA256",source_manifest_sha256);cp.addArray("ELFSHA256",ELF_sha256);
         cp.addArray("BuildRuntimeManifestSHA256",build_runtime_manifest_sha256);cp.addArray("InputSHA256",input_sha256);
         cp.addArray("StaticBodySHA256",static_body_sha256);
     }
+    uint64_t steps()const{return schema==1?protocol.steps():physical_protocol.steps();}
+    Real normalStroke()const{return schema==1?protocol.normal_stroke:physical_protocol.physical.normal_stroke;}
+    uint64_t phaseAtStep(uint64_t step)const
+    {return schema==1?(step==protocol.steps()?3:(step<16?0:(step<24?1:2))):physical_protocol.phaseAtStep(step);}
+    BoundedSessionInterval interval(uint64_t step,Real time)const
+    {
+        if(schema==2)return physical_protocol.interval(step,time);
+        BoundedSessionInterval r;static_cast<BoundedFrictionInterval&>(r)=protocol.interval(step,time);return r;
+    }
     void validateProfile()const
     {
         using namespace bounded_session_detail;
-        currentFloatingPointProfile();protocol.validate();
-        require(schema==1 && equation_version==1 && material_path_version==1 && transfer_version==1 && compensation_version==1 &&
-            floating_point_profile==1 && physical_stream_schema==1 && mode==1 && normal_base_steps==16,
+        currentFloatingPointProfile();
+        require(schema==1 || schema==2,"bounded session: unsupported explicit schema");
+        if(schema==1)protocol.validate();else
+        {
+            physical_protocol.validate();
+            require(!checkpoint_steps.empty() && checkpoint_steps.size()<=64 && checkpoint_steps.back()==physical_protocol.steps(),
+                "bounded session: explicit checkpoint cursor profile");
+            uint64_t previous=0;
+            for(uint64_t step:checkpoint_steps)
+            {require(step>previous && step<=physical_protocol.steps(),"bounded session: checkpoint cursor order");previous=step;}
+        }
+        require(equation_version==1 && material_path_version==1 && transfer_version==1 && compensation_version==1 &&
+            floating_point_profile==1 && physical_stream_schema==schema && mode==1 && (schema==2 || normal_base_steps==16),
             "bounded session: incompatible algorithm version");
         require(rotation<=1 && azimuths>=8 && azimuths<=16 && std::isfinite(cap_width) && cap_width>0 && cap_width<.5,
             "bounded session: scene profile");
@@ -142,7 +180,7 @@ struct BoundedSessionCandidate
     BoundedArchiveBody body;
     BoundedSessionContract contract;
     BoundedPhysicalOutputCursor output;
-    uint64_t accepted_boundary=1,next_phase=0;
+    uint64_t accepted_boundary=1,next_phase=0,accepted_tick=0;
 
     template<class Registry>void registerCheckpoint(Registry &cp)
     {
@@ -151,6 +189,7 @@ struct BoundedSessionCandidate
         auto o=cp.scope("output");output.registerCheckpoint(o);
         auto algorithm=cp.scope("accepted_algorithm");algorithm.addScalar("NoInflightTrial",accepted_boundary);
         algorithm.addScalar("NextPhase",next_phase);
+        if(contract.schema==2)algorithm.addScalar("AcceptedTick",accepted_tick);
     }
     void validateCandidate(const canonical_archive::Digest &external_trusted_contract)const
     {
@@ -163,14 +202,25 @@ struct BoundedSessionCandidate
         for(size_t i=0;i<3;++i)for(size_t j=0;j<3;++j)
             require(sameBits(body.frame(i,j),expected_frame(i,j)),"bounded session: rotation/frame mismatch");
         require(body.surface.reference.size()==7*contract.azimuths+2,"bounded session: azimuth count mismatch");
-        const auto &state=body.accepted.gel;const auto &protocol=contract.protocol;
-        require(accepted_boundary==1 && state.steps<=protocol.steps(),"bounded session: accepted-only boundary");
+        const auto &state=body.accepted.gel;
+        require(accepted_boundary==1 && state.steps<=contract.steps(),"bounded session: accepted-only boundary");
         Real time=0,last_dt=0;
-        for(size_t k=0;k<state.steps;++k)
+        if(contract.schema==1)
         {
-            const auto interval=protocol.interval(k,time);last_dt=interval.actual_dt;time=interval.new_time;
+            // Original v1 binary clock arithmetic and byte schema unchanged.
+            for(size_t k=0;k<state.steps;++k)
+            {
+                const auto interval=contract.protocol.interval(k,time);last_dt=interval.actual_dt;time=interval.new_time;
+            }
         }
-        const uint64_t phase=state.steps==protocol.steps()?3:(state.steps<16?0:(state.steps<24?1:2));
+        else
+        {
+            const auto &p=contract.physical_protocol;
+            require(accepted_tick==p.tickAtStep(state.steps),"bounded session: accepted rational tick/history mismatch");
+            time=p.timeAtStep(state.steps);
+            if(state.steps)last_dt=p.interval(state.steps-1,p.timeAtStep(state.steps-1)).actual_dt;
+        }
+        const uint64_t phase=contract.phaseAtStep(state.steps);
         require(next_phase==phase && sameBits(state.time,time) && sameBits(state.last_dt,last_dt),
             "bounded session: exact accepted protocol clock");
         require(output.schema==1 && output.records==state.steps+1 && output.last_step==state.steps &&

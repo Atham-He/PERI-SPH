@@ -96,10 +96,11 @@ class Inspector:
         self.ids=header['plate_ids'];self.cache={}
     def close(self,actual,wanted,scale=D(1)):
         self.maximum=max(self.maximum,close_tree(actual,wanted,scale))
+    def expected_end_time(self):return dec(self.case['dt'])*self.case['steps']
     def initial(self):
         c=self.case;h=self.h;old=h['initial_state'];ref=self.ref;n=33
         self.close(h['parameters'],c['parameters']);assert h['mode']==c['mode'] and h['steps_requested']==c['steps']
-        self.close(h['nominal_dt'],c['dt']);self.close(h['end_time'],dec(c['dt'])*c['steps']);self.close(h['stroke'],c['stroke'])
+        self.close(h['nominal_dt'],c['dt']);self.close(h['end_time'],self.expected_end_time());self.close(h['stroke'],c['stroke'])
         q=[row.copy() for row in ref['position']]
         if c['mode']==0:
             f=list(map(dec,c['initial_affine']));dq=list(map(dec,c['local_perturbation']))

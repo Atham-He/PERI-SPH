@@ -88,7 +88,7 @@ class FrictionInspector(Inspector):
         assert header['normalization_impulse_scale']==mass*header['solver_velocity_scale']
         self.I=dec(header['normalization_impulse_scale'])
         self.E=max(self.I*dec(header['solver_velocity_scale']),sum(self.ref['volume'],D(0))*max(map(dec,header['parameters'][:2])))
-        assert header['format']==1 and header['actual_PD_body']
+        assert header['actual_PD_body']
         assert header['physical_mass']==[header['rho0']*v for v in header['reference']['volume']]
         assert header['primal_dofs']==99 and header['contact_count']==len(header['plate_ids'])
         assert header['unknowns']==99+3*len(header['plate_ids'])
@@ -96,12 +96,7 @@ class FrictionInspector(Inspector):
         expected_frame=[0,-1,0,1,0,0,0,0,1] if case['rotation'] else [1,0,0,0,1,0,0,0,1]
         expected_tangent=[[0,1,0],[0,0,1]] if case['rotation'] else [[1,0,0],[0,0,1]]
         self.close(header['frame'],expected_frame);self.close(header['plate_tangent'],expected_tangent)
-        assert header['protocol_kind']==case['protocol_kind'] and header['phase_step_counts']==[16,8,16]
-        self.close(header['phase_end_times'],[16*case['dt'],24*case['dt'],40*case['dt']])
-        if case['protocol_kind']==2:
-            assert header['tangent_cycle_cursor']=='independent_C1_early_cycle_then_zero'
-            assert header['tangent_cycle_factors']==[0,1,-1,0]
-            self.close(header['tangent_cycle_end_times'],[k*case['dt'] for k in [2,6,8]])
+        self.validate_protocol_header(case,header)
         self.close(header['mu'],case['mu']);self.close(header['tangent_stroke'],case['tangent_stroke'])
         assert header['wall_velocity_cursor']==CURSOR
         assert header['geometry_cursor']=='minimum_over_each_linear_particle_and_true_prescribed_cubic_wall_interval'
@@ -112,6 +107,17 @@ class FrictionInspector(Inspector):
             Maxwell_loss=D(0),normal_loss=D(0),friction_loss=D(0),algorithmic_loss=D(0),
             positive_input_work=D(0),minimum_observed_gap=D('Infinity'),
             nonzero_tangent0_rows=0,nonzero_tangent1_rows=0)
+
+    def validate_protocol_header(self,case,header):
+        assert header['format']==1
+        assert header['protocol_kind']==case['protocol_kind'] and header['phase_step_counts']==[16,8,16]
+        self.close(header['phase_end_times'],[16*case['dt'],24*case['dt'],40*case['dt']])
+        if case['protocol_kind']==2:
+            assert header['tangent_cycle_cursor']=='independent_C1_early_cycle_then_zero'
+            assert header['tangent_cycle_factors']==[0,1,-1,0]
+            self.close(header['tangent_cycle_end_times'],[k*case['dt'] for k in [2,6,8]])
+
+    def expected_protocol(self,step,time):return protocol(self.case,step,time)
 
     def initial(self):
         old,z,loss=super().initial();history=self.h['initial_friction_history'];m=len(self.ids)
@@ -124,7 +130,7 @@ class FrictionInspector(Inspector):
         return old,z,loss,history
 
     def interval(self,interval,old):
-        k=old['step'];expected=protocol(self.case,k,old['time'])
+        k=old['step'];expected=self.expected_protocol(k,old['time'])
         for field in ['phase','step','old_time','new_time','actual_dt']:
             assert interval[field]==expected[field],('original_clock',field)
         for field in ['old_offset','new_offset','normal_cubic','old_tangent_displacement','new_tangent_displacement']:
@@ -275,14 +281,14 @@ class FrictionInspector(Inspector):
         return new,[x['viscous'] for x in reference['points']],[x['total_dissipation'] for x in reference['points']],hnew
 
 
-def inspect_stream(case,path,code,full=False,capture=None):
+def inspect_stream(case,path,code,full=False,capture=None,inspector_type=None):
     with localcontext() as ctx:
         ctx.prec=95
         assert code==case.get('expected_code',0)==0,(case['name'],'return_code',code)
         with open(path,encoding='utf8') as stream:
             meta=json.loads(next(stream));h=json.loads(next(stream))
             assert meta['type']=='identity' and h['type']=='header'
-            audit=FrictionInspector(case,h,full);audit.capture=capture
+            audit=(FrictionInspector if inspector_type is None else inspector_type)(case,h,full);audit.capture=capture
             old,z,loss,history=audit.initial();count=0;end=None
             for line in stream:
                 row=json.loads(line)

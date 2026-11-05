@@ -75,8 +75,10 @@ class BoundedAcceptedWriter
     {
         using namespace canonical_archive;using namespace bounded_session_detail;
         const auto &old=*owner.candidate_;running.requireFor(old.contract);old.validateCandidate(trusted);
+        require(record.schema==old.contract.physical_stream_schema,"accepted writer: explicit record version");
         record.body.validateStored();bounded_mechanical_detail::validateStatic(record.body,old.contract);
-        BoundedMechanicalRecord previous;previous.body=old.body;
+        BoundedMechanicalRecord previous;previous.body=old.body;previous.schema=old.contract.physical_stream_schema;
+        if(old.contract.schema==2){previous.accepted_tick=old.accepted_tick;previous.time_denominator=old.contract.physical_protocol.physical.denominator;}
         bounded_mechanical_detail::validateAdjacent(previous,record,old.contract);
         const auto encoded=encodeBoundedMechanicalRecord(record);Prepared prepared;
         appendU64(prepared.frame,encoded.size());prepared.frame.insert(prepared.frame.end(),encoded.begin(),encoded.end());
@@ -86,7 +88,8 @@ class BoundedAcceptedWriter
         next.body=record.body;next.output.records=old.output.records+1;next.output.bytes=old.output.bytes+prepared.frame.size();
         next.output.last_step=record.body.accepted.gel.steps;next.output.last_time=record.body.accepted.gel.time;
         const auto step=next.body.accepted.gel.steps;
-        next.next_phase=step==next.contract.protocol.steps()?3:(step<16?0:(step<24?1:2));
+        next.next_phase=next.contract.phaseAtStep(step);
+        if(next.contract.schema==2)next.accepted_tick=record.accepted_tick;
         prepared.before=bounded_generation_detail::regular(owner.working_->get(),maximum_output_prefix);
         require(uint64_t(prepared.before.st_size)==old.output.bytes,"accepted writer: exact committed working length");
         Sha256Stream original_hash,combined_hash;std::array<uint8_t,65536> buffer{};uint64_t offset=0;

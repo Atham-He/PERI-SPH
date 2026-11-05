@@ -8,7 +8,20 @@ target_link_libraries(extra_3d_PD_material_tests PRIVATE sphinxsys_3d GTest::gte
 set_target_properties(extra_3d_PD_material_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin")
 add_test(NAME extra_3d_PD_material_tests COMMAND extra_3d_PD_material_tests)
 set_tests_properties(extra_3d_PD_material_tests PROPERTIES TIMEOUT 30 LABELS peri_fast)
+add_executable(extra_3d_PD_model_config_tests model_config_tests.cpp)
+target_link_libraries(extra_3d_PD_model_config_tests PRIVATE sphinxsys_3d GTest::gtest_main)
+set_target_properties(extra_3d_PD_model_config_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin")
+add_test(NAME extra_3d_PD_model_config_tests COMMAND extra_3d_PD_model_config_tests)
+set_tests_properties(extra_3d_PD_model_config_tests PROPERTIES TIMEOUT 30 LABELS peri_fast)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME peri_model_config_cli COMMAND ${Python3_EXECUTABLE}
+    "${SPHINXSYS_PROJECT_DIR}/tools/peri_model_config_check.py"
+    --capsule $<TARGET_FILE:extra_3d_PD_capsule_compression>
+    --gel $<TARGET_FILE:extra_3d_PD_gel_compression>)
+set_tests_properties(peri_model_config_cli PROPERTIES TIMEOUT 60 LABELS peri_fast)
+add_test(NAME peri_gel_preflight_profiles COMMAND ${Python3_EXECUTABLE} -m unittest discover
+    -s "${SPHINXSYS_PROJECT_DIR}/tools" -p "test_peri_gel_preflight_profiles.py" -v)
+set_tests_properties(peri_gel_preflight_profiles PROPERTIES TIMEOUT 10 LABELS peri_fast)
 add_test(NAME peri_analysis_unit_tests COMMAND ${Python3_EXECUTABLE} -m unittest discover -s "${SPHINXSYS_PROJECT_DIR}/tools" -p "test_peri_*.py" -v)
 set_tests_properties(peri_analysis_unit_tests PROPERTIES TIMEOUT 20 LABELS peri_fast)
 add_executable(extra_3d_PD_normal_contact_probe normal_contact_probe.cpp)

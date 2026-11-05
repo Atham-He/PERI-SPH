@@ -8,6 +8,24 @@ import subprocess
 import tempfile
 
 
+def validate_limits(model):
+    """Recognize declared profiles, never accept an arbitrary enlarged budget.
+    The 8192 profile already exists in execution_limits.h; legacy R8/1000
+    evidence and its immutable executables retain their original scope.
+    """
+    profile = model.get('execution_profile')
+    if profile is None:
+        expected = 1000
+    elif profile == 'solid-particle-spatial-v1':
+        expected = 8192
+        if model.get('max_steps') != 98304 or model.get('max_threads') != 8:
+            raise ValueError('bounded execution limits changed')
+    else:
+        raise ValueError('unknown bounded execution profile')
+    if model['max_particles'] != expected or not 1 <= model['default_threads'] <= 8:
+        raise ValueError('bounded execution limits changed')
+
+
 def inspect(executable):
     executable = Path(executable).resolve(strict=True)
     checks = []
@@ -24,8 +42,7 @@ def inspect(executable):
         model = json.loads(description.stdout)
         if model['model'] != 'solid_sphere_no_separate_liquid' or model['calibrated']:
             raise ValueError('incorrect model identity or calibration claim')
-        if model['max_particles'] != 1000 or model['default_threads'] > 8:
-            raise ValueError('bounded execution limits changed')
+        validate_limits(model)
         checks.append('model_description_without_particle_allocation')
 
         rejected = invoke('--describe-model', '--pd-threads', '9')
@@ -36,7 +53,8 @@ def inspect(executable):
         invalid = root / 'invalid.cfg'
         invalid.write_text('poisson_ratio=0.5\n')
         rejected = invoke('--describe-model', '--case-config', str(invalid))
-        if rejected.returncode == 0 or 'invalid particle' not in rejected.stderr:
+        if rejected.returncode == 0 or not any(token in rejected.stderr for token in
+                ['invalid particle', 'invalid PD material parameter']):
             raise ValueError('singular material was not rejected before allocation')
         checks.append('invalid_material_rejected_before_allocation')
 

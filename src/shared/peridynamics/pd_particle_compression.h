@@ -3,6 +3,7 @@
 #define PD_PARTICLE_COMPRESSION_H
 
 #include "pd_case_config.h"
+#include "pd_model_options.h"
 #include <algorithm>
 
 namespace SPH::peridynamics
@@ -20,19 +21,31 @@ struct ParticleCompressionOptions
         Real initial_gap = 0;
     } geometry;
 
-    struct Material
+    struct Material : PDMaterialOptions
     {
-        Real density = 1000;
-        Real youngs_modulus = 1e6;
-        Real poisson_ratio = 0.35;
         bool viscoplastic = false;
         bool viscoelastic = true;
-        Real relaxing_shear_ratio = 1;
-        Real relaxation_time = 1e-6;
-        Real yield_stress = 5e5;
-        Real hardening_modulus = 5e6;
-        Real plastic_viscosity = 500;
+        Material()
+        {
+            model = "legacy"; hardening_model = "legacy";
+            poisson_ratio = 0.35; relaxation_time = 1e-6;
+            yield_stress = 5e5; hardening_modulus = 5e6; plastic_viscosity = 500;
+        }
+        PDMaterialOptions resolved() const
+        {
+            PDMaterialOptions value = *this;
+            if (model == "legacy")
+            {
+                if (viscoplastic && viscoelastic)
+                    throw std::invalid_argument("legacy material flags conflict");
+                CaseParameters absent;
+                resolvePDMaterialInputs(value, absent, viscoelastic ? "viscoelastic" : (viscoplastic ? "viscoplastic" : "elastic"));
+            }
+            value.validate();
+            return value;
+        }
     } material;
+    PDFractureOptions fracture;
 
     struct Contact
     {
@@ -69,16 +82,10 @@ struct ParticleCompressionOptions
         inputs.bind("plate_half_width", geometry.plate_half_width);
         inputs.bind("plate_thickness", geometry.plate_thickness);
         inputs.bind("initial_gap", geometry.initial_gap);
-        inputs.bind("density", material.density);
-        inputs.bind("youngs_modulus", material.youngs_modulus);
-        inputs.bind("poisson_ratio", material.poisson_ratio);
+        material.bind(inputs);
+        fracture.bind(inputs);
         inputs.bind("viscoplastic", material.viscoplastic);
         inputs.bind("gel_viscoelastic", material.viscoelastic);
-        inputs.bind("relaxing_shear_ratio", material.relaxing_shear_ratio);
-        inputs.bind("relaxation_time", material.relaxation_time);
-        inputs.bind("yield_stress", material.yield_stress);
-        inputs.bind("hardening_modulus", material.hardening_modulus);
-        inputs.bind("plastic_viscosity", material.plastic_viscosity);
         inputs.bind("friction_mu", contact.friction_mu);
         inputs.bind("friction_velocity", contact.friction_velocity);
         inputs.bind("reference_surface_contact", contact.reference_surface);
@@ -97,8 +104,24 @@ struct ParticleCompressionOptions
         return inputs;
     }
 
+    void resolveModels(const CaseParameters &inputs)
+    {
+        if (material.viscoplastic && material.viscoelastic && !inputs.wasProvided("material_model"))
+            throw std::invalid_argument("legacy material flags conflict");
+        resolvePDMaterialInputs(material, inputs, material.viscoelastic ? "viscoelastic" :
+                                (material.viscoplastic ? "viscoplastic" : "elastic"));
+        const bool viscous = material.model == "viscoplastic", gel = material.isViscoelastic();
+        if ((inputs.wasProvided("viscoplastic") && material.viscoplastic != viscous) ||
+            (inputs.wasProvided("gel_viscoelastic") && material.viscoelastic != gel))
+            throw std::invalid_argument("material_model conflicts with legacy material flags");
+        material.viscoplastic = viscous; material.viscoelastic = gel;
+        fracture.validate(material);
+    }
+
     void validate() const
     {
+        const auto selected = material.resolved();
+        fracture.validate(selected);
         // Programmatic callers receive the same finite-value checks as the CLI.
         for (Real value : {geometry.radius, geometry.spacing, geometry.plate_half_width,
                            geometry.plate_thickness, geometry.initial_gap, material.density,
@@ -116,7 +139,7 @@ struct ParticleCompressionOptions
             geometry.initial_gap < 0 || material.density <= 0 || material.youngs_modulus <= 0 ||
             material.poisson_ratio <= -1 || material.poisson_ratio >= 0.5 ||
             material.yield_stress <= 0 || material.hardening_modulus < 0 || material.plastic_viscosity < 0 ||
-            (material.viscoplastic && material.viscoelastic) || material.relaxing_shear_ratio < 0 || material.relaxation_time <= 0 ||
+            material.relaxing_shear_ratio < 0 || material.relaxation_time <= 0 ||
             contact.friction_mu < 0 || contact.friction_velocity <= 0 || loading.speed <= 0 ||
             contact.surface_support <= 0 || contact.penalty_length <= 0 ||
             contact.surface_rings < 4 || contact.surface_rings > 256 || contact.surface_azimuths < 8 || contact.surface_azimuths > 256 ||

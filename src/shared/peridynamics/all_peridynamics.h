@@ -23,5 +23,6 @@
 #include "pd_gel_material.h"
 #include "pd_gel_dynamics.h"
 #include "nosbpd_dynamics.h"
+#include "pd_model_assembly.h"
 
 #endif // ALL_PERIDYNAMICS_H

@@ -6,6 +6,7 @@
 #include <functional>
 #include <iomanip>
 #include <map>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -24,7 +25,7 @@ class CaseParameters
             if (end != s.size() || !std::isfinite(parsed)) throw std::invalid_argument("expected finite number");
             value = parsed;
         };
-        getters_[key] = [&value]() { return value; };
+        getters_[key] = [&value]() { return number(value); };
     }
     void bind(const std::string &key, int &value)
     {
@@ -34,7 +35,7 @@ class CaseParameters
             if (end != s.size()) throw std::invalid_argument("expected integer");
             value = parsed;
         };
-        getters_[key] = [&value]() { return Real(value); };
+        getters_[key] = [&value]() { return number(Real(value)); };
     }
     void bind(const std::string &key, bool &value)
     {
@@ -44,10 +45,37 @@ class CaseParameters
             else if (s == "false" || s == "0") value = false;
             else throw std::invalid_argument("expected true or false");
         };
-        getters_[key] = [&value]() { return Real(value); };
+        getters_[key] = [&value]() { return number(Real(value)); };
+    }
+    void bind(const std::string &key, std::string &value)
+    {
+        setters_[key] = [&value](const std::string &s)
+        {
+            if (s.empty() || s.find_first_of("\r\n#=") != std::string::npos)
+                throw std::invalid_argument("expected nonempty single-line value");
+            value = s;
+        };
+        getters_[key] = [&value]() { return value; };
+    }
+    /** Input compatibility alias; serialization retains both names. A file may
+     * contain both only if their normalized values agree, independent of order. */
+    void bindAlias(const std::string &alias, const std::string &canonical)
+    {
+        if (!setters_.count(canonical) || setters_.count(alias))
+            throw std::logic_error("case alias requires a bound canonical key and a new alias");
+        setters_[alias] = setters_.at(canonical);
+        getters_[alias] = getters_.at(canonical);
+        aliases_[alias] = canonicalKey(canonical);
+    }
+    bool wasProvided(const std::string &key) const
+    {
+        for (const auto &name : provided_)
+            if (canonicalKey(name) == canonicalKey(key)) return true;
+        return false;
     }
     void parse(int &argc, char **argv)
     {
+        provided_.clear();
         std::string file; int output = 1;
         for (int i = 1; i < argc; ++i)
         {
@@ -69,6 +97,7 @@ class CaseParameters
         std::ifstream input(file);
         if (!input) throw std::invalid_argument("cannot open case configuration: " + file);
         std::map<std::string, bool> seen;
+        std::map<std::string, std::string> assigned;
         std::string line; size_t number = 0;
         while (std::getline(input, line))
         {
@@ -80,7 +109,15 @@ class CaseParameters
             if (!setters_.count(key)) throw std::invalid_argument("unknown case parameter: " + key);
             if (seen[key]) throw std::invalid_argument("duplicate case parameter: " + key);
             seen[key] = true;
-            try { setters_.at(key)(value); }
+            try
+            {
+                setters_.at(key)(value);
+                const auto canonical = canonicalKey(key), normalized = getters_.at(key)();
+                if (assigned.count(canonical) && assigned.at(canonical) != normalized)
+                    throw std::invalid_argument("conflicting aliases for " + canonical);
+                assigned[canonical] = normalized;
+                provided_.insert(key);
+            }
             catch (const std::exception &e) { throw std::invalid_argument(key + ": " + e.what()); }
         }
     }
@@ -97,6 +134,15 @@ class CaseParameters
     }
 
   private:
+    static std::string number(Real value)
+    {
+        std::ostringstream output; output << std::setprecision(17) << value; return output.str();
+    }
+    std::string canonicalKey(const std::string &key) const
+    {
+        const auto found = aliases_.find(key);
+        return found == aliases_.end() ? key : found->second;
+    }
     static std::string trim(const std::string &s)
     {
         size_t first = s.find_first_not_of(" \t\r\n");
@@ -104,7 +150,9 @@ class CaseParameters
         return s.substr(first, s.find_last_not_of(" \t\r\n") - first + 1);
     }
     std::map<std::string, std::function<void(const std::string &)>> setters_;
-    std::map<std::string, std::function<Real()>> getters_;
+    std::map<std::string, std::function<std::string()>> getters_;
+    std::map<std::string, std::string> aliases_;
+    std::set<std::string> provided_;
 };
 }
 #endif

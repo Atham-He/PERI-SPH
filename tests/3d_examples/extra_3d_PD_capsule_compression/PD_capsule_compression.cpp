@@ -15,11 +15,21 @@
 
 using namespace SPH;
 
+peridynamics::PDMaterialOptions material_options = []
+{
+    peridynamics::PDMaterialOptions m;
+    m.model = "legacy"; m.hardening_model = "legacy";
+    m.youngs_modulus = 1e7; m.poisson_ratio = 0.4;
+    m.yield_stress = 5e5; m.hardening_modulus = 5e6; m.plastic_viscosity = 500;
+    return m;
+}();
+peridynamics::PDFractureOptions fracture_options = []
+{ peridynamics::PDFractureOptions f; f.model = "legacy"; return f; }();
 Real capsule_radius_out = 0.5e-3, shell_thickness = 0.02e-3, shell_layers = 3;
 Real plate_radius = 0.75e-3, plate_thickness = 0.06e-3, initial_gap = 1e-5;
-Real rho0_shell = 1000, youngs_shell = 1e7, poisson_shell = 0.4;
-Real max_tension_stress = 1e5, yield_stress_shell = 5e5, hardening_shell = 5e6;
-Real viscosity_shell = 500, critical_plastic_strain = 1;
+Real &rho0_shell = material_options.density, &youngs_shell = material_options.youngs_modulus, &poisson_shell = material_options.poisson_ratio;
+Real &max_tension_stress = fracture_options.stress_limit, &yield_stress_shell = material_options.yield_stress, &hardening_shell = material_options.hardening_modulus;
+Real &viscosity_shell = material_options.plastic_viscosity, &critical_plastic_strain = fracture_options.plastic_strain_limit;
 Real plate_friction_mu = 0.3, plate_friction_veps = 0.005;
 Real rho0_f = 935, c_f = 25, mu_f = 0.25, fluid_spacing_ratio = 1.5;
 Real gravity_g = 9.8, compression_speed = 0.1, compression_distance = 0.58e-3;
@@ -53,11 +63,15 @@ class PlateShape : public ComplexShape
 static peridynamics::CaseParameters parameters()
 {
     peridynamics::CaseParameters p;
+    material_options.bind(p); fracture_options.bind(p);
+    for (const auto &names : {std::pair{"rho0_shell", "density"}, {"youngs_shell", "youngs_modulus"},
+             {"poisson_shell", "poisson_ratio"}, {"yield_stress_shell", "yield_stress"},
+             {"hardening_shell", "hardening_modulus"}, {"viscosity_shell", "plastic_viscosity"},
+             {"max_tension_stress", "fracture_stress"}, {"critical_plastic_strain", "fracture_plastic_strain"}})
+        p.bindAlias(names.first, names.second);
 #define BIND(x) p.bind(#x, x)
     BIND(capsule_radius_out); BIND(shell_thickness); BIND(shell_layers);
     BIND(plate_radius); BIND(plate_thickness); BIND(initial_gap);
-    BIND(rho0_shell); BIND(youngs_shell); BIND(poisson_shell); BIND(max_tension_stress);
-    BIND(yield_stress_shell); BIND(hardening_shell); BIND(viscosity_shell); BIND(critical_plastic_strain);
     BIND(plate_friction_mu); BIND(plate_friction_veps); BIND(rho0_f); BIND(c_f); BIND(mu_f);
     BIND(fluid_spacing_ratio); BIND(gravity_g); BIND(compression_speed); BIND(compression_distance);
     BIND(pd_pressure_acceleration_factor); BIND(pd_horizon); BIND(analytic_plate_contact); BIND(reinitialize_density); BIND(U_ref); BIND(pd_cfl); BIND(acoustic_cfl); BIND(acoustic_damping_factor);
@@ -65,6 +79,22 @@ static peridynamics::CaseParameters parameters()
     BIND(max_pd_substeps); BIND(output_frames); BIND(diagnostic_frames); BIND(bond_check_interval); BIND(inject_nan_step);
 #undef BIND
     return p;
+}
+
+static void resolveModels(const peridynamics::CaseParameters &config)
+{
+    const bool old_viscoplastic = shell_viscoplastic;
+    const bool legacy_material = material_options.model == "legacy";
+    peridynamics::resolvePDMaterialInputs(material_options, config, old_viscoplastic ? "viscoplastic" : "elastic");
+    if (config.wasProvided("shell_viscoplastic") && old_viscoplastic != (material_options.model == "viscoplastic"))
+        throw std::invalid_argument("material_model conflicts with legacy shell_viscoplastic flag");
+    shell_viscoplastic = material_options.model == "viscoplastic";
+    if (fracture_options.model == "legacy")
+        fracture_options.model = config.wasProvided("material_model") && !legacy_material ? "none" :
+            (old_viscoplastic ? "principal_plastic_strain" : "principal_stress");
+    fracture_options.validate(material_options);
+    if (material_options.isViscoelastic())
+        throw std::invalid_argument("this liquid-shell driver has no staged viscoelastic/FSI history integration; use a supporting driver");
 }
 
 static void validateParameters()
@@ -107,10 +137,12 @@ static Vecd sumVector(SPHBody &body, const std::string &name)
 int main(int argc, char **argv)
 {
     auto config = parameters();peridynamics::CheckpointOptions checkpoint_options;
-    try {checkpoint_options.parse(argc,argv);config.parse(argc, argv); validateParameters();}
+    try {checkpoint_options.parse(argc,argv);config.parse(argc, argv); resolveModels(config); validateParameters();}
     catch (const std::exception &e) {std::cerr << e.what() << std::endl; return 2;}
     if(checkpoint_options.describe_only)
-    {std::cout << "{\"format\":1,\"full_pd_state\":true,\"default_threads\":" << checkpoint_options.threads << "}\n";return 0;}
+    {std::cout << "{\"format\":1,\"full_pd_state\":true,\"default_threads\":" << checkpoint_options.threads
+        << ",\"material_model\":\"" << material_options.model << "\",\"hardening_model\":\"" << material_options.hardening_model
+        << "\",\"fracture_model\":\"" << fracture_options.model << "\"}\n";return 0;}
     Real extent = 6 * capsule_radius_out;
     peridynamics::CheckpointOutputGuard output_guard(!checkpoint_options.resume.empty());
     SPHSystem system(BoundingBoxd(Vecd(-extent, -extent, -extent), Vecd(extent, 2 * extent, extent)), resolution_ref, checkpoint_options.threads);
@@ -131,9 +163,7 @@ int main(int argc, char **argv)
     liquid.generateParticles<peridynamics::CheckpointParticles, Lattice>();
     PDBody shell(system, makeShared<CapsuleShellShape>("CapsuleShell"));
     shell.defineAdaptationRatios(0.5 * pd_horizon / resolution_ref);
-    if (shell_viscoplastic)
-        shell.defineMatterMaterial<ViscoPlasticSolidforPD>(rho0_shell, youngs_shell, poisson_shell, yield_stress_shell, viscosity_shell, hardening_shell);
-    else shell.defineMatterMaterial<HughesWingetSolid>(rho0_shell, youngs_shell, poisson_shell);
+    peridynamics::definePDMaterial(shell, material_options);
     shell.generateParticles<peridynamics::CheckpointParticles, Lattice>();
     SolidBody lower(system, makeShared<PlateShape>("LowerPlate", 0.5 * plate_thickness));
     lower.defineAdaptationRatios(1.3, 1.0 / 3.0);
@@ -188,17 +218,8 @@ int main(int argc, char **argv)
     box_contact.addBox("UpperPlate", Vecd(0, upper_plate_bottom + 0.5 * plate_thickness, 0), plate_half_size);
     InteractionWithUpdate<solid_dynamics::NosbPDShapeMatrix> shape_matrix(shell_inner);
     SimpleDynamics<solid_dynamics::NosbPDFirstStep> first(shell);
-    UniquePtr<BaseDynamics<void>> second, fracture;
-    if (shell_viscoplastic)
-    {
-        second = makeUnique<InteractionWithUpdate<solid_dynamics::NosbPDSecondStepPlastic>>(shell_inner);
-        fracture = makeUnique<InteractionDynamics<solid_dynamics::BondBreakByPlasticStrain>>(shell_inner, critical_plastic_strain);
-    }
-    else
-    {
-        second = makeUnique<InteractionWithUpdate<solid_dynamics::NosbPDSecondStep>>(shell_inner);
-        fracture = makeUnique<InteractionDynamics<solid_dynamics::BondBreakByPrinStress>>(shell_inner, max_tension_stress);
-    }
+    auto constitutive = peridynamics::makePDConstitutiveDynamics(shell_inner);
+    auto fracture = peridynamics::makePDFracture(shell_inner, material_options, fracture_options);
     InteractionDynamics<solid_dynamics::LittleWoodHourGlassControl> hourglass(shell_inner, hourglass_coefficient, hourglass_damage_cutoff);
     InteractionDynamics<solid_dynamics::PairNumericalDampingforPD> pd_damping(shell_inner);
     InteractionDynamics<solid_dynamics::NosbPDThirdStep> third(shell_inner);
@@ -217,7 +238,7 @@ int main(int argc, char **argv)
     for (const auto &name : {"Mass", "Density", "Pressure", "VolumetricMeasure"}) liquid.getBaseParticles().addVariableToWrite<Real>(name);
     for (const auto &name : {"Velocity", "AverageVelocity", "AverageAcceleration", "PDAcceleration", "PDAccelerationPrior"}) shell.getBaseParticles().addVariableToWrite<Vecd>(name);
     for (const auto &name : {"PDStress", "DeformationGradient"}) shell.getBaseParticles().addVariableToWrite<Matd>(name);
-    if (shell_viscoplastic)
+    if (material_options.isPlastic())
     {
         shell.getBaseParticles().addVariableToWrite<Matd>("PlasticStrain");
         shell.getBaseParticles().addVariableToWrite<Real>("IsotropicHardeningParam");
@@ -274,7 +295,7 @@ int main(int argc, char **argv)
     };
     auto flush_outputs=[&](){diagnostics.flush();reaction.flush();budget.flush();mass_record.flush();progress.flush();
         if(!diagnostics || !reaction || !budget || !mass_record || !progress) throw std::runtime_error("cannot flush diagnostic outputs");};
-    std::string checkpoint_identity=config.serialize()+"\nrecording="+std::to_string(system.StateRecording())+
+    std::string checkpoint_identity="pd-model-config-v1\n"+config.serialize()+"\nrecording="+std::to_string(system.StateRecording())+
         "\nexecutable="+std::to_string(peridynamics::checkpoint_detail::fileHash(std::filesystem::canonical(argv[0])));
     peridynamics::DiskCheckpoint checkpoint(checkpoint_options.directory,checkpoint_identity);
     for(SPHBody *body:{static_cast<SPHBody*>(&shell),static_cast<SPHBody*>(&liquid),static_cast<SPHBody*>(&lower),static_cast<SPHBody*>(&upper)})
@@ -556,8 +577,8 @@ int main(int argc, char **argv)
                         Real ds = peridynamics::boundedTimeStep(shell_step.exec(), {dt - elapsed});
                         first.exec(ds);
                         if (analytic_plate_contact) apply_contact(time + elapsed + 0.5 * ds);
-                        second->exec(ds);
-                        if (pd_count % size_t(bond_check_interval) == 0) fracture->exec(ds);
+                        constitutive.force->exec(ds);
+                        if (fracture && pd_count % size_t(bond_check_interval) == 0) fracture->exec(ds);
                         hourglass.exec(ds); pd_damping.exec(ds); third.exec(ds); fourth.exec(ds);
                         shell_check.exec(); ++pd_count;
                         elapsed = ds == dt - elapsed ? dt : elapsed + ds;

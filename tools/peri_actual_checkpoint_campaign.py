@@ -7,6 +7,34 @@ import argparse,hashlib,json,math,os,resource,shutil,signal,subprocess,sys,time,
 from pathlib import Path
 
 
+def require_tail_qualification(name,review,normal_anchor=None):
+    """Validate the named physical scope, not only a success label.
+
+    This imports a completed review without solving/reviewing it again. In
+    particular, zero-mu needs the explicit same-discrete-model normal limit.
+    The future1% trajectory-loss target is deliberately NOT a new S3 gate.
+    """
+    expected={'actual_PD_strict_stick_hold_release':(40,116),'same114sample_zero_mu':(16,228)}
+    assert name in expected,'unknown prerequisite scope'
+    assert review['status']=='never_attempted_original_tail_independently_passed'
+    assert review['backend_selected_before_reference_imports'] is True and review['physical_solver_calls']==0
+    assert review['original_failed_study_unchanged'] is True
+    q=review['assessment'];steps,rows=expected[name]
+    assert q['name']==name and q['accepted_steps']==steps and q['all_trial_point_tangents_checked'] is True
+    assert 0<=q['maximum_normalized_error']<=1e-10
+    assert q['independent_trial_material_points']>0
+    geometry=q['geometry'];assert geometry['nodes']==33 and geometry['physical_DOF']==99 and geometry['normal_rows']==rows
+    assert geometry['exact_rigidity_rank']==93 and q['independent_stability']['rigid_modes']==6
+    if name=='actual_PD_strict_stick_hold_release':
+        assert q['observations']['strict_stick_rows']>0 and q['observations']['previously_active_separation_rows']>0
+    else:
+        comparison=review['normal_limit_comparison']
+        assert comparison['status']=='new_zero_mu_same114sample_normal_limit_passed' and comparison['steps']==16
+        assert 0<=comparison['maximum_normalized_error']<=1e-10
+        assert comparison['old_solver_dispatched'] is False and comparison['old_review_repeated'] is False
+        assert normal_anchor is not None and comparison['old_qualified_review_imported']==normal_anchor['review']
+
+
 def prepare(root):
     repo=Path(__file__).resolve().parents[1];sys.path.insert(0,str(repo/'tools'))
     from peri_elastic_normal import read,record,verify,save,reserves,stamp
@@ -24,10 +52,12 @@ def prepare(root):
     for name in ['peri_actual_checkpoint_negative.py','peri_actual_checkpoint_support.py','peri_canonical_archive_audit.py','peri_bounded_session_archive_audit.py','peri_bounded_mechanical_stream_audit.py']:
         assert record(repo/'tools'/name)['sha256']==record(semantic/'frozen'/name)['sha256'],'semantic component changed;new preflight required'
     terminal=read(tail/'terminal.json');assert terminal['status']=='two_original_never_attempted_friction_tails_independently_qualified' and terminal['failure'] is None
-    prerequisites=[record(tail/'terminal.json'),record(tail/'plan.json')]
+    tail_plan=read(tail/'plan.json');normal_anchor=tail_plan['normal_anchor']
+    normal_records=[normal_anchor[k] for k in ['review','stdout','stderr']];verify(normal_records)
+    prerequisites=[record(tail/'terminal.json'),record(tail/'plan.json')]+normal_records
     for name in ['actual_PD_strict_stick_hold_release','same114sample_zero_mu']:
-        review=read(tail/(name+'.independent_review.json'));assert review['status']=='never_attempted_original_tail_independently_passed'
-        assert review['assessment']['all_trial_point_tangents_checked'];verify([review['attempt'],review['plan']])
+        review=read(tail/(name+'.independent_review.json'));require_tail_qualification(name,review,normal_anchor)
+        verify([review['attempt'],review['plan']])
         attempt=read(tail/(name+'.attempt.json'));verify([attempt['stdout'],attempt['stderr']])
         prerequisites += [record(tail/(name+'.independent_review.json')),review['attempt'],attempt['stdout'],attempt['stderr']]
     proof=read(producer/'independent_preflight.json');end=read(producer/'terminal.json');build=read(producer/'frozen_execution.json')['build']

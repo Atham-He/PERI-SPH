@@ -8,6 +8,17 @@ controller/reference/byte-helper/semantic-negative/runtime artifacts before
 the first physical command. Native producer source and wrapper source are
 separate identities. No old native input/state or passed raw review is retried.
 
+Admission checks the named physical scope in each prerequisite, not just its
+success label:33 nodes/99 coordinates, full trial-point tangents, original
+normalized1e-10 gate, and actual strict-stick/separation coverage. The zero-mu
+tail additionally requires its explicit16-step SAME114sample normal-limit
+comparison, matching imported qualified anchor, and no old native/review call.
+The original normal review/raw/stderr fingerprints become new campaign artifacts.
+Three new metadata-only regression tests reject missing/partial/mislabeled or
+out-of-tolerance comparisons; they do not rerun an old mathematical review.
+The future1% algorithmic-loss convergence requirement remains separate from S3
+admission and is not retroactively imposed on qualified coarse trajectories.
+
 The implemented positive sequence is continuous40, owned install/resave without
 advance at8/20/32, planned independent-initial split8, explicit resume8->40,
 and explicit old20->40 while retaining all actual later accepted files. Every

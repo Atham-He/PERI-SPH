@@ -19,7 +19,8 @@ def prepare(root):
     execution_component=verified_execution_component(base)
     semantic=base/'engineering-CP-semantic-validator';semantic_receipt=read(semantic/'engineering_receipt.json');semantic_terminal=read(semantic/'terminal.json')
     assert semantic_terminal['return_code']==0 and semantic_receipt['semantic_rejections']==16 and semantic_receipt['positive_binding_controls']==1
-    verify([semantic_terminal['receipt'],semantic_receipt['plan'],semantic_receipt['review']])
+    semantic_evidence=verified_semantic_component(semantic,semantic_receipt,semantic_terminal)
+    verify(semantic_evidence)
     for name in ['peri_actual_checkpoint_negative.py','peri_actual_checkpoint_support.py','peri_canonical_archive_audit.py','peri_bounded_session_archive_audit.py','peri_bounded_mechanical_stream_audit.py']:
         assert record(repo/'tools'/name)['sha256']==record(semantic/'frozen'/name)['sha256'],'semantic component changed;new preflight required'
     terminal=read(tail/'terminal.json');assert terminal['status']=='two_original_never_attempted_friction_tails_independently_qualified' and terminal['failure'] is None
@@ -39,8 +40,7 @@ def prepare(root):
     assert subprocess.check_output(['git','status','--porcelain'],cwd=repo,text=True)==''
     root.mkdir(mode=0o700);frozen=root/'frozen';reference=frozen/'reference';reference.mkdir(parents=True)
     artifacts=prerequisites+build['support']+build['source_snapshots']+native_inputs+[build['ELF'],record(producer/'independent_preflight.json'),record(producer/'terminal.json')]
-    artifacts += [execution_component['receipt'],execution_component['frozen_controller']]
-    artifacts += [record(semantic/'engineering_receipt.json'),record(semantic/'terminal.json'),semantic_receipt['plan'],semantic_receipt['review']]
+    artifacts += execution_component['immutable_evidence']+semantic_evidence
     for source in sorted((cross/'frozen/reference').glob('*.py')):
         target=reference/source.name;shutil.copy2(source,target);artifacts += [record(source),record(target)]
     for name in ['peri_actual_checkpoint_campaign.py','peri_actual_checkpoint_reference.py','peri_actual_checkpoint_support.py',
@@ -164,9 +164,28 @@ def verified_execution_component(base):
         imports=[ast.dump(x,include_attributes=False) for x in tree.body if isinstance(x,(ast.Import,ast.ImportFrom))]
         return ''.join(lines[cls.lineno-1:cls.end_lineno]),imports
     before=pieces(frozen);current=pieces(__file__);assert before==current,'guardian component changed;new preflight required'
+    evidence=[record(old/'terminal.json'),terminal['receipt'],receipt['plan']]
+    evidence += [x for x in plan['artifacts'] if not x['path'].startswith('/home/hezhy58/SPHinXsys/')]
+    for key in ['fast','reference_binding','controlled_failure','controlled_wall']:
+        evidence.append(receipt[key]);attempt=read(receipt[key]['path']);evidence += [attempt['stdout'],attempt['stderr']]
+    verify(evidence)
     return dict(status='exact_guardian_class_and_top_imports_match_previously_qualified_component',
         class_SHA256=hashlib.sha256(current[0].encode()).hexdigest(),receipt=record(old/'engineering_receipt.json'),frozen_controller=record(frozen),
-        control_count=5,old_preflight_not_repeated=True)
+        control_count=5,old_preflight_not_repeated=True,immutable_evidence=evidence)
+
+
+def verified_semantic_component(root,receipt,terminal):
+    """Import immutable source/attempt/raw evidence without repeating controls."""
+    from peri_elastic_normal import read,record,verify
+    evidence=[record(root/'terminal.json'),terminal['receipt'],receipt['plan'],receipt['review']]
+    verify(evidence);plan=read(receipt['plan']['path']);review=read(receipt['review']['path'])
+    assert review['semantic_rejections']==16 and review['positive_binding_controls']==1
+    assert review['accepted_step']==0 and not review['qualified_physical_nonzero_seed']
+    evidence += [x for x in plan['artifacts'] if not x['path'].startswith('/home/hezhy58/SPHinXsys/')]
+    for attempt_record in review['results']:
+        verify([attempt_record]);attempt=read(attempt_record['path'])
+        evidence += [attempt_record,attempt['stdout'],attempt['stderr']]
+    verify(evidence);return evidence
 
 
 def run(root):

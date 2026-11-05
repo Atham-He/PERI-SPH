@@ -17,6 +17,7 @@
 #define PD_MATERIALS_H
 
 #include "elastic_solid.h"
+#include "pd_hardening.h"
 
 namespace SPH
 {
@@ -93,14 +94,17 @@ class J2PlasticityforPD : public PlasticSolidforPD
   public:
     explicit J2PlasticityforPD(Real rho0, Real youngs_modulus, Real poisson_ratio, Real yield_stress,
                                Real isotropic_hardening_modulus = 0.0, Real kinematic_hardening_modulus = 0.0);
+    /** Explicit hardening; the scalar-modulus overload retains legacy saturation. */
+    J2PlasticityforPD(Real rho0, Real youngs_modulus, Real poisson_ratio, Real yield_stress,
+                     const PDIsotropicHardening &hardening, Real kinematic_hardening_modulus = 0.0);
     virtual ~J2PlasticityforPD() {};
 
     virtual Real YieldFunc(const Matd &stress, const Real &iso_q = 0.0, const Matd &kin_q = Matd::Zero()) override;
     inline Real IsoHardeningFunc(const Real &ISV1)
     {
-        Real exponent = exp(-index_kesi_ * ISV1);
-        return isotropic_hardening_modulus_ * ISV1 + (sigmaY_infinite_ - sigmaY_0_) * (1.0 - exponent);
+        return hardening_.value(ISV1);
     };
+    const PDIsotropicHardening &HardeningParameters() const { return hardening_; }
     inline Matd KinHardeningFunc(const Matd &ISV2) { return kinematic_hardening_modulus_ * ISV2; };
     virtual Matd PlasticConstitutiveRelation(const Matd &vel_grad, const Matd &stress_old,
                                              Matd &epsilon_p, size_t index_i, Real dt = 0.0) override;
@@ -110,7 +114,7 @@ class J2PlasticityforPD : public PlasticSolidforPD
      * Rate-independent J2: G + H_iso/3 + H_kin/2. Rate-dependent
      * extensions (e.g. Perzyna) add a viscosity term. */
     virtual Real J2FlowResistance(Real dt) const;
-    Real sigmaY_infinite_, sigmaY_0_, index_kesi_;
+    const PDIsotropicHardening hardening_;
 };
 
 /**
@@ -123,8 +127,8 @@ class J2PlasticityforPD : public PlasticSolidforPD
  * in the linear-hardening limit.
  * The model reduces to rate-independent J2 as viscosity -> 0 and to
  * purely elastic response as viscosity -> inf; the characteristic
- * overstress relaxation time is eta/(3G). Suitable for alginate-type
- * hydrogel shells with rate-dependent yielding.
+ * deviatoric overstress relaxation time is eta/(3G). Material applicability
+ * and parameter calibration require independent evidence.
  */
 class ViscoPlasticSolidforPD : public J2PlasticityforPD
 {
@@ -133,6 +137,9 @@ class ViscoPlasticSolidforPD : public J2PlasticityforPD
                                     Real yield_stress, Real viscosity,
                                     Real isotropic_hardening_modulus = 0.0,
                                     Real kinematic_hardening_modulus = 0.0);
+    ViscoPlasticSolidforPD(Real rho0, Real youngs_modulus, Real poisson_ratio,
+                          Real yield_stress, Real viscosity, const PDIsotropicHardening &hardening,
+                          Real kinematic_hardening_modulus = 0.0);
     virtual ~ViscoPlasticSolidforPD() {};
 
     Real Viscosity() { return viscosity_; };

@@ -182,9 +182,17 @@ void PlasticSolidforPD::initializeLocalParameters(BaseParticles *base_particles)
 J2PlasticityforPD::
     J2PlasticityforPD(Real rho0, Real youngs_modulus, Real poisson_ratio, Real yield_stress,
                       Real isotropic_hardening_modulus, Real kinematic_hardening_modulus)
+    : J2PlasticityforPD(rho0, youngs_modulus, poisson_ratio, yield_stress,
+                       PDIsotropicHardening::Legacy(yield_stress, isotropic_hardening_modulus),
+                       kinematic_hardening_modulus)
+{}
+//=================================================================================================//
+J2PlasticityforPD::
+    J2PlasticityforPD(Real rho0, Real youngs_modulus, Real poisson_ratio, Real yield_stress,
+                      const PDIsotropicHardening &hardening, Real kinematic_hardening_modulus)
     : PlasticSolidforPD(rho0, youngs_modulus, poisson_ratio, yield_stress,
-                        isotropic_hardening_modulus, kinematic_hardening_modulus),
-      sigmaY_infinite_(1.589 * yield_stress), sigmaY_0_(yield_stress), index_kesi_(16.93)
+                        hardening.linearModulus(), kinematic_hardening_modulus),
+      hardening_(hardening)
 {
     material_type_name_ = "J2PlasticityforPD";
 }
@@ -235,6 +243,8 @@ Matd J2PlasticityforPD::PlasticConstitutiveRelation(const Matd &G, const Matd &s
     if (trial_function > TinyReal)
     {
         /** plastic corrector */
+        // q(alpha) contains the complete isotropic law, including H*alpha.
+        // Remove that linear contribution here so it is counted exactly once.
         Real linear_resistance = 2.0 * J2FlowResistance(dt) - 2.0 * isotropic_hardening_modulus_ / 3.0;
         auto residual = [&](Real gamma)
         {
@@ -261,8 +271,17 @@ ViscoPlasticSolidforPD::
     ViscoPlasticSolidforPD(Real rho0, Real youngs_modulus, Real poisson_ratio,
                            Real yield_stress, Real viscosity,
                            Real isotropic_hardening_modulus, Real kinematic_hardening_modulus)
+    : ViscoPlasticSolidforPD(rho0, youngs_modulus, poisson_ratio, yield_stress, viscosity,
+                            PDIsotropicHardening::Legacy(yield_stress, isotropic_hardening_modulus),
+                            kinematic_hardening_modulus)
+{}
+//=================================================================================================//
+ViscoPlasticSolidforPD::
+    ViscoPlasticSolidforPD(Real rho0, Real youngs_modulus, Real poisson_ratio,
+                           Real yield_stress, Real viscosity, const PDIsotropicHardening &hardening,
+                           Real kinematic_hardening_modulus)
     : J2PlasticityforPD(rho0, youngs_modulus, poisson_ratio, yield_stress,
-                        isotropic_hardening_modulus, kinematic_hardening_modulus),
+                        hardening, kinematic_hardening_modulus),
       viscosity_(viscosity)
 {
     if (!std::isfinite(viscosity) || viscosity < 0.0)

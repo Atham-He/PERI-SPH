@@ -1,4 +1,5 @@
-/** All-solid SPH capsule demonstrator. SI units throughout; NOT experimentally calibrated.
+/** All-solid SPH capsule: fixed-input quasi-static cases and accelerated demos.
+ * SI units throughout; NOT experimentally calibrated.
  * Native SPH volume core and native SPH midsurface shell retain their own inertia.
  * A case-local affine-reproducing penalty tie transfers equal/opposite interface forces.
  */
@@ -21,13 +22,16 @@ namespace fs = std::filesystem;
 struct Options
 {
     bool coated = true, patch_test = false, rest_test = false, smoke_test = false;
+    bool quasistatic = false;
     Real diameter = 1e-3, thickness = 1e-5, spacing = 1e-4;
     Real core_E = 1e6, shell_E = 1e7, core_nu = 0.3, shell_nu = 0.3;
     Real core_rho = 1355, shell_rho = 1000;
     Real strain = 0.01, load_time = 3e-4, hold_time = 3e-4;
     Real contact_factor = 100, tie_factor = 20, cfl = 0.2, dt_scale = 1;
     Real drag = 0, yield_stress = 2e4, hardening = 0;
-    std::string material = "elastic", output = "run";
+    Real relaxation_damping = 0.002, force_tolerance = 0.05, balance_tolerance = 0.02, kinetic_tolerance = 1e-4;
+    size_t load_steps = 20, ramp_steps = 1000, max_stage_steps = 200000, threads = 1;
+    std::string material = "elastic", output = "run", input_file;
     size_t max_steps = 2000000;
 
     void parse(int ac, char **av)
@@ -42,7 +46,26 @@ struct Options
             if (a.substr(0, 2) != "--" || eq == std::string::npos)
                 throw std::invalid_argument("use --name=value or --patch-test");
             std::string key = a.substr(2, eq - 2), val = a.substr(eq + 1);
-            if (key == "case")
+            if (key == "config")
+            {
+                std::ifstream input(val);
+                if (!input) throw std::invalid_argument("cannot read config: " + val);
+                std::vector<std::string> words{"config"};
+                for (std::string line; std::getline(input, line); )
+                {
+                    line = line.substr(0, line.find('#'));
+                    size_t first = line.find_first_not_of(" \t\r"), last = line.find_last_not_of(" \t\r");
+                    if (first == std::string::npos) continue;
+                    line = line.substr(first, last - first + 1);
+                    if (line.substr(0, 7) == "config=") throw std::invalid_argument("nested configs unsupported");
+                    words.push_back("--" + line);
+                }
+                std::vector<char *> argv;
+                for (auto &word : words) argv.push_back(word.data());
+                parse(static_cast<int>(argv.size()), argv.data());
+                input_file = fs::absolute(val).string();
+            }
+            else if (key == "case")
             {
                 if (val != "bare" && val != "coated") throw std::invalid_argument("case must be bare or coated");
                 coated = val == "coated";
@@ -73,6 +96,20 @@ struct Options
                 else if (key == "drag") drag = x;
                 else if (key == "yield-stress") yield_stress = x;
                 else if (key == "hardening") hardening = x;
+                else if (key == "quasistatic")
+                { if (x != 0 && x != 1) throw std::invalid_argument("quasistatic must be 0 or 1"); quasistatic = x == 1; }
+                else if (key == "relaxation-damping") relaxation_damping = x;
+                else if (key == "force-tolerance") force_tolerance = x;
+                else if (key == "balance-tolerance") balance_tolerance = x;
+                else if (key == "kinetic-tolerance") kinetic_tolerance = x;
+                else if (key == "load-steps" || key == "ramp-steps" || key == "max-stage-steps" || key == "threads")
+                {
+                    if (x < 1 || x > 10000000 || std::floor(x) != x) throw std::invalid_argument("invalid integer: " + key);
+                    if (key == "load-steps") load_steps = static_cast<size_t>(x);
+                    else if (key == "ramp-steps") ramp_steps = static_cast<size_t>(x);
+                    else if (key == "max-stage-steps") max_stage_steps = static_cast<size_t>(x);
+                    else threads = static_cast<size_t>(x);
+                }
                 else if (key == "max-steps")
                 {
                     if (x < 1 || x > 1e8 || std::floor(x) != x) throw std::invalid_argument("invalid max-steps");
@@ -89,6 +126,10 @@ struct Options
             dt_scale <= 0 || dt_scale > 1 || drag < 0 || yield_stress <= 0 || hardening < 0)
             throw std::invalid_argument("parameters outside supported positive/small-strain ranges");
         if (material != "elastic" && material != "j2") throw std::invalid_argument("material must be elastic or j2");
+        if (relaxation_damping <= 0 || relaxation_damping > 0.1 || force_tolerance <= 0 || force_tolerance > .1 ||
+            balance_tolerance <= 0 || balance_tolerance > .05 || kinetic_tolerance <= 0 || kinetic_tolerance > .01 || threads > 16 ||
+            (quasistatic && (strain <= 0 || max_stage_steps <= ramp_steps || load_steps > 200 || drag != 0)))
+            throw std::invalid_argument("invalid quasi-static solver settings");
     }
 };
 
@@ -147,12 +188,13 @@ template <> class ParticleGenerator<SurfaceParticles, CapsuleShellGenerator> : p
 
 struct State
 {
+    SolidBody &body;
     size_t n;
     Vecd *x, *v, *prior, *force;
     Real *mass, *measure;
     Matd *F;
     StdVec<Vecd> x0;
-    explicit State(SolidBody &b)
+    explicit State(SolidBody &b) : body(b)
     {
         auto &p = b.getBaseParticles();
         n = p.TotalRealParticles();
@@ -322,7 +364,7 @@ int run(const Options &o)
         ~WorkingDirectory() { fs::current_path(previous); }
     } cwd(output_root / "runtime");
     Real R = o.diameter / 2, rc = o.coated ? R - o.thickness : R, rs = R - o.thickness / 2;
-    SPHSystem system(BoundingBoxd(Vecd::Constant(-2 * R), Vecd::Constant(2 * R)), o.spacing, 1);
+    SPHSystem system(BoundingBoxd(Vecd::Constant(-2 * R), Vecd::Constant(2 * R)), o.spacing, o.threads);
     if (!o.patch_test) IO::getEnvironment().resetOutputFolder((output_root / "vtp").string(), true);
     SolidBody core(system, makeShared<GeometricShapeBall>(Vecd::Zero(), rc, "Core"));
     core.defineAdaptationRatios(1.15, 1);
@@ -389,7 +431,9 @@ int run(const Options &o)
     }
     std::ofstream cfg(output_root / "parameters.txt");
     if (!cfg) throw std::runtime_error("cannot write parameters");
-    cfg << std::setprecision(17) << "status=DEMONSTRATION_NOT_CALIBRATED\nunits=SI\ncase=" << (s ? "coated" : "bare")
+    if (!o.input_file.empty()) fs::copy_file(o.input_file, output_root / "input.cfg");
+    cfg << std::setprecision(17) << "status=" << (o.quasistatic ? "CONFIGURED_ASSUMPTION_CASE_NOT_CALIBRATED" : "DEMONSTRATION_NOT_CALIBRATED")
+        << "\nunits=SI\ncase=" << (s ? "coated" : "bare")
         << "\nsource_sha256=" << CAPSULE_SOURCE_SHA256
         << "\ncore_material=" << o.material << "\nshell_material=" << (s ? "elastic_plane_stress" : "none")
         << "\ninterface=" << (s ? "affine_penalty_tie" : "none") << '\n'
@@ -397,23 +441,57 @@ int run(const Options &o)
         << "\ncore_E=" << o.core_E << "\ncore_nu=" << o.core_nu << "\ncore_density=" << o.core_rho
         << "\nshell_E=" << o.shell_E << "\nshell_nu=" << o.shell_nu << "\nshell_density=" << o.shell_rho
         << "\nyield_stress=" << o.yield_stress << "\nhardening=" << o.hardening
-        << "\nload_time=" << o.load_time << "\nhold_time=" << o.hold_time << "\nstrain=" << o.strain
-        << "\nmaximum_plate_speed=" << 0.5 * Pi * o.strain * o.diameter / o.load_time
+        << (o.quasistatic ? "\nunused_dynamic_load_time=" : "\nload_time=") << o.load_time
+        << (o.quasistatic ? "\nunused_dynamic_hold_time=" : "\nhold_time=") << o.hold_time << "\nstrain=" << o.strain
+        << (o.quasistatic ? "\nunused_dynamic_maximum_plate_speed=" : "\nmaximum_plate_speed=")
+        << 0.5 * Pi * o.strain * o.diameter / o.load_time
         << "\npaper_plate_speed=1e-6\ncontact_factor=" << o.contact_factor << "\ntie_factor=" << o.tie_factor
         << "\ncfl=" << o.cfl << "\ndt_scale=" << o.dt_scale << "\ndrag=" << o.drag
         << "\ncore_particles=" << c.n << "\nshell_particles=" << (s ? s->n : 0)
         << "\ncore_mass=" << c.totalMass() << "\nshell_mass=" << (s ? s->totalMass() : 0)
         << "\ncontact_surface_offset=" << surface_offset
+        << "\nquasistatic=" << o.quasistatic << "\nload_steps=" << o.load_steps << "\nramp_steps=" << o.ramp_steps
+        << "\nmax_stage_steps=" << o.max_stage_steps << "\nrelaxation_damping_per_step=" << o.relaxation_damping
+        << "\nforce_tolerance=" << o.force_tolerance << "\nbalance_tolerance=" << o.balance_tolerance
+        << "\nkinetic_tolerance=" << o.kinetic_tolerance << "\nthreads=" << o.threads
+        << "\ntime_interpretation=" << (o.quasistatic ? "numerical_relaxation_time_not_experimental_time" : "accelerated_dynamic_time")
+        << "\nplate_frame=" << (o.quasistatic ? "centered_static_equivalent_fixed_lower_z_equals_centered_z_minus_compression_over_2" : "fixed_lower_plate")
         << "\ncontact_dt_limit=" << contact.stable_dt << "\ntie_dt_limit=" << (tie ? tie->stable_dt : 0) << '\n';
+    cfg.flush();
     std::ofstream csv(output_root / "history.csv");
     if (!csv) throw std::runtime_error("cannot write history");
-    csv << "step,time_s,dt_s,compression_m,upper_N,lower_N,kinetic_J,core_elastic_J,tie_J,contact_J,max_tie_gap_m,max_penetration_m,min_J,interface_force_residual,interface_power_residual_W,external_work_J,drag_loss_J,max_plastic_alpha\n";
+    csv << "step," << (o.quasistatic ? "relaxation_time_s" : "time_s")
+        << ",dt_s,compression_m,upper_N,lower_N,kinetic_J,core_elastic_J,tie_J,contact_J,max_tie_gap_m,max_penetration_m,min_J,interface_force_residual,interface_power_residual_W,external_work_J,drag_loss_J,max_plastic_alpha\n";
     csv << std::setprecision(17);
     Real &time = *system.getSystemVariableDataByName<Real>("PhysicalTime");
     Real end = o.load_time + o.hold_time, next_csv = 0, next_vtp = 0, work = 0, drag_loss = 0;
     Real worst_J = 1, largest_gap = 0, largest_penetration = 0, max_force = 0;
     size_t step = 0, frame = 0;
+    size_t stage = 1, stage_step = 0, consecutive_balanced = 0;
+    std::ofstream equilibria;
+    if (o.quasistatic)
+    {
+        equilibria.open(output_root / "equilibria.csv");
+        if (!equilibria) throw std::runtime_error("cannot write equilibria");
+        equilibria << std::setprecision(17)
+                   << "load_step,relaxation_steps,compression_m,strain,experimental_displacement_time_s,upper_N,lower_N,force_residual,plate_imbalance,kinetic_ratio,max_tie_gap_m,min_J,max_plastic_alpha\n";
+    }
     auto compression = [&](Real t) { return 0.5 * o.strain * o.diameter * (1 - std::cos(Pi * std::min(t / o.load_time, Real(1)))); };
+    auto step_compression = [&](Real increment)
+    {
+        if (!o.quasistatic) return compression(time + increment);
+        Real a = std::min((Real(stage_step) + increment) / o.ramp_steps, Real(1));
+        Real fraction = Real(stage - 1) + 0.5 * (1 - std::cos(Pi * a));
+        return o.strain * o.diameter * fraction / o.load_steps;
+    };
+    // No gravity, spherical antipodal geometry, bonded isotropic materials and
+    // frictionless equal planes: centered static loading is a rigid translation
+    // of the fixed-lower-plate equilibrium, without a slow rigid drift mode.
+    auto apply_contact = [&](Real delta)
+    {
+        Real center_shift = o.quasistatic ? 0.5 * delta : 0;
+        contact.apply(-R + center_shift, R - delta + center_shift, contact_depth);
+    };
     auto inspect = [&](State &a, Real &kinetic, Real &U, Real &minJ, bool volume_core)
     {
         for (size_t i = 0; i < a.n; ++i)
@@ -436,19 +514,19 @@ int run(const Options &o)
     {
         c.clearPrior(); if (s) s->clearPrior();
         if (tie) tie->apply();
-        Real delta = compression(time);
-        contact.apply(-R, R - delta, contact_depth);
+        Real delta = step_compression(0);
+        apply_contact(delta);
         Real kinetic = 0, core_U = 0, minJ = 1;
         inspect(c, kinetic, core_U, minJ, true); if (s) inspect(*s, kinetic, core_U, minJ, false);
         largest_gap = std::max(largest_gap, tie ? tie->max_gap : 0);
         largest_penetration = std::max(largest_penetration, contact.penetration);
         worst_J = std::min(worst_J, minJ); max_force = std::max(max_force, contact.upper);
-        if (time < end && end - time < 1e-12 * end) { time = end; continue; }
+        if (!o.quasistatic && time < end && end - time < 1e-12 * end) { time = end; continue; }
         Real dt = std::min(core_dt.exec(), contact.stable_dt);
         if (s) dt = std::min({dt, shell_dt->exec(), tie->stable_dt});
         if (o.drag > 0) dt = std::min(dt, Real(0.2) / o.drag);
-        dt = std::min(o.dt_scale * dt, end - time);
-        if (time >= next_csv || time >= end)
+        dt = o.quasistatic ? o.dt_scale * dt : std::min(o.dt_scale * dt, end - time);
+        if (time >= next_csv || (!o.quasistatic && time >= end))
         {
             Real max_alpha = plastic_alpha ? *std::max_element(plastic_alpha, plastic_alpha + c.n) : 0;
             csv << step << ',' << time << ',' << dt << ',' << delta << ',' << contact.upper << ',' << contact.lower << ','
@@ -457,40 +535,106 @@ int run(const Options &o)
                 << (tie ? tie->balance : 0) << ',' << (tie ? tie->power_residual : 0) << ',' << work << ',' << drag_loss << ',' << max_alpha << '\n';
             next_csv = time + end / 300;
         }
-        if (time >= next_vtp || time >= end)
+        if ((!o.quasistatic && (time >= next_vtp || time >= end)) || step == 0)
         {
             vtp.writeToFile(frame++); next_vtp = time + end / 10;
             std::cout << "step=" << step << " time=" << time << " upper=" << contact.upper << " lower=" << contact.lower
                       << " gap=" << (tie ? tie->max_gap : 0) << " minJ=" << minJ << std::endl;
         }
-        if (time >= end) break;
+        if (!o.quasistatic && time >= end) break;
+        if (o.quasistatic && stage_step > o.ramp_steps && stage_step % 200 == 0)
+        {
+            Real sum_force2 = 0, rotational_kinetic = 0;
+            for (size_t i = 0; i < c.n; ++i) sum_force2 += (c.force[i] + c.prior[i]).squaredNorm();
+            if (s)
+            {
+                auto *omega = shell->getBaseParticles().getVariableDataByName<Vecd>("AngularVelocity");
+                auto *alpha = shell->getBaseParticles().getVariableDataByName<Vecd>("AngularAcceleration");
+                for (size_t i = 0; i < s->n; ++i)
+                {
+                    Real inertia = s->mass[i] * o.thickness * o.thickness / 12;
+                    rotational_kinetic += 0.5 * inertia * omega[i].squaredNorm();
+                    sum_force2 += (s->force[i] + s->prior[i]).squaredNorm() + std::pow(inertia / R, 2) * alpha[i].squaredNorm();
+                }
+            }
+            Real mean_force = 0.5 * (contact.upper + contact.lower);
+            Real residual = std::sqrt(sum_force2) / std::max(mean_force, Real(1e-20));
+            Real imbalance = std::abs(contact.upper - contact.lower) / std::max(mean_force, Real(1e-20));
+            Real kinetic_ratio = (kinetic + rotational_kinetic) / std::max(mean_force * delta, Real(1e-30));
+            bool balanced = mean_force > 1e-10 && residual <= o.force_tolerance &&
+                            imbalance <= o.balance_tolerance && kinetic_ratio <= o.kinetic_tolerance;
+            consecutive_balanced = balanced ? consecutive_balanced + 1 : 0;
+            if (stage_step % 10000 == 0)
+                std::cout << "load=" << stage << " relax=" << stage_step << " residual=" << residual
+                          << " imbalance=" << imbalance << " kinetic=" << kinetic_ratio << std::endl;
+            if (consecutive_balanced >= 3)
+            {
+                Real max_alpha = plastic_alpha ? *std::max_element(plastic_alpha, plastic_alpha + c.n) : 0;
+                equilibria << stage << ',' << stage_step << ',' << delta << ',' << delta / o.diameter << ',' << delta / 1e-6 << ','
+                           << contact.upper << ',' << contact.lower << ',' << residual << ',' << imbalance << ',' << kinetic_ratio << ','
+                           << (tie ? tie->max_gap : 0) << ',' << minJ << ',' << max_alpha << '\n';
+                equilibria.flush();
+                vtp.writeToFile(frame++);
+                std::cout << "ACCEPTED load=" << stage << '/' << o.load_steps << " strain=" << delta / o.diameter
+                          << " force=" << mean_force << " residual=" << residual << " imbalance=" << imbalance << std::endl;
+                if (stage == o.load_steps) break;
+                ++stage; stage_step = 0; consecutive_balanced = 0;
+                continue;
+            }
+            if (stage_step >= o.max_stage_steps) throw std::runtime_error("load step did not converge; no complete-case result written");
+        }
         if (step >= o.max_steps || !std::isfinite(dt) || dt < 1e-15) throw std::runtime_error("time step/step-count guard");
         // Split the native first-half operators at the SAME midpoint for both
         // bodies. Lagging penalty forces by a half drift injects interface energy.
         auto initialize = [&](auto &method, State &a)
-        { for (size_t i = 0; i < a.n; ++i) method.initialization(i, dt); };
+        { particle_for(execution::ParallelPolicy(), a.body.LoopRange(), [&](size_t i) { method.initialization(i, dt); }); };
         auto interact = [&](auto &method, State &a)
-        { for (size_t i = 0; i < a.n; ++i) method.interaction(i, dt); };
+        { particle_for(execution::ParallelPolicy(), a.body.LoopRange(), [&](size_t i) { method.interaction(i, dt); }); };
         auto update = [&](auto &method, State &a)
-        { for (size_t i = 0; i < a.n; ++i) method.update(i, dt); };
+        { particle_for(execution::ParallelPolicy(), a.body.LoopRange(), [&](size_t i) { method.update(i, dt); }); };
         if (plastic_first) initialize(*plastic_first, c); else initialize(elastic_first, c);
-        if (shell_first) initialize(*shell_first, *s);
+        // Native shell initialization writes a shared numerical damping matrix.
+        // Keep this portion serial; core and shell interactions remain parallel.
+        if (shell_first)
+            for (size_t i = 0; i < s->n; ++i) shell_first->initialization(i, dt);
         c.clearPrior(); if (s) s->clearPrior();
         if (tie) tie->apply();
-        contact.apply(-R, R - compression(time + 0.5 * dt), contact_depth);
+        apply_contact(step_compression(o.quasistatic ? Real(0.5) : 0.5 * dt));
         if (o.drag > 0)
         {
             auto damp = [&](State &a) { for (size_t i = 0; i < a.n; ++i) a.prior[i] -= o.drag * a.mass[i] * a.v[i]; };
             damp(c); if (s) damp(*s);
             drag_loss += 2 * o.drag * kinetic * dt;
         }
-        work += contact.upper * (compression(time + dt) - delta);
+        work += (o.quasistatic ? 0.5 * (contact.upper + contact.lower) : contact.upper) *
+                (step_compression(o.quasistatic ? Real(1) : dt) - delta);
         if (plastic_first) interact(*plastic_first, c); else interact(elastic_first, c);
         if (shell_first) interact(*shell_first, *s);
         if (plastic_first) update(*plastic_first, c); else update(elastic_first, c);
         if (shell_first) update(*shell_first, *s);
+        if (o.quasistatic)
+        {
+            Real factor = std::exp(-o.relaxation_damping), before = 0, after = 0;
+            auto damp_velocity = [&](State &a)
+            {
+                for (size_t i = 0; i < a.n; ++i)
+                { before += 0.5 * a.mass[i] * a.v[i].squaredNorm(); a.v[i] *= factor; after += 0.5 * a.mass[i] * a.v[i].squaredNorm(); }
+            };
+            damp_velocity(c); if (s) damp_velocity(*s);
+            if (s)
+            {
+                auto *omega = shell->getBaseParticles().getVariableDataByName<Vecd>("AngularVelocity");
+                for (size_t i = 0; i < s->n; ++i)
+                {
+                    Real inertia = s->mass[i] * o.thickness * o.thickness / 12;
+                    before += 0.5 * inertia * omega[i].squaredNorm(); omega[i] *= factor;
+                    after += 0.5 * inertia * omega[i].squaredNorm();
+                }
+            }
+            drag_loss += before - after;
+        }
         core_second.exec(dt); if (shell_second) shell_second->exec(dt);
-        time = std::min(end, time + dt); ++step;
+        time = o.quasistatic ? time + dt : std::min(end, time + dt); ++step; ++stage_step;
     }
     if (o.rest_test && (max_force > 1e-8 * o.core_E * o.diameter * o.diameter ||
                         worst_J < 1 - 1e-6 || largest_gap > 1e-6 * o.spacing))
@@ -499,9 +643,13 @@ int run(const Options &o)
         throw std::runtime_error("loaded solid-shell smoke regression failed");
     std::ofstream summary(output_root / "summary.json");
     if (!summary) throw std::runtime_error("cannot write summary");
-    summary << std::setprecision(17) << "{\n  \"status\": \"COMPLETED_DEMONSTRATION\",\n  \"steps\": " << step
+    summary << std::setprecision(17) << "{\n  \"status\": \"" << (o.quasistatic ? "COMPLETED_CONFIGURED_QUASISTATIC_CASE" : "COMPLETED_DEMONSTRATION")
+            << "\",\n  \"steps\": " << step
+            << ",\n  \"equilibrated_load_steps\": " << (o.quasistatic ? stage : 0)
+            << ",\n  \"time_is_numerical_relaxation\": " << (o.quasistatic ? "true" : "false")
             << ",\n  \"source_sha256\": \"" << CAPSULE_SOURCE_SHA256 << "\""
-            << ",\n  \"final_time_s\": " << time << ",\n  \"min_J\": " << worst_J << ",\n  \"max_upper_N\": " << max_force
+            << (o.quasistatic ? ",\n  \"numerical_relaxation_time_s\": " : ",\n  \"final_time_s\": ")
+            << time << ",\n  \"min_J\": " << worst_J << ",\n  \"max_upper_N\": " << max_force
             << ",\n  \"max_tie_gap_m\": " << largest_gap << ",\n  \"max_penetration_m\": " << largest_penetration
             << ",\n  \"experimental_calibration\": false,\n  \"shell_energy_and_rotational_energy_audited\": false\n}\n";
     return 0;

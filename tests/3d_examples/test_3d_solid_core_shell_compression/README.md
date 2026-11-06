@@ -1,5 +1,37 @@
 # All-solid SPH core-shell compression
 
+## Configured whole-capsule calculation
+
+The fixed-input first case is `configs/EC0SS_1mm_first_case.cfg`. It selects the
+rate-independent J2 elastic-perfectly-plastic core and elastic plane-stress shell,
+not an elastic-only trial. Paper geometry and assumed material values are marked
+separately in the file. Run the complete 0--5% compression case with:
+
+```sh
+../all-sph-build/capsule/test_3d_solid_core_shell_compression \
+  --config=tests/3d_examples/test_3d_solid_core_shell_compression/configs/EC0SS_1mm_first_case.cfg \
+  --output=/absolute/path/whole-capsule-01
+```
+
+Each of 20 displacement levels must converge, with three successive checks of
+nodal-force residual, plate imbalance and total kinetic energy (including shell
+rotation). No success summary is written if a level fails to converge. The
+dynamic-relaxation clock is numerical, not experimental time. Both constitutive
+models are rate-independent; `equilibria.csv` also lists displacement divided by
+the paper speed 1 micrometer/s as an experimental reference coordinate.
+
+For this spherical, isotropic, gravity-free, frictionless problem the static
+solution is computed in a centered frame to eliminate a slow rigid translation.
+Convert to the fixed-lower-plate frame by `z_fixed = z_centered - displacement/2`.
+VTP files use the centered frame. This equivalence is for static equilibria, not
+for a physical dynamic test with an accelerating frame.
+
+The three milestones are fixed inputs/constitutive choices, completion of all
+equilibrium levels, and interpretation of the whole-case force/deformation data.
+Material identification, fracture and full spatial/contact convergence remain
+outside this first configured calculation. The earlier accelerated modes below
+remain available for development but are not run as additional small prototypes.
+
 This **uncalibrated demonstrator** uses a native SphinXsys volume-SPH core and
 native SphinXsys midsurface-SPH shell. No PD, liquid or fracture is involved.
 The two bodies retain separate masses and native stress integration. A reference

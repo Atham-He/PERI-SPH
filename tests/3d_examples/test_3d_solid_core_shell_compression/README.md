@@ -1,0 +1,111 @@
+# All-solid SPH core-shell compression
+
+This **uncalibrated demonstrator** uses a native SphinXsys volume-SPH core and
+native SphinXsys midsurface-SPH shell. No PD, liquid or fracture is involved.
+The two bodies retain separate masses and native stress integration. A reference
+MLS penalty tie, with affine reproduction and transpose force scatter, approximates
+a fully bonded interface. It is case-local and is not presented as an upstream
+validated core-shell implementation. Both normal and tangential displacement
+are tied; debonding and slip are unsupported.
+
+## Build in a separate directory
+
+From the repository root:
+
+```sh
+cmake -S solid_capsule -B ../all-sph-build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE=-O1
+cmake --build ../all-sph-build --target test_3d_solid_core_shell_compression -j2
+ctest --test-dir ../all-sph-build --output-on-failure
+```
+
+The ordinary root build also discovers this example when 3D examples are enabled.
+The dedicated entry avoids building unrelated examples. It does not alter the
+existing `peri` entry or the other chat's data. GCC 13 optimization encountered an
+internal compiler error at `-O3` in an existing library source on this workstation;
+`-O1` is used for the isolated validation build.
+The same compiler also ICEd in the existing CK `derived_solid_state.cpp`; the
+dedicated build entry compiles that one source at `-O0` for GCC 13 only.
+
+## First runs
+
+Use a **new or empty** absolute output directory each time; outputs are never erased.
+
+```sh
+EXE=../all-sph-build/capsule/test_3d_solid_core_shell_compression
+"$EXE" --case=bare --output=/absolute/path/bare
+"$EXE" --case=coated --output=/absolute/path/coated
+"$EXE" --case=bare --material=j2 --output=/absolute/path/bare-j2
+"$EXE" --patch-test
+```
+
+For a repeatable five-run check (elastic/J2 bare/coated, plus a half-step coated
+comparison), use a new output directory:
+
+```sh
+python3 tests/3d_examples/test_3d_solid_core_shell_compression/verify_runs.py \
+  --exe ../all-sph-build/capsule/test_3d_solid_core_shell_compression \
+  --output /absolute/path/verification
+```
+
+The verifier records source/executable hashes and confirms that the J2 histories
+actually evolve. Its completion is a runtime check, not quasi-static or experimental
+acceptance. The CTest suite covers affine interface force/torque/power, unloaded
+equilibrium, loaded integration and invalid input. Test outputs use new temporary
+directories so repeated CTest runs do not overwrite earlier evidence.
+
+All quantities are SI. Defaults: diameter 1 mm, shell thickness 10 micrometers,
+particle spacing 0.1 mm, core density 1355 kg/m3 (provisional paper reference),
+shell density 1000 kg/m3 (demonstration assumption), core E=1 MPa, shell E=10 MPa,
+both Poisson ratios 0.3. **Neither modulus is an identified material property.**
+The core radius is 0.49 mm in the coated case and 0.5 mm in the bare case; the
+shell midsurface radius is 0.495 mm. The samples are separate nominal geometries,
+not a claim of identical experimental pre-coating and post-coating cores.
+
+The default 1% compression uses a cosine ramp over 0.3 ms followed by a 0.3 ms
+hold. **This is accelerated numerical loading, not the paper's 1 micrometer/s
+test.** Both speeds are written in `parameters.txt`. No fitted experimental
+prediction or quasi-static qualification is claimed merely because a run completes.
+
+Useful options (all `--key=value`):
+
+- `case=bare|coated`, `material=elastic|j2` (core material only)
+- `diameter`, `thickness`, `spacing`
+- `core-E`, `shell-E`, `core-nu`, `shell-nu`, `core-density`, `shell-density`
+- `yield-stress` (default 20 kPa, demonstration only), `hardening` (default zero)
+- `strain`, `load-time`, `hold-time`, `dt-scale`, `cfl`
+- `contact-factor`, `tie-factor`, `drag` (artificial mass drag, default zero)
+- `max-steps`, `output`
+
+The time step is the minimum of the native core/shell acoustic limits, conservative
+interface stiffness limit and plane-contact stiffness limit. It is not a supplied
+fixed step. `dt-scale=0.5` halves this limit for a time-step comparison.
+
+## Outputs and interpretation
+
+- `parameters.txt`: all inputs and assumptions, actual masses, particle counts,
+  loading speed and stiffness-based time-step bounds.
+- `history.csv`: both plate reactions (positive compressive magnitudes), displacement,
+  translational kinetic energy, elastic core energy (only meaningful in elastic
+  mode), tie/contact energy, tie gap and penalty penetration, deformation determinant,
+  interface force/power residual, external work and optional drag loss.
+- `vtp/`: native core and shell snapshots for ParaView.
+- `summary.json`: completion status and extrema. A nonzero exit means failure;
+  no success summary is written after a caught exception.
+
+Shell strain/rotational energy and plastic dissipation are **not yet audited**.
+Consequently these columns do not constitute a complete system energy balance.
+The interface is compliant, not an exact kinematic constraint. Force/power patch
+checks do not replace penalty sensitivity, spatial convergence or experimental
+validation. The coarse core particle volume is normalized to the continuum sphere
+volume; the resulting boundary quadrature needs refinement studies before Hertz
+or material identification can be claimed. Core contact uses a reference offset
+from the outermost axial particle center to the specified sphere pole (half a
+spacing for the default lattice); shell contact uses a half-thickness offset.
+This is a discrete plane-penalty approximation, not an independently resolved
+continuum contact patch.
+
+The immediate milestone is a stable native all-SPH run with nonzero plate loading
+and demonstrably reciprocal interface forces. Subsequent qualification includes
+particle refinement, step/load/contact/tie sensitivity and the selected 0SS/EC0SS
+experimental comparison. Original pressure-fluid coupling is not reused.

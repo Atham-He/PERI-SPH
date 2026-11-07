@@ -135,6 +135,7 @@ struct Options
             dt_scale <= 0 || dt_scale > 1 || drag < 0 || yield_stress <= 0 || hardening < 0)
             throw std::invalid_argument("parameters outside supported positive/pre-fracture ranges (strain <= 0.15)");
         if (material != "elastic" && material != "j2" && material != "dpc") throw std::invalid_argument("material must be elastic, j2 or dpc");
+        if (constraint_E < 0) throw std::invalid_argument("constraint-E must be zero (use core E) or positive");
         if (material == "dpc")
         {
             auto model=dpc::Model::fromCSV(dpc_table,dpc_r0);auto p=model.parameters(dpc_r0);
@@ -770,7 +771,7 @@ int run(const Options &o)
         << "\ncore_E=" << o.core_E << "\ncore_nu=" << o.core_nu << "\ncore_density=" << o.core_rho
         << "\nshell_E=" << o.shell_E << "\nshell_nu=" << o.shell_nu << "\nshell_density=" << o.shell_rho
         << "\nconstraint_reference_E=" << (o.constraint_E > 0 ? o.constraint_E : o.core_E)
-        << "\nunused_for_dpc_yield_stress=" << o.yield_stress << "\nhardening=" << o.hardening
+        << (o.material == "dpc" ? "\nunused_for_dpc_yield_stress=" : "\nyield_stress=") << o.yield_stress << "\nhardening=" << o.hardening
         << (o.quasistatic ? "\nunused_dynamic_load_time=" : "\nload_time=") << o.load_time
         << (o.quasistatic ? "\nunused_dynamic_hold_time=" : "\nhold_time=") << o.hold_time << "\nstrain=" << o.strain
         << (o.quasistatic ? "\nunused_dynamic_maximum_plate_speed=" : "\nmaximum_plate_speed=")

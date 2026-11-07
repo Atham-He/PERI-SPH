@@ -44,6 +44,12 @@ class DruckerPragerCapSolid : public SaintVenantKirchhoffSolid
         elastic_energy_[i]=out.elastic_energy;yield_residual_[i]=out.yield_residual;active_surface_[i]=out.surface;
         const Matd invF=F.inverse();return F.determinant()*invF*out.sigma*invF.transpose();
     }
+    Matd StressCauchy(Matd &,size_t) override
+    { throw std::logic_error("DPC requires the total-deformation PK1/PK2 integration path; strain-only and shell adapters are unsupported"); }
+    Real VolumetricKirchhoff(Real) override
+    { throw std::logic_error("DPC must not use an elastic/isochoric decomposed stress integration path"); }
+    Matd DeviatoricKirchhoff(const Matd &) override
+    { throw std::logic_error("DPC must not use a separated elastic deviatoric stress update"); }
     Real acousticBound(Real J) const
     {
         Real maxmod=0;for(const auto &row:model_.nodes())

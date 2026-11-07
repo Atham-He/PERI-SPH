@@ -14,3 +14,11 @@ add_test(NAME solid_capsule_zero_load COMMAND test_3d_solid_core_shell_compressi
 add_test(NAME solid_capsule_loaded_smoke COMMAND test_3d_solid_core_shell_compression --smoke-test)
 add_test(NAME solid_capsule_invalid_input COMMAND test_3d_solid_core_shell_compression --diameter=-1)
 set_tests_properties(solid_capsule_invalid_input PROPERTIES WILL_FAIL TRUE)
+
+file(SHA256 "${SPHINXSYS_PROJECT_DIR}/src/shared/materials/drucker_prager_cap_kernel.h" DPC_KERNEL_SHA)
+file(SHA256 "${SPHINXSYS_PROJECT_DIR}/src/shared/materials/drucker_prager_cap_solid.h" DPC_ADAPTER_SHA)
+string(SHA256 DPC_MATERIAL_SHA "${DPC_KERNEL_SHA};${DPC_ADAPTER_SHA}")
+target_compile_definitions(test_3d_solid_core_shell_compression PRIVATE DPC_MATERIAL_SHA256="${DPC_MATERIAL_SHA}")
+add_executable(dpc_material_acceptance dpc_material_acceptance.cpp)
+target_link_libraries(dpc_material_acceptance PRIVATE sphinxsys_3d)
+add_test(NAME dpc_material_acceptance COMMAND dpc_material_acceptance "${CMAKE_CURRENT_SOURCE_DIR}/configs/mcc_mitra2016_reference.csv")

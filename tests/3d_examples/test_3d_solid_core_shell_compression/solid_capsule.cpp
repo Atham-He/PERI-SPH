@@ -4,6 +4,7 @@
  * A case-local affine-reproducing penalty tie transfers equal/opposite interface forces.
  */
 #include "sphinxsys.h"
+#include "drucker_prager_cap_solid.h"
 #include <Eigen/Cholesky>
 #include <Eigen/Geometry>
 #include <chrono>
@@ -33,6 +34,8 @@ struct Options
     size_t load_steps = 20, ramp_steps = 1000, max_stage_steps = 200000, threads = 1;
     std::string material = "elastic", output = "run", input_file, plate_contact = "legacy", interface_surface = "legacy_mid";
     size_t max_steps = 2000000;
+    std::string dpc_table;
+    Real dpc_r0 = 0, dpc_solid_density = 0, constraint_E = 0;
 
     void parse(int ac, char **av)
     {
@@ -71,6 +74,7 @@ struct Options
                 coated = val == "coated";
             }
             else if (key == "material") material = val;
+            else if (key == "dpc-table") dpc_table = fs::absolute(val).string();
             else if (key == "plate-contact") plate_contact = val;
             else if (key == "interface-surface") interface_surface = val;
             else if (key == "output") output = val;
@@ -79,7 +83,10 @@ struct Options
                 size_t used = 0;
                 Real x = std::stod(val, &used);
                 if (used != val.size() || !std::isfinite(x)) throw std::invalid_argument("non-finite/invalid number: " + key);
-                if (key == "diameter") diameter = x;
+                if (key == "dpc-r0") dpc_r0 = x;
+                else if (key == "dpc-solid-density") dpc_solid_density = x;
+                else if (key == "constraint-E") constraint_E = x;
+                else if (key == "diameter") diameter = x;
                 else if (key == "thickness") thickness = x;
                 else if (key == "spacing") spacing = x;
                 else if (key == "core-E") core_E = x;
@@ -127,7 +134,14 @@ struct Options
             contact_factor <= 0 || tie_factor <= 0 || cfl <= 0 || cfl > 0.3 ||
             dt_scale <= 0 || dt_scale > 1 || drag < 0 || yield_stress <= 0 || hardening < 0)
             throw std::invalid_argument("parameters outside supported positive/pre-fracture ranges (strain <= 0.15)");
-        if (material != "elastic" && material != "j2") throw std::invalid_argument("material must be elastic or j2");
+        if (material != "elastic" && material != "j2" && material != "dpc") throw std::invalid_argument("material must be elastic, j2 or dpc");
+        if (material == "dpc")
+        {
+            auto model=dpc::Model::fromCSV(dpc_table,dpc_r0);auto p=model.parameters(dpc_r0);
+            auto close=[](Real a,Real b){return std::abs(a-b)<=1e-9*std::max(Real(1),std::abs(b));};
+            if(dpc_solid_density<=0 || !close(core_rho,dpc_solid_density*dpc_r0) || !close(core_E,p.E) || !close(core_nu,p.nu))
+                throw std::invalid_argument("DPC initial E, nu and mass density must match table/r0/solid-density; no silent substitution");
+        }
         if (plate_contact != "legacy" && plate_contact != "outer_surface")
             throw std::invalid_argument("plate-contact must be legacy or outer_surface");
         if (interface_surface != "legacy_mid" && interface_surface != "inner")
@@ -642,7 +656,13 @@ int run(const Options &o)
     if (!o.patch_test) IO::getEnvironment().resetOutputFolder((output_root / "vtp").string(), true);
     SolidBody core(system, makeShared<GeometricShapeBall>(Vecd::Zero(), rc, "Core"));
     core.defineAdaptationRatios(1.15, 1);
-    if (o.material == "j2") core.defineMatterMaterial<HardeningPlasticSolid>(o.core_rho, o.core_E, o.core_nu, o.yield_stress, o.hardening);
+    DruckerPragerCapSolid *dpc_material=nullptr;
+    if (o.material == "dpc")
+    {
+        core.defineMatterMaterial<DruckerPragerCapSolid>(o.core_rho,dpc::Model::fromCSV(o.dpc_table,o.dpc_r0));
+        dpc_material=&DynamicCast<DruckerPragerCapSolid>(&core,core.getMatterMaterial());
+    }
+    else if (o.material == "j2") core.defineMatterMaterial<HardeningPlasticSolid>(o.core_rho, o.core_E, o.core_nu, o.yield_stress, o.hardening);
     else core.defineMatterMaterial<SaintVenantKirchhoffSolid>(o.core_rho, o.core_E, o.core_nu);
     core.generateParticles<BaseParticles, CapsuleCoreGenerator>(rc, o.spacing);
     InnerRelation core_inner(core);
@@ -679,7 +699,7 @@ int run(const Options &o)
     correction.exec();
     if (shell_correction) shell_correction->exec();
     std::unique_ptr<BondedInterface> tie;
-    if (s) tie = std::make_unique<BondedInterface>(c, *s, o.spacing, o.tie_factor * o.core_E / o.spacing,
+    if (s) tie = std::make_unique<BondedInterface>(c, *s, o.spacing, o.tie_factor * (o.constraint_E > 0 ? o.constraint_E : o.core_E) / o.spacing,
                                                  o.interface_surface == "inner", o.thickness, rc * rc / (rs * rs));
     if (o.patch_test) { tie->patchTest(o.spacing); return 0; }
     State &surface = s ? *s : c;
@@ -693,7 +713,7 @@ int run(const Options &o)
     }
     if (!s && o.plate_contact == "outer_surface") surface_offset = 0;
     PlaneContact contact(surface, surface_offset,
-                         o.contact_factor * o.core_E / o.spacing, contact_depth,
+                         o.contact_factor * (o.constraint_E > 0 ? o.constraint_E : o.core_E) / o.spacing, contact_depth,
                          o.plate_contact == "outer_surface", bool(s), R, o.thickness, o.spacing);
     BodyStatesRecordingToVtp vtp(system);
     core.getBaseParticles().addVariableToWrite<Vecd>("Velocity");
@@ -715,12 +735,30 @@ int run(const Options &o)
         plastic_alpha = core.getBaseParticles().getVariableDataByName<Real>("HardeningParameter");
         core.getBaseParticles().addVariableToWrite<Real>("HardeningParameter");
     }
+    std::ofstream material_history;
+    Real *dpc_r=nullptr,*dpc_kappa=nullptr,*dpc_work=nullptr,*dpc_residual=nullptr,*dpc_surface=nullptr;
+    std::vector<bool> ever_cap(c.n,false);
+    if(dpc_material)
+    {
+        auto &p=core.getBaseParticles();
+        dpc_r=p.getVariableDataByName<Real>("DPCRelativeDensity");dpc_kappa=p.getVariableDataByName<Real>("DPCPlasticCompaction");
+        dpc_work=p.getVariableDataByName<Real>("DPCPlasticStressWork");dpc_residual=p.getVariableDataByName<Real>("DPCYieldResidual");
+        dpc_surface=p.getVariableDataByName<Real>("DPCActiveSurface");
+        for(const std::string name:{"DPCRelativeDensity","DPCPlasticCompaction","DPCPlasticStressWork","DPCYieldResidual","DPCActiveSurface"})p.addVariableToWrite<Real>(name);
+        p.addVariableToWrite<Matd>("DPCCauchyStress");p.addVariableToWrite<Matd>("DPCInversePlasticMetric");
+        fs::copy_file(o.dpc_table,output_root/"dpc_density_table.csv");
+        material_history.open(output_root/"material_history.csv");
+        material_history<<std::setprecision(17)<<"load_step,strain,volume_ratio,min_relative_density,max_relative_density,min_kappa,max_kappa,ever_cap_particle_fraction,plastic_stress_work_J,max_yield_residual\n";
+    }
     std::ofstream cfg(output_root / "parameters.txt");
     if (!cfg) throw std::runtime_error("cannot write parameters");
     if (!o.input_file.empty()) fs::copy_file(o.input_file, output_root / "input.cfg");
     cfg << std::setprecision(17) << "status=" << (o.quasistatic ? "CONFIGURED_ASSUMPTION_CASE_NOT_CALIBRATED" : "DEMONSTRATION_NOT_CALIBRATED")
         << "\nunits=SI\ncase=" << (s ? "coated" : "bare")
         << "\nsource_sha256=" << CAPSULE_SOURCE_SHA256
+        << "\ndpc_material_sha256=" << DPC_MATERIAL_SHA256
+        << "\ndpc_r0=" << o.dpc_r0 << "\ndpc_solid_density=" << o.dpc_solid_density
+        << "\ndpc_flow=shifted_ellipse_c_equals_b_pa_Frenning2023\ndpc_reference_is_batch_calibrated=false"
         << "\ncore_material=" << o.material << "\nshell_material=" << (s ? "elastic_plane_stress" : "none")
         << "\ninterface=" << (s ? "affine_penalty_tie" : "none") << '\n'
         << "interface_surface=" << (s ? o.interface_surface : "none")
@@ -731,7 +769,8 @@ int run(const Options &o)
         << "diameter=" << o.diameter << "\nthickness=" << o.thickness << "\nspacing=" << o.spacing
         << "\ncore_E=" << o.core_E << "\ncore_nu=" << o.core_nu << "\ncore_density=" << o.core_rho
         << "\nshell_E=" << o.shell_E << "\nshell_nu=" << o.shell_nu << "\nshell_density=" << o.shell_rho
-        << "\nyield_stress=" << o.yield_stress << "\nhardening=" << o.hardening
+        << "\nconstraint_reference_E=" << (o.constraint_E > 0 ? o.constraint_E : o.core_E)
+        << "\nunused_for_dpc_yield_stress=" << o.yield_stress << "\nhardening=" << o.hardening
         << (o.quasistatic ? "\nunused_dynamic_load_time=" : "\nload_time=") << o.load_time
         << (o.quasistatic ? "\nunused_dynamic_hold_time=" : "\nhold_time=") << o.hold_time << "\nstrain=" << o.strain
         << (o.quasistatic ? "\nunused_dynamic_maximum_plate_speed=" : "\nmaximum_plate_speed=")
@@ -783,6 +822,7 @@ int run(const Options &o)
         Real center_shift = o.quasistatic ? 0.5 * delta : 0;
         contact.apply(-R + center_shift, R - delta + center_shift, contact_depth);
     };
+    Real dpc_dt_bound=std::numeric_limits<Real>::infinity();
     auto inspect = [&](State &a, Real &kinetic, Real &U, Real &minJ, bool volume_core)
     {
         for (size_t i = 0; i < a.n; ++i)
@@ -792,6 +832,11 @@ int run(const Options &o)
                 throw std::runtime_error("non-finite state or invalid deformation determinant");
             minJ = std::min(minJ, J);
             kinetic += 0.5 * a.mass[i] * a.v[i].squaredNorm();
+            if(volume_core && dpc_material)
+            {
+                dpc_dt_bound=std::min(dpc_dt_bound,o.cfl*1.15*o.spacing/(dpc_material->acousticBound(J)+a.v[i].norm()));
+                ever_cap[i]=ever_cap[i] || dpc_surface[i]==2;
+            }
             if (volume_core && o.material == "elastic")
             {
                 Matd e = 0.5 * (a.F[i].transpose() * a.F[i] - Matd::Identity());
@@ -808,12 +853,13 @@ int run(const Options &o)
         Real delta = step_compression(0);
         apply_contact(delta);
         Real kinetic = 0, core_U = 0, minJ = 1;
+        dpc_dt_bound=std::numeric_limits<Real>::infinity();
         inspect(c, kinetic, core_U, minJ, true); if (s) inspect(*s, kinetic, core_U, minJ, false);
         largest_gap = std::max(largest_gap, tie ? tie->max_gap : 0);
         largest_penetration = std::max(largest_penetration, contact.penetration);
         worst_J = std::min(worst_J, minJ); max_force = std::max(max_force, contact.upper);
         if (!o.quasistatic && time < end && end - time < 1e-12 * end) { time = end; continue; }
-        Real dt = std::min(core_dt.exec(), contact.stable_dt);
+        Real dt = std::min({core_dt.exec(), contact.stable_dt,dpc_dt_bound});
         if (s) dt = std::min({dt, shell_dt->exec(), tie->stable_dt});
         if (o.drag > 0) dt = std::min(dt, Real(0.2) / o.drag);
         dt = o.quasistatic ? o.dt_scale * dt : std::min(o.dt_scale * dt, end - time);
@@ -873,6 +919,15 @@ int run(const Options &o)
                            << (tie ? tie->max_gap : 0) << ',' << minJ << ',' << max_alpha << ',' << (tie ? tie->balance : 0)
                            << ',' << (tie ? tie->torque_residual : 0) << ',' << (tie ? tie->power_relative : 0) << '\n';
                 equilibria.flush();
+                if(dpc_material)
+                {
+                    Real V=0,V0=0,W=0,yr=0;size_t caps=0;
+                    for(size_t i=0;i<c.n;++i){V+=c.measure[i]*c.F[i].determinant();V0+=c.measure[i];W+=c.measure[i]*dpc_work[i];yr=std::max(yr,dpc_residual[i]);caps+=ever_cap[i];}
+                    material_history<<stage<<','<<delta/o.diameter<<','<<V/V0<<','
+                        <<*std::min_element(dpc_r,dpc_r+c.n)<<','<<*std::max_element(dpc_r,dpc_r+c.n)<<','
+                        <<*std::min_element(dpc_kappa,dpc_kappa+c.n)<<','<<*std::max_element(dpc_kappa,dpc_kappa+c.n)<<','
+                        <<Real(caps)/c.n<<','<<W<<','<<yr<<'\n';material_history.flush();
+                }
                 contact.writeSurface(output_root / "contact_surface", frame);
                 if (tie) tie->writeSurface(output_root / "interface_surface", frame);
                 vtp.writeToFile(frame++);

@@ -212,3 +212,21 @@ bare solve with the current executable and requires its entire force curve to
 match the previous verified curve within 1e-8 N before freezing and running the
 coated case. A changed bare path requires a fresh calibration. Proposal and
 previous-curve hashes are recorded; partial superseded coated runs are not used.
+
+## Inner-face bonded interface audit
+
+`interface-surface=inner` enforces the binding at x_mid-t*n/2, mapped to the core
+reference inner-face coordinates. Its potential is U=sum k|x_mid-t*n/2-W*x_core|^2/2.
+The shell receives f=-k*gap and the director load -t*f/2; the core receives -W^T*f.
+These give equal/opposite force, zero total torque, and body power plus dU/dt=0.
+The interface and outer-contact director loads use separate arrays and are summed
+before converting virtual work to angular acceleration; neither overwrites the other.
+The spherical inner reference-area ratio is supplied by the geometry setup, not
+fitted as a material constant. The stability estimate includes the shell director
+inertia and shared-core stencil coupling. `legacy_mid` retains the previous option.
+
+Initial and equilibrium `interface_surface/` snapshots expose both physical faces
+and the actual mapping gap. Summary and equilibrium files record interface force,
+torque and relative power residuals. Shell F, bending F, and midsurface Cauchy stress
+are exported for elastic-applicability checks; no damage or parameter fitting is
+introduced by those diagnostics. The material constitutive laws remain unchanged.

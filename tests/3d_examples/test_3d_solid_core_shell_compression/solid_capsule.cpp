@@ -31,7 +31,7 @@ struct Options
     Real drag = 0, yield_stress = 2e4, hardening = 0;
     Real relaxation_damping = 0.002, force_tolerance = 0.05, balance_tolerance = 0.02, kinetic_tolerance = 1e-4;
     size_t load_steps = 20, ramp_steps = 1000, max_stage_steps = 200000, threads = 1;
-    std::string material = "elastic", output = "run", input_file, plate_contact = "legacy";
+    std::string material = "elastic", output = "run", input_file, plate_contact = "legacy", interface_surface = "legacy_mid";
     size_t max_steps = 2000000;
 
     void parse(int ac, char **av)
@@ -72,6 +72,7 @@ struct Options
             }
             else if (key == "material") material = val;
             else if (key == "plate-contact") plate_contact = val;
+            else if (key == "interface-surface") interface_surface = val;
             else if (key == "output") output = val;
             else
             {
@@ -129,6 +130,8 @@ struct Options
         if (material != "elastic" && material != "j2") throw std::invalid_argument("material must be elastic or j2");
         if (plate_contact != "legacy" && plate_contact != "outer_surface")
             throw std::invalid_argument("plate-contact must be legacy or outer_surface");
+        if (interface_surface != "legacy_mid" && interface_surface != "inner")
+            throw std::invalid_argument("interface-surface must be legacy_mid or inner");
         if (relaxation_damping <= 0 || relaxation_damping > 0.1 || force_tolerance <= 0 || force_tolerance > .1 ||
             balance_tolerance <= 0 || balance_tolerance > .05 || kinetic_tolerance <= 0 || kinetic_tolerance > .01 || threads > 16 ||
             (quasistatic && (strain <= 0 || max_stage_steps <= ramp_steps || load_steps > 200 || drag != 0)))
@@ -238,20 +241,22 @@ DirectorJacobian directorJacobian(const Vecd &rotation)
  */
 class SurfaceLoadedShellFirst : public thin_structure_dynamics::ShellStressRelaxationFirstHalf
 {
-    Vecd *contact_director_force_;
+    Vecd *contact_director_force_, *interface_director_force_;
   public:
     explicit SurfaceLoadedShellFirst(BaseInnerRelation &inner)
         : ShellStressRelaxationFirstHalf(inner, 3, true),
-          contact_director_force_(particles_->registerStateVariableData<Vecd>("ContactDirectorForce")) {}
+          contact_director_force_(particles_->registerStateVariableData<Vecd>("ContactDirectorForce")),
+          interface_director_force_(particles_->registerStateVariableData<Vecd>("InterfaceDirectorForce")) {}
     void interaction(size_t i, Real dt = 0)
     {
         ShellStressRelaxationFirstHalf::interaction(i, dt);
-        if (contact_director_force_[i].squaredNorm() == 0) return;
+        Vecd director_force = contact_director_force_[i] + interface_director_force_[i];
+        if (director_force.squaredNorm() == 0) return;
         DirectorJacobian J = directorJacobian(rotation_[i]);
         Eigen::Matrix2d metric = J.transpose() * J;
         if (metric.determinant() < 1e-10) throw std::runtime_error("singular shell rotation coordinates");
         Real inertia = mass_[i] * thickness_[i] * thickness_[i] / 12;
-        Eigen::Vector2d Q = J.transpose() * (transformation_matrix0_[i] * contact_director_force_[i]);
+        Eigen::Vector2d Q = J.transpose() * (transformation_matrix0_[i] * director_force);
         Eigen::Vector2d extra_alpha = metric.ldlt().solve(Q) / inertia;
         dangular_vel_dt_[i][0] += extra_alpha[0]; dangular_vel_dt_[i][1] += extra_alpha[1];
         dpseudo_n_d2t_[i] += transformation_matrix0_[i].transpose() * (J * extra_alpha);
@@ -268,19 +273,37 @@ struct BondedInterface
     State &core, &shell;
     std::vector<Row> rows;
     Real stable_dt = std::numeric_limits<Real>::infinity(), max_gap = 0, energy = 0, balance = 0, power_residual = 0;
-    BondedInterface(State &c, State &s, Real dp, Real stiffness) : core(c), shell(s)
+    bool inner_surface;
+    Real thickness, length_scale, reference_area_ratio, affine_error = 0;
+    Real torque_residual = 0, power_relative = 0;
+    Real worst_balance = 0, worst_torque_residual = 0, worst_power_relative = 0;
+    Vecd *director, *initial_director, *director_force, *rotation, *omega;
+    Matd *transform;
+    StdVec<Vecd> reference_points, shell_points, mapped_points, forces;
+    BondedInterface(State &c, State &s, Real dp, Real stiffness, bool inner = false, Real h = 0, Real area_ratio = 1)
+        : core(c), shell(s), inner_surface(inner), thickness(h), length_scale(dp), reference_area_ratio(area_ratio)
     {
+        auto &p = s.body.getBaseParticles();
+        director = p.getVariableDataByName<Vecd>("PseudoNormal");
+        initial_director = p.getVariableDataByName<Vecd>("InitialNormalDirection");
+        director_force = p.getVariableDataByName<Vecd>("InterfaceDirectorForce");
+        rotation = p.getVariableDataByName<Vecd>("Rotation");
+        omega = p.getVariableDataByName<Vecd>("AngularVelocity");
+        transform = p.getVariableDataByName<Matd>("TransformationMatrix");
+        shell_points.resize(s.n); mapped_points.resize(s.n); forces.resize(s.n);
         std::vector<Real> rate_c(c.n, 0);
         Real max_rate = 0;
         for (size_t i = 0; i < s.n; ++i)
         {
+            Vecd target = s.x0[i] - (inner_surface ? 0.5 * thickness : 0) * initial_director[i];
+            reference_points.push_back(target);
             Row row;
             Eigen::Matrix4d moment = Eigen::Matrix4d::Zero();
             std::vector<Eigen::Vector4d> bases;
             std::vector<Real> kernel;
             for (size_t j = 0; j < c.n; ++j)
             {
-                Vecd q = (c.x0[j] - s.x0[i]) / dp;
+                Vecd q = (c.x0[j] - target) / dp;
                 if (q.norm() >= 2.5) continue;
                 Eigen::Vector4d b; b << 1, q[0], q[1], q[2];
                 Real w = std::exp(-q.squaredNorm());
@@ -299,50 +322,103 @@ struct BondedInterface
                 row.w.push_back(w); sum_w += w; sum_abs += std::abs(w);
                 mapped += w * c.x0[row.j[k]];
             }
-            if (std::abs(sum_w - 1) > 1e-9 || (mapped - s.x0[i]).norm() > 1e-9 * dp)
+            affine_error = std::max({affine_error, std::abs(sum_w - 1), (mapped - target).norm() / dp});
+            if (std::abs(sum_w - 1) > 1e-9 || (mapped - target).norm() > 1e-9 * dp)
                 throw std::runtime_error("affine reproduction failed");
-            row.k = stiffness * s.measure[i];
+            row.k = stiffness * s.measure[i] * (inner_surface ? reference_area_ratio : 1);
             max_rate = std::max(max_rate, row.k * sum_abs / s.mass[i]);
             for (size_t k = 0; k < row.j.size(); ++k)
                 rate_c[row.j[k]] += row.k * std::abs(row.w[k]) * sum_abs / c.mass[row.j[k]];
             rows.push_back(std::move(row));
         }
         for (Real r : rate_c) max_rate = std::max(max_rate, r);
+        if (inner_surface)
+        {
+            // Row-block bound of sqrt(K)*B*M^-1*B^T*sqrt(K). Shell translation
+            // plus unit-director inertia contributes at most 4*k/m per row;
+            // the absolute shared-core terms bound cross-row coupling.
+            std::vector<Real> shared_core(c.n, 0);
+            for (const auto &row : rows)
+                for (size_t a = 0; a < row.j.size(); ++a)
+                    shared_core[row.j[a]] += std::sqrt(row.k) * std::abs(row.w[a]);
+            max_rate = 0;
+            for (size_t i = 0; i < s.n; ++i)
+            {
+                const auto &row = rows[i];
+                Real rate = 4 * row.k / s.mass[i];
+                for (size_t a = 0; a < row.j.size(); ++a)
+                    rate += std::sqrt(row.k) * std::abs(row.w[a]) * shared_core[row.j[a]] / c.mass[row.j[a]];
+                max_rate = std::max(max_rate, rate);
+            }
+        }
         stable_dt = 0.2 / std::sqrt(max_rate);
     }
     void apply()
     {
-        max_gap = energy = balance = power_residual = 0;
-        Vecd sum = Vecd::Zero();
-        Real force_scale = 0, power = 0;
+        max_gap = energy = balance = power_residual = torque_residual = power_relative = 0;
+        Vecd sum = Vecd::Zero(), torque = Vecd::Zero();
+        Real force_scale = 0, power = 0, power_scale = 0;
+        for (size_t i = 0; i < shell.n; ++i) director_force[i].setZero();
         for (size_t i = 0; i < shell.n; ++i)
         {
             const auto &row = rows[i];
             Vecd mapped = Vecd::Zero(), mapped_v = Vecd::Zero();
             for (size_t k = 0; k < row.j.size(); ++k)
             { mapped += row.w[k] * core.x[row.j[k]]; mapped_v += row.w[k] * core.v[row.j[k]]; }
-            Vecd gap = shell.x[i] - mapped, f = -row.k * gap;
+            Vecd inner_rate = Vecd::Zero();
+            if (inner_surface)
+                inner_rate = transform[i].transpose() * thin_structure_dynamics::getVectorChangeRateAfterThinStructureRotation(
+                    Vecd(0, 0, 1), rotation[i], omega[i]);
+            Vecd point = shell.x[i] - (inner_surface ? 0.5 * thickness : 0) * director[i];
+            Vecd point_velocity = shell.v[i] - (inner_surface ? 0.5 * thickness : 0) * inner_rate;
+            Vecd gap = point - mapped, f = -row.k * gap;
+            shell_points[i] = point; mapped_points[i] = mapped; forces[i] = f;
             shell.prior[i] += f;
-            sum += f; power += f.dot(shell.v[i]);
+            Vecd g = -(inner_surface ? 0.5 * thickness : 0) * f;
+            director_force[i] += g;
+            sum += f; torque += shell.x[i].cross(f) + director[i].cross(g);
+            Real ps = f.dot(shell.v[i]), pg = g.dot(inner_rate);
+            power += ps + pg; power_scale += std::abs(ps) + std::abs(pg);
             for (size_t k = 0; k < row.j.size(); ++k)
             {
                 Vecd reaction = -row.w[k] * f;
                 core.prior[row.j[k]] += reaction;
                 sum += reaction; power += reaction.dot(core.v[row.j[k]]);
+                torque += core.x[row.j[k]].cross(reaction);
+                power_scale += std::abs(reaction.dot(core.v[row.j[k]]));
             }
-            power_residual += -f.dot(shell.v[i] - mapped_v); // dU/dt
+            Real spring_power = f.dot(point_velocity - mapped_v);
+            power_residual += -spring_power; // dU/dt
+            power_scale += std::abs(spring_power);
             max_gap = std::max(max_gap, gap.norm());
             energy += 0.5 * row.k * gap.squaredNorm(); force_scale += f.norm();
         }
         balance = sum.norm() / std::max(force_scale, Real(1e-30));
         power_residual += power; // external interface power + dU/dt = 0
+        torque_residual = torque.norm() / std::max(length_scale * force_scale, Real(1e-30));
+        power_relative = std::abs(power_residual) / std::max(power_scale, Real(1e-30));
+        worst_balance = std::max(worst_balance, balance);
+        worst_torque_residual = std::max(worst_torque_residual, torque_residual);
+        worst_power_relative = std::max(worst_power_relative, power_relative);
+    }
+    void writeSurface(const fs::path &folder, size_t frame) const
+    {
+        fs::create_directories(folder);
+        std::ofstream f(folder / ("interface_" + std::to_string(frame) + ".csv"));
+        f << std::setprecision(17) << "x0_m,y0_m,z0_m,shell_x_m,shell_y_m,shell_z_m,core_x_m,core_y_m,core_z_m,fx_N,fy_N,fz_N\n";
+        for (size_t i = 0; i < shell.n; ++i)
+            f << reference_points[i][0] << ',' << reference_points[i][1] << ',' << reference_points[i][2] << ','
+              << shell_points[i][0] << ',' << shell_points[i][1] << ',' << shell_points[i][2] << ','
+              << mapped_points[i][0] << ',' << mapped_points[i][1] << ',' << mapped_points[i][2] << ','
+              << forces[i][0] << ',' << forces[i][1] << ',' << forces[i][2] << '\n';
     }
     void patchTest(Real dp)
     {
         Matd R = Eigen::AngleAxisd(0.37, Vecd(1, 2, 3).normalized()).toRotationMatrix();
         Vecd shift(0.2 * dp, -0.1 * dp, 0.3 * dp);
         for (size_t i = 0; i < core.n; ++i) core.x[i] = R * core.x0[i] + shift;
-        for (size_t i = 0; i < shell.n; ++i) shell.x[i] = R * shell.x0[i] + shift;
+        for (size_t i = 0; i < shell.n; ++i)
+        { shell.x[i] = R * shell.x0[i] + shift; if (inner_surface) director[i] = R * initial_director[i]; }
         core.clearPrior(); shell.clearPrior(); apply();
         if (max_gap / dp > 1e-10) throw std::runtime_error("rigid-motion patch failed");
         for (size_t i = 0; i < core.n; ++i)
@@ -353,12 +429,15 @@ struct BondedInterface
         Vecd torque = Vecd::Zero(); Real scale = 0;
         for (size_t i = 0; i < core.n; ++i) { torque += core.x[i].cross(core.prior[i]); scale += core.prior[i].norm(); }
         for (size_t i = 0; i < shell.n; ++i) { torque += shell.x[i].cross(shell.prior[i]); scale += shell.prior[i].norm(); }
+        if (inner_surface)
+            for (size_t i = 0; i < shell.n; ++i) torque += director[i].cross(director_force[i]);
         Real torque_residual = torque.norm() / std::max(dp * scale, Real(1e-30));
         if (balance > 1e-10 || torque_residual > 1e-10 || std::abs(power_residual) > 1e-10 * scale)
             throw std::runtime_error("force/torque/power patch failed");
         std::cout << "PATCH PASS force=" << balance << " torque=" << torque_residual << " power=" << power_residual << '\n';
         for (size_t i = 0; i < core.n; ++i) { core.x[i] = core.x0[i]; core.v[i].setZero(); }
-        for (size_t i = 0; i < shell.n; ++i) { shell.x[i] = shell.x0[i]; shell.v[i].setZero(); }
+        for (size_t i = 0; i < shell.n; ++i)
+        { shell.x[i] = shell.x0[i]; shell.v[i].setZero(); if (inner_surface) director[i] = initial_director[i]; }
         core.clearPrior(); shell.clearPrior();
     }
 };
@@ -600,7 +679,8 @@ int run(const Options &o)
     correction.exec();
     if (shell_correction) shell_correction->exec();
     std::unique_ptr<BondedInterface> tie;
-    if (s) tie = std::make_unique<BondedInterface>(c, *s, o.spacing, o.tie_factor * o.core_E / o.spacing);
+    if (s) tie = std::make_unique<BondedInterface>(c, *s, o.spacing, o.tie_factor * o.core_E / o.spacing,
+                                                 o.interface_surface == "inner", o.thickness, rc * rc / (rs * rs));
     if (o.patch_test) { tie->patchTest(o.spacing); return 0; }
     State &surface = s ? *s : c;
     Real contact_depth = s ? 1 : o.spacing;
@@ -624,6 +704,10 @@ int run(const Options &o)
         shell->getBaseParticles().addVariableToWrite<Vecd>("Velocity");
         shell->getBaseParticles().addVariableToWrite<Vecd>("PseudoNormal");
         shell->getBaseParticles().addVariableToWrite<Vecd>("ContactDirectorForce");
+        shell->getBaseParticles().addVariableToWrite<Vecd>("InterfaceDirectorForce");
+        shell->getBaseParticles().addVariableToWrite<Matd>("DeformationGradient");
+        shell->getBaseParticles().addVariableToWrite<Matd>("BendingDeformationGradient");
+        shell->getBaseParticles().addVariableToWrite<Matd>("MidSurfaceCauchyStress");
     }
     Real *plastic_alpha = nullptr;
     if (o.material == "j2")
@@ -639,6 +723,9 @@ int run(const Options &o)
         << "\nsource_sha256=" << CAPSULE_SOURCE_SHA256
         << "\ncore_material=" << o.material << "\nshell_material=" << (s ? "elastic_plane_stress" : "none")
         << "\ninterface=" << (s ? "affine_penalty_tie" : "none") << '\n'
+        << "interface_surface=" << (s ? o.interface_surface : "none")
+        << "\ninterface_affine_error=" << (tie ? tie->affine_error : 0)
+        << "\ninterface_reference_area_ratio=" << (tie ? (tie->inner_surface ? tie->reference_area_ratio : 1) : 0) << '\n'
         << "plate_contact=" << o.plate_contact << "\ncontact_quadrature_points=" << contact.x0.size()
         << "\ncontact_reference_area_m2=" << contact.area << "\ncontact_affine_error=" << contact.affine_error << '\n'
         << "diameter=" << o.diameter << "\nthickness=" << o.thickness << "\nspacing=" << o.spacing
@@ -665,7 +752,7 @@ int run(const Options &o)
     std::ofstream csv(output_root / "history.csv");
     if (!csv) throw std::runtime_error("cannot write history");
     csv << "step," << (o.quasistatic ? "relaxation_time_s" : "time_s")
-        << ",dt_s,compression_m,upper_N,lower_N,kinetic_J,core_elastic_J,tie_J,contact_J,max_tie_gap_m,max_penetration_m,min_J,interface_force_residual,interface_power_residual_W,external_work_J,drag_loss_J,max_plastic_alpha\n";
+        << ",dt_s,compression_m,upper_N,lower_N,kinetic_J,core_elastic_J,tie_J,contact_J,max_tie_gap_m,max_penetration_m,min_J,interface_force_residual,interface_power_residual_W,external_work_J,drag_loss_J,max_plastic_alpha,interface_torque_residual,interface_power_relative\n";
     csv << std::setprecision(17);
     Real &time = *system.getSystemVariableDataByName<Real>("PhysicalTime");
     Real end = o.load_time + o.hold_time, next_csv = 0, next_vtp = 0, work = 0, drag_loss = 0;
@@ -678,7 +765,7 @@ int run(const Options &o)
         equilibria.open(output_root / "equilibria.csv");
         if (!equilibria) throw std::runtime_error("cannot write equilibria");
         equilibria << std::setprecision(17)
-                   << "load_step,relaxation_steps,compression_m,strain,experimental_displacement_time_s,upper_N,lower_N,force_residual,plate_imbalance,kinetic_ratio,max_tie_gap_m,min_J,max_plastic_alpha\n";
+                   << "load_step,relaxation_steps,compression_m,strain,experimental_displacement_time_s,upper_N,lower_N,force_residual,plate_imbalance,kinetic_ratio,max_tie_gap_m,min_J,max_plastic_alpha,interface_force_residual,interface_torque_residual,interface_power_relative\n";
     }
     auto compression = [&](Real t) { return 0.5 * o.strain * o.diameter * (1 - std::cos(Pi * std::min(t / o.load_time, Real(1)))); };
     auto step_compression = [&](Real increment)
@@ -736,12 +823,14 @@ int run(const Options &o)
             csv << step << ',' << time << ',' << dt << ',' << delta << ',' << contact.upper << ',' << contact.lower << ','
                 << kinetic << ',' << core_U << ',' << (tie ? tie->energy : 0) << ',' << contact.energy << ','
                 << (tie ? tie->max_gap : 0) << ',' << contact.penetration << ',' << minJ << ','
-                << (tie ? tie->balance : 0) << ',' << (tie ? tie->power_residual : 0) << ',' << work << ',' << drag_loss << ',' << max_alpha << '\n';
+                << (tie ? tie->balance : 0) << ',' << (tie ? tie->power_residual : 0) << ',' << work << ',' << drag_loss << ',' << max_alpha
+                << ',' << (tie ? tie->torque_residual : 0) << ',' << (tie ? tie->power_relative : 0) << '\n';
             next_csv = time + end / 300;
         }
         if ((!o.quasistatic && (time >= next_vtp || time >= end)) || step == 0)
         {
             contact.writeSurface(output_root / "contact_surface", frame);
+            if (tie) tie->writeSurface(output_root / "interface_surface", frame);
             vtp.writeToFile(frame++); next_vtp = time + end / 10;
             std::cout << "step=" << step << " time=" << time << " upper=" << contact.upper << " lower=" << contact.lower
                       << " gap=" << (tie ? tie->max_gap : 0) << " minJ=" << minJ << std::endl;
@@ -781,9 +870,11 @@ int run(const Options &o)
                 Real max_alpha = plastic_alpha ? *std::max_element(plastic_alpha, plastic_alpha + c.n) : 0;
                 equilibria << stage << ',' << stage_step << ',' << delta << ',' << delta / o.diameter << ',' << delta / 1e-6 << ','
                            << contact.upper << ',' << contact.lower << ',' << residual << ',' << imbalance << ',' << kinetic_ratio << ','
-                           << (tie ? tie->max_gap : 0) << ',' << minJ << ',' << max_alpha << '\n';
+                           << (tie ? tie->max_gap : 0) << ',' << minJ << ',' << max_alpha << ',' << (tie ? tie->balance : 0)
+                           << ',' << (tie ? tie->torque_residual : 0) << ',' << (tie ? tie->power_relative : 0) << '\n';
                 equilibria.flush();
                 contact.writeSurface(output_root / "contact_surface", frame);
+                if (tie) tie->writeSurface(output_root / "interface_surface", frame);
                 vtp.writeToFile(frame++);
                 std::cout << "ACCEPTED load=" << stage << '/' << o.load_steps << " strain=" << delta / o.diameter
                           << " force=" << mean_force << " residual=" << residual << " imbalance=" << imbalance << std::endl;
@@ -868,6 +959,10 @@ int run(const Options &o)
             << ",\n  \"max_contact_force_mapping_residual\": " << contact.worst_force_residual
             << ",\n  \"max_contact_torque_mapping_residual\": " << contact.worst_torque_residual
             << ",\n  \"max_contact_power_mapping_residual\": " << contact.worst_power_residual
+            << ",\n  \"interface_surface\": \"" << (s ? o.interface_surface : "none") << "\""
+            << ",\n  \"max_interface_force_mapping_residual\": " << (tie ? tie->worst_balance : 0)
+            << ",\n  \"max_interface_torque_mapping_residual\": " << (tie ? tie->worst_torque_residual : 0)
+            << ",\n  \"max_interface_power_mapping_residual\": " << (tie ? tie->worst_power_relative : 0)
             << ",\n  \"experimental_calibration\": false,\n  \"shell_energy_and_rotational_energy_audited\": false\n}\n";
     return 0;
 }

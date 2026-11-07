@@ -58,7 +58,7 @@ def main():
                            base_config_sha256=digest(args.base_config),
                            paper_bare_sha256=digest(args.paper_bare),
                            paper_coated_sha256=digest(args.paper_coated),
-                           source_commit=args.source_commit)
+                           driver_sha256=digest(__file__), source_commit=args.source_commit)
     receipt = args.out / 'launch_receipt.json'
     if receipt.exists():
         assert json.loads(receipt.read_text()) == expected_hashes, 'resume provenance mismatch'
@@ -112,13 +112,27 @@ def main():
                 return result
         ratio = 10 ** log_ratio
         name = f'fit_ratio_{len(evaluations):02d}'
-        values, summary = simulate(name, 1e9, 1e9 * ratio)
+        failure_file = args.out / (name + '.failure.json')
+        if failure_file.exists():
+            result = json.loads(failure_file.read_text())
+            evaluations.append(result)
+            return result
+        try:
+            values, summary = simulate(name, 1e9, 1e9 * ratio)
+        except subprocess.CalledProcessError as error:
+            result = dict(run=name, log10_yield_over_E=log_ratio, yield_over_E=ratio,
+                          status='FAILED_NUMERICAL_EQUILIBRIUM', solver_exit_code=error.returncode)
+            save(failure_file, result)
+            evaluations.append(result)
+            save(args.out / 'optimization_trace.json', evaluations)
+            print(f'REJECT {name}: solver did not complete; no fit data used', flush=True)
+            return result
         # Bound the two material parameters without changing numerical controls.
         Emin, Emax = max(2e7, 1e5 / ratio), min(2e10, 3e8 / ratio)
         scale = sum(a*b for a, b in zip(values[:16], reference[:16])) / sum(a*a for a in values[:16])
         scale = max(Emin / 1e9, min(Emax / 1e9, scale))
         predicted = [v * scale for v in values]
-        result = dict(run=name, log10_yield_over_E=log_ratio, yield_over_E=ratio,
+        result = dict(run=name, status='COMPLETED', log10_yield_over_E=log_ratio, yield_over_E=ratio,
                       E_Pa=1e9*scale, yield_stress_Pa=1e9*ratio*scale,
                       fit=metrics(predicted[:16], reference[:16]),
                       holdout=metrics(predicted[16:], reference[16:]),
@@ -132,16 +146,18 @@ def main():
         return result
 
     # A bounded one-dimensional material-shape search, not a suite of prototypes.
-    grid = [-4., -3., -2., -1., -.5]
-    for value in grid:
+    def objective(result):
+        return result['fit']['nrmse'] if result['status'] == 'COMPLETED' else math.inf
+    grid = [-3., -2., -1., -.5]
+    for value in [-2., -1., -3., -.5]:
         evaluate(value)
-    best_grid = min(range(len(grid)), key=lambda i: evaluations[i]['fit']['nrmse'])
+    best_grid = min(range(len(grid)), key=lambda i: objective(evaluate(grid[i])))
     low, high = grid[max(0, best_grid - 1)], grid[min(len(grid) - 1, best_grid + 1)]
     golden = (math.sqrt(5) - 1) / 2
     a, b = high - golden * (high - low), low + golden * (high - low)
     ea, eb = evaluate(a), evaluate(b)
     for _ in range(5):
-        if ea['fit']['nrmse'] < eb['fit']['nrmse']:
+        if objective(ea) < objective(eb):
             high, b, eb = b, a, ea
             a = high - golden * (high - low)
             ea = evaluate(a)
@@ -149,13 +165,15 @@ def main():
             low, a, ea = a, b, eb
             b = low + golden * (high - low)
             eb = evaluate(b)
-    best = min(evaluations, key=lambda r: r['fit']['nrmse'])
+    best = min(evaluations, key=objective)
+    if not math.isfinite(objective(best)):
+        raise RuntimeError('no material candidate completed equilibrium; calibration not accepted')
     E, sy = float(f'{best["E_Pa"]:.8g}'), float(f'{best["yield_stress_Pa"]:.8g}')
     actual, bare_summary = simulate('bare_calibrated', E, sy)
     fit = metrics(actual[:16], reference[:16])
     holdout = metrics(actual[16:], reference[16:])
     passed = fit['nrmse'] <= .10 and fit['max_abs_error_over_peak'] <= .20 and holdout['nrmse'] <= .15
-    near_best = [r for r in evaluations if r['fit']['nrmse'] <= best['fit']['nrmse'] + .01]
+    near_best = [r for r in evaluations if objective(r) <= objective(best) + .01]
     frozen = dict(status='ACCEPTED_EFFECTIVE_CALIBRATION' if passed else 'PROVISIONAL_BEST_FIT_NOT_ACCEPTED',
                   constitutive='native finite-strain J2 perfect plasticity', core_E_Pa=E,
                   core_yield_stress_Pa=sy, core_hardening_Pa=0, core_nu=.3, core_density_kg_m3=1355,

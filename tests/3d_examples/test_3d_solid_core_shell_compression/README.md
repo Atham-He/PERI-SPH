@@ -181,8 +181,11 @@ For the bare body, virtual surface coordinates are obtained with a fixed-referen
 affine-complete MLS map of core particle positions; the transpose map scatters
 the contact load. Virtual points carry no mass or material. For the shell, each
 point is the actual outer offset x_mid + t*n_director/2. Its force supplies both
-the midsurface force and the director load t*f/2, which is included in the native
-shell rotational-acceleration equation by a local dynamics subclass. Constitutive
+the midsurface force and the director load g=t*f/2. A local dynamics subclass computes
+the angular generalized force Q=J^T*T*g and inertia M=(m*t^2/12)*J^T*J using the
+native director rotation Jacobian, then adds M^-1*Q to the native angular
+acceleration. The constrained normal component does not drive rotation.
+The relaxation kinetic criterion uses the same director inertia metric. Constitutive
 classes and their stress updates are unchanged. Contact stability bounds include
 the mapped core stiffness or shell translational/director inertia, respectively.
 
@@ -202,3 +205,10 @@ maximum error/reference peak <=8%; holdout does not choose parameters. Acceptanc
 still uses the declared 10% fit / 15% holdout / 15% coated thresholds.
 Use `configs/unified_surface_calibration.cfg`. The current complete-energy and
 spatial-convergence limitations continue to apply.
+
+After a shell-only load-integration correction, `--core-proposal=<previous frozen_core.json>`
+can reuse an already selected core proposal. This still launches a NEW complete
+bare solve with the current executable and requires its entire force curve to
+match the previous verified curve within 1e-8 N before freezing and running the
+coated case. A changed bare path requires a fresh calibration. Proposal and
+previous-curve hashes are recorded; partial superseded coated runs are not used.

@@ -222,9 +222,19 @@ struct State
     Real totalMass() const { return std::accumulate(mass, mass + n, Real(0)); }
 };
 
-/** External surface force also loads the shell director, without changing its
- * native elastic law. g is conjugate to the global unit director: g=t*f/2.
- * Feed its acceleration into the same native rotation equation as bending/shear.
+using DirectorJacobian = Eigen::Matrix<Real, 3, 2>;
+DirectorJacobian directorJacobian(const Vecd &rotation)
+{
+    DirectorJacobian J;
+    J.col(0) = thin_structure_dynamics::getVectorChangeRateAfterThinStructureRotation(Vecd(0, 0, 1), rotation, Vecd(1, 0, 0));
+    J.col(1) = thin_structure_dynamics::getVectorChangeRateAfterThinStructureRotation(Vecd(0, 0, 1), rotation, Vecd(0, 1, 0));
+    return J;
+}
+
+/** g=t*f/2 is conjugate to the GLOBAL UNIT director. External angular loading
+ * is linear: Q=J^T*T*g, M=I*J^T*J, delta_alpha=M^-1*Q. This removes the
+ * constrained normal component and preserves virtual work. Native internal
+ * shell forces, constitutive stress update and gyroscopic terms are retained.
  */
 class SurfaceLoadedShellFirst : public thin_structure_dynamics::ShellStressRelaxationFirstHalf
 {
@@ -236,9 +246,15 @@ class SurfaceLoadedShellFirst : public thin_structure_dynamics::ShellStressRelax
     void interaction(size_t i, Real dt = 0)
     {
         ShellStressRelaxationFirstHalf::interaction(i, dt);
-        dpseudo_n_d2t_[i] += 12 * contact_director_force_[i] / (mass_[i] * thickness_[i] * thickness_[i]);
-        dangular_vel_dt_[i] = thin_structure_dynamics::getRotationFromPseudoNormal(
-            transformation_matrix0_[i] * dpseudo_n_d2t_[i], rotation_[i], angular_vel_[i], dt);
+        if (contact_director_force_[i].squaredNorm() == 0) return;
+        DirectorJacobian J = directorJacobian(rotation_[i]);
+        Eigen::Matrix2d metric = J.transpose() * J;
+        if (metric.determinant() < 1e-10) throw std::runtime_error("singular shell rotation coordinates");
+        Real inertia = mass_[i] * thickness_[i] * thickness_[i] / 12;
+        Eigen::Vector2d Q = J.transpose() * (transformation_matrix0_[i] * contact_director_force_[i]);
+        Eigen::Vector2d extra_alpha = metric.ldlt().solve(Q) / inertia;
+        dangular_vel_dt_[i][0] += extra_alpha[0]; dangular_vel_dt_[i][1] += extra_alpha[1];
+        dpseudo_n_d2t_[i] += transformation_matrix0_[i].transpose() * (J * extra_alpha);
     }
 };
 
@@ -739,11 +755,15 @@ int run(const Options &o)
             {
                 auto *omega = shell->getBaseParticles().getVariableDataByName<Vecd>("AngularVelocity");
                 auto *alpha = shell->getBaseParticles().getVariableDataByName<Vecd>("AngularAcceleration");
+                auto *rotation = shell->getBaseParticles().getVariableDataByName<Vecd>("Rotation");
                 for (size_t i = 0; i < s->n; ++i)
                 {
                     Real inertia = s->mass[i] * o.thickness * o.thickness / 12;
-                    rotational_kinetic += 0.5 * inertia * omega[i].squaredNorm();
-                    sum_force2 += (s->force[i] + s->prior[i]).squaredNorm() + std::pow(inertia / R, 2) * alpha[i].squaredNorm();
+                    DirectorJacobian J = directorJacobian(rotation[i]);
+                    Eigen::Vector2d w(omega[i][0], omega[i][1]), a(alpha[i][0], alpha[i][1]);
+                    rotational_kinetic += 0.5 * inertia * (J * w).squaredNorm();
+                    Eigen::Vector2d torque = inertia * (J.transpose() * J) * a;
+                    sum_force2 += (s->force[i] + s->prior[i]).squaredNorm() + torque.squaredNorm() / (R * R);
                 }
             }
             Real mean_force = 0.5 * (contact.upper + contact.lower);
@@ -814,11 +834,13 @@ int run(const Options &o)
             if (s)
             {
                 auto *omega = shell->getBaseParticles().getVariableDataByName<Vecd>("AngularVelocity");
+                auto *rotation = shell->getBaseParticles().getVariableDataByName<Vecd>("Rotation");
                 for (size_t i = 0; i < s->n; ++i)
                 {
                     Real inertia = s->mass[i] * o.thickness * o.thickness / 12;
-                    before += 0.5 * inertia * omega[i].squaredNorm(); omega[i] *= factor;
-                    after += 0.5 * inertia * omega[i].squaredNorm();
+                    Eigen::Vector2d w(omega[i][0], omega[i][1]);
+                    Real energy = 0.5 * inertia * (directorJacobian(rotation[i]) * w).squaredNorm();
+                    before += energy; omega[i] *= factor; after += energy * factor * factor;
                 }
             }
             drag_loss += before - after;

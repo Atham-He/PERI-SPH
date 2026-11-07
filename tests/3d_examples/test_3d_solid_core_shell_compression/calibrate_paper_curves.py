@@ -50,6 +50,8 @@ def main():
     for option in ['exe', 'base-config', 'paper-bare', 'paper-coated', 'source', 'out']:
         parser.add_argument('--' + option, type=Path, required=True)
     parser.add_argument('--source-commit', required=True)
+    parser.add_argument('--core-proposal', type=Path,
+                        help='reverify an already calibrated core by a fresh full bare solve before freezing it')
     parser.add_argument('--resume-control-change', action='store_true',
                         help='reuse completed solver histories only if solver/data/config hashes are unchanged')
     args = parser.parse_args()
@@ -61,6 +63,19 @@ def main():
                            paper_bare_sha256=digest(args.paper_bare),
                            paper_coated_sha256=digest(args.paper_coated),
                            driver_sha256=digest(__file__), source_commit=args.source_commit)
+    proposal = None
+    if args.core_proposal:
+        proposal = json.loads(args.core_proposal.read_text())
+        assert proposal['status'] == 'ACCEPTED_EFFECTIVE_CALIBRATION'
+        assert proposal['core_hardening_Pa'] == 0 and proposal['core_nu'] == .3 and proposal['core_density_kg_m3'] == 1355
+        proposal_run = args.core_proposal.parent / 'bare_calibrated'
+        proposal_summary = json.loads((proposal_run / 'summary.json').read_text())
+        assert proposal_summary['source_sha256'] == proposal['source_sha256']
+        proposal_rows = list(csv.DictReader((proposal_run / 'equilibria.csv').open()))
+        assert len(proposal_rows) == 20
+        proposal_force = [(float(r['upper_N']) + float(r['lower_N'])) / 2 for r in proposal_rows]
+        expected_hashes['core_proposal_sha256'] = digest(args.core_proposal)
+        expected_hashes['proposal_curve_sha256'] = digest(proposal_run / 'equilibria.csv')
     receipt = args.out / 'launch_receipt.json'
     if receipt.exists():
         previous = json.loads(receipt.read_text())
@@ -136,6 +151,18 @@ def main():
 
     evaluations = []
     def evaluate(log_ratio):
+        if proposal:
+            if evaluations:
+                return evaluations[0]
+            ratio = proposal['core_yield_stress_Pa'] / proposal['core_E_Pa']
+            result = dict(run='prior_bare_calibration_proposal', status='COMPLETED',
+                          log10_yield_over_E=math.log10(ratio), yield_over_E=ratio,
+                          E_Pa=proposal['core_E_Pa'], yield_stress_Pa=proposal['core_yield_stress_Pa'],
+                          fit=proposal['fit'], holdout=proposal['holdout'], scaled_force_N=proposal_force,
+                          proposal_source_commit=proposal['source_commit'])
+            evaluations.append(result)
+            save(args.out / 'optimization_trace.json', evaluations)
+            return result
         for result in evaluations:
             if abs(result['log10_yield_over_E'] - log_ratio) < 1e-9:
                 return result
@@ -184,9 +211,10 @@ def main():
     adequate = None
     for value in [-2., -1.5, -1., -3., -.5]:
         current = evaluate(value)
-        if adequate_fit(current):
+        if proposal or adequate_fit(current):
             adequate = current
-            print('ADEQUATE FIT: stop material search; holdout has not selected parameters', flush=True)
+            print('REVERIFY PROPOSAL: fresh bare solve required' if proposal else
+                  'ADEQUATE FIT: stop material search; holdout has not selected parameters', flush=True)
             break
     if adequate is None:
         best_grid = min(range(len(grid)), key=lambda i: objective(evaluate(grid[i])))
@@ -211,6 +239,9 @@ def main():
         raise RuntimeError('no material candidate completed equilibrium; calibration not accepted')
     E, sy = float(f'{best["E_Pa"]:.8g}'), float(f'{best["yield_stress_Pa"]:.8g}')
     actual, bare_summary = simulate('bare_calibrated', E, sy)
+    if proposal:
+        assert max(abs(a-b) for a,b in zip(actual, proposal_force)) < 1e-8, \
+            'bare response changed: proposal cannot be reused; perform a fresh calibration'
     fit = metrics(actual[:16], reference[:16])
     holdout = metrics(actual[16:], reference[16:])
     passed = fit['nrmse'] <= .10 and fit['max_abs_error_over_peak'] <= .20 and holdout['nrmse'] <= .15

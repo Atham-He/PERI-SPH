@@ -141,3 +141,25 @@ The immediate milestone is a stable native all-SPH run with nonzero plate loadin
 and demonstrably reciprocal interface forces. Subsequent qualification includes
 particle refinement, step/load/contact/tie sensitivity and the selected 0SS/EC0SS
 experimental comparison. Original pressure-fluid coupling is not reused.
+
+## Whole-curve calibration and frozen-core comparison
+
+`calibrate_paper_curves.py` performs two main acceptance stages, without launching
+the legacy prototype tests. It calibrates native J2 perfect-plastic core E and
+yield stress to digitized **experimental markers** for the nominal 1 mm bare
+particle in Figure 20(a) of DOI 10.1007/s11440-026-03253-6, then freezes those
+parameters for the coated calculation against Figure 20(b). Model-fit lines in
+the paper are not calibration targets. `configs/paper_curve_calibration.cfg`
+contains the shared settings and fixed shell assumptions.
+
+Calibration uses 0.5-8% compression; 8.5-10% is held out. Each material-search
+evaluation solves the same full 0-10% history. The supported input compression
+limit is now 15% for these pre-fracture calculations; no rupture prediction is
+implied. The driver exploits force scaling with E at fixed yield/E, and verifies
+the selected actual E/yield by a final full bare solve before the coated solve.
+It writes the frozen core parameters and hash before starting the coated solve.
+Acceptance thresholds and failure states are explicit in the driver's result.
+Fixed nu, shell properties, contact/tie factors and discretization are not fitted.
+Parameters remain effective, discretization-dependent estimates; identifiability,
+experimental variability, spatial convergence and full energy accounting are not
+inferred from curve agreement.

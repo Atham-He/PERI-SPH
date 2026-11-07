@@ -121,10 +121,10 @@ struct Options
         if (diameter <= 0 || thickness <= 0 || thickness >= diameter / 4 || spacing < diameter / 80 || spacing > diameter / 4 ||
             core_E <= 0 || shell_E <= 0 || core_rho <= 0 || shell_rho <= 0 ||
             core_nu < 0 || core_nu >= 0.49 || shell_nu < 0 || shell_nu >= 0.49 ||
-            strain < 0 || strain > 0.05 || load_time <= 0 || hold_time < 0 ||
+            strain < 0 || strain > 0.15 || load_time <= 0 || hold_time < 0 ||
             contact_factor <= 0 || tie_factor <= 0 || cfl <= 0 || cfl > 0.3 ||
             dt_scale <= 0 || dt_scale > 1 || drag < 0 || yield_stress <= 0 || hardening < 0)
-            throw std::invalid_argument("parameters outside supported positive/small-strain ranges");
+            throw std::invalid_argument("parameters outside supported positive/pre-fracture ranges (strain <= 0.15)");
         if (material != "elastic" && material != "j2") throw std::invalid_argument("material must be elastic or j2");
         if (relaxation_damping <= 0 || relaxation_damping > 0.1 || force_tolerance <= 0 || force_tolerance > .1 ||
             balance_tolerance <= 0 || balance_tolerance > .05 || kinetic_tolerance <= 0 || kinetic_tolerance > .01 || threads > 16 ||

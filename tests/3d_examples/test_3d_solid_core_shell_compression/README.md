@@ -168,3 +168,37 @@ Fixed nu, shell properties, contact/tie factors and discretization are not fitte
 Parameters remain effective, discretization-dependent estimates; identifiability,
 experimental variability, spatial convergence and full energy accounting are not
 inferred from curve agreement.
+
+## Unified exterior contact (2026-11-07)
+
+`plate-contact=outer_surface` uses the same antipodal spherical quadrature at the
+nominal OUTER radius, the same reference-area weights, and the same frictionless
+plane penalty energy in both cases: U = sum_q k_area A_q p_q^2 / 2. The outer
+reference geometry is independent of whether a shell exists. No Hertz force law
+or paper-fit force curve is inserted. `legacy` remains available for old runs.
+
+For the bare body, virtual surface coordinates are obtained with a fixed-reference
+affine-complete MLS map of core particle positions; the transpose map scatters
+the contact load. Virtual points carry no mass or material. For the shell, each
+point is the actual outer offset x_mid + t*n_director/2. Its force supplies both
+the midsurface force and the director load t*f/2, which is included in the native
+shell rotational-acceleration equation by a local dynamics subclass. Constitutive
+classes and their stress updates are unchanged. Contact stability bounds include
+the mapped core stiffness or shell translational/director inertia, respectively.
+
+The shell and bare contact quadratures use identical angular samples and outer
+reference areas. Shell material mass still integrates the midsurface area times
+thickness; it is not replaced with contact quadrature mass. The bonded-interface
+law remains unchanged. At this nominal 1 mm / dp=62.5 um resolution, both have
+806 exterior points and one initial highest point per platen.
+
+The complete main histories record contact force/torque/power transfer residuals
+and `contact_surface/surface_<frame>.csv` at the initial state and every accepted
+load point. The calibration driver checks affine reproduction, identical initial
+exterior geometry and mapping conservation within the two main acceptance stages.
+It calibrates the bare curve, freezes the actual verified core parameters, then
+runs the coated case. Fit-only adequacy stops further search at NRMSE <=3% and
+maximum error/reference peak <=8%; holdout does not choose parameters. Acceptance
+still uses the declared 10% fit / 15% holdout / 15% coated thresholds.
+Use `configs/unified_surface_calibration.cfg`. The current complete-energy and
+spatial-convergence limitations continue to apply.

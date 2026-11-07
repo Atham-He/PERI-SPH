@@ -81,6 +81,7 @@ def main():
     x = [.5 * i for i in range(1, 21)]
     reference = [interpolate(bare_paper, p) for p in x]
     coated_reference = [interpolate(coated_paper, p) for p in x]
+    geometries = {}
 
     def simulate(name, E, sy, coated=False):
         config = args.out / 'configs' / (name + '.cfg')
@@ -104,6 +105,24 @@ def main():
         params = dict(line.split('=', 1) for line in (run / 'parameters.txt').read_text().splitlines())
         assert float(params['core_E']) == E and float(params['yield_stress']) == sy
         assert float(params['hardening']) == 0 and float(params['core_nu']) == .3
+        if params.get('plate_contact') == 'outer_surface':
+            for field in ['max_contact_force_mapping_residual', 'max_contact_torque_mapping_residual',
+                          'max_contact_power_mapping_residual']:
+                assert summary[field] <= 1e-10, f'nonconservative contact map: {field}'
+            surface = list(csv.DictReader((run / 'contact_surface/surface_0.csv').open()))
+            geometry_text = '\n'.join(','.join(r[k] for k in ['x0_m', 'y0_m', 'z0_m', 'reference_area_m2'])
+                                       for r in surface)
+            z = [float(r['z0_m']) for r in surface]
+            error = max(math.sqrt(sum((float(r[a])-float(r[b]))**2
+                                      for a,b in [('x0_m','x_m'),('y0_m','y_m'),('z0_m','z_m')])) for r in surface)
+            highest = sum(abs(v-max(z)) < 1e-10 for v in z)
+            lowest = sum(abs(v-min(z)) < 1e-10 for v in z)
+            assert highest == lowest == 1 and error < 1e-12
+            geometries[name] = dict(reference_geometry_sha256=hashlib.sha256(geometry_text.encode()).hexdigest(),
+                                   points=len(surface), highest_points=highest, lowest_points=lowest,
+                                   max_initial_position_error_m=error,
+                                   reference_area_sum_m2=sum(float(r['reference_area_m2']) for r in surface))
+            save(args.out / 'contact_geometry_audit.json', geometries)
         rows = list(csv.DictReader((run / 'equilibria.csv').open()))
         assert len(rows) == 20
         for i, row in enumerate(rows):
@@ -160,10 +179,10 @@ def main():
         return result['fit']['nrmse'] if result['status'] == 'COMPLETED' else math.inf
     def adequate_fit(result):
         # Stop based only on the fitting window. Holdout NEVER selects parameters.
-        return objective(result) <= .05 and result['fit']['max_abs_error_over_peak'] <= .10
-    grid = [-3., -2., -1., -.5]
+        return objective(result) <= .03 and result['fit']['max_abs_error_over_peak'] <= .08
+    grid = [-3., -2., -1.5, -1., -.5]
     adequate = None
-    for value in [-2., -1., -3., -.5]:
+    for value in [-2., -1.5, -1., -3., -.5]:
         current = evaluate(value)
         if adequate_fit(current):
             adequate = current
@@ -221,6 +240,12 @@ def main():
                   coated_comparison=comparison, core_parameters_identical=True,
                   frozen_core_sha256=freeze_hash, shell_E_Pa=6e8,
                   shell_parameters_fitted=False, bare_summary=bare_summary, coated_summary=coated_summary)
+    if geometries:
+        a, b = geometries['bare_calibrated'], geometries['coated_frozen_core']
+        assert a['reference_geometry_sha256'] == b['reference_geometry_sha256']
+        assert a['points'] == b['points']
+        result['identical_outer_contact_reference_geometry'] = True
+        result['outer_contact_geometry_sha256'] = a['reference_geometry_sha256']
     save(args.out / 'calibration_comparison_summary.json', result)
     with (args.out / 'comparison.csv').open('w', newline='') as f:
         writer = csv.writer(f)

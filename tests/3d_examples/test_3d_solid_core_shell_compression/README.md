@@ -158,6 +158,11 @@ limit is now 15% for these pre-fracture calculations; no rupture prediction is
 implied. The driver exploits force scaling with E at fixed yield/E, and verifies
 the selected actual E/yield by a final full bare solve before the coated solve.
 It writes the frozen core parameters and hash before starting the coated solve.
+The material search stops once fit NRMSE is at most 5% and maximum fit error is
+at most 10% of the reference peak; holdout data do not select parameters. It does
+not claim a global optimum or a completed identifiability profile. A control-only
+resume may reuse completed histories after checking unchanged solver, input and
+reference-data hashes; the previous launch receipt is preserved.
 Acceptance thresholds and failure states are explicit in the driver's result.
 Fixed nu, shell properties, contact/tie factors and discretization are not fitted.
 Parameters remain effective, discretization-dependent estimates; identifiability,

@@ -50,6 +50,8 @@ def main():
     for option in ['exe', 'base-config', 'paper-bare', 'paper-coated', 'source', 'out']:
         parser.add_argument('--' + option, type=Path, required=True)
     parser.add_argument('--source-commit', required=True)
+    parser.add_argument('--resume-control-change', action='store_true',
+                        help='reuse completed solver histories only if solver/data/config hashes are unchanged')
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / 'configs').mkdir(exist_ok=True)
@@ -61,7 +63,15 @@ def main():
                            driver_sha256=digest(__file__), source_commit=args.source_commit)
     receipt = args.out / 'launch_receipt.json'
     if receipt.exists():
-        assert json.loads(receipt.read_text()) == expected_hashes, 'resume provenance mismatch'
+        previous = json.loads(receipt.read_text())
+        if previous != expected_hashes:
+            assert args.resume_control_change, 'resume provenance mismatch'
+            unchanged = set(expected_hashes) - {'driver_sha256', 'source_commit'}
+            assert all(previous.get(k) == expected_hashes[k] for k in unchanged), 'solver/input changed on resume'
+            archive = args.out / ('launch_receipt_control_' + digest(receipt)[:12] + '.json')
+            if not archive.exists():
+                archive.write_bytes(receipt.read_bytes())
+            save(receipt, expected_hashes)
     else:
         save(receipt, expected_hashes)
     def paper(path):
@@ -148,23 +158,35 @@ def main():
     # A bounded one-dimensional material-shape search, not a suite of prototypes.
     def objective(result):
         return result['fit']['nrmse'] if result['status'] == 'COMPLETED' else math.inf
+    def adequate_fit(result):
+        # Stop based only on the fitting window. Holdout NEVER selects parameters.
+        return objective(result) <= .05 and result['fit']['max_abs_error_over_peak'] <= .10
     grid = [-3., -2., -1., -.5]
+    adequate = None
     for value in [-2., -1., -3., -.5]:
-        evaluate(value)
-    best_grid = min(range(len(grid)), key=lambda i: objective(evaluate(grid[i])))
-    low, high = grid[max(0, best_grid - 1)], grid[min(len(grid) - 1, best_grid + 1)]
-    golden = (math.sqrt(5) - 1) / 2
-    a, b = high - golden * (high - low), low + golden * (high - low)
-    ea, eb = evaluate(a), evaluate(b)
-    for _ in range(5):
-        if objective(ea) < objective(eb):
-            high, b, eb = b, a, ea
-            a = high - golden * (high - low)
-            ea = evaluate(a)
-        else:
-            low, a, ea = a, b, eb
-            b = low + golden * (high - low)
-            eb = evaluate(b)
+        current = evaluate(value)
+        if adequate_fit(current):
+            adequate = current
+            print('ADEQUATE FIT: stop material search; holdout has not selected parameters', flush=True)
+            break
+    if adequate is None:
+        best_grid = min(range(len(grid)), key=lambda i: objective(evaluate(grid[i])))
+        low, high = grid[max(0, best_grid - 1)], grid[min(len(grid) - 1, best_grid + 1)]
+        golden = (math.sqrt(5) - 1) / 2
+        a, b = high - golden * (high - low), low + golden * (high - low)
+        ea, eb = evaluate(a), evaluate(b)
+        for _ in range(5):
+            if adequate_fit(ea) or adequate_fit(eb):
+                adequate = ea if adequate_fit(ea) else eb
+                break
+            if objective(ea) < objective(eb):
+                high, b, eb = b, a, ea
+                a = high - golden * (high - low)
+                ea = evaluate(a)
+            else:
+                low, a, ea = a, b, eb
+                b = low + golden * (high - low)
+                eb = evaluate(b)
     best = min(evaluations, key=objective)
     if not math.isfinite(objective(best)):
         raise RuntimeError('no material candidate completed equilibrium; calibration not accepted')
@@ -182,6 +204,8 @@ def main():
                   nearly_equal_fit_E_range_Pa=[min(r['E_Pa'] for r in near_best), max(r['E_Pa'] for r in near_best)],
                   nearly_equal_fit_yield_range_Pa=[min(r['yield_stress_Pa'] for r in near_best), max(r['yield_stress_Pa'] for r in near_best)],
                   parameters_are_discretization_dependent=True, unique_intrinsic_material_constants_claimed=False,
+                  identifiability_profile_completed=False,
+                  search_stopped_for_adequate_fit=adequate is not None,
                   **expected_hashes)
     freeze_file = args.out / 'frozen_core.json'
     save(freeze_file, frozen)

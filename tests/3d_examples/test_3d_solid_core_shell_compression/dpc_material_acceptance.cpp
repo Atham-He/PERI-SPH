@@ -24,6 +24,13 @@ int main(int argc,char **argv)
         Tensor F=Tensor::Identity();F(0,0)=std::exp(.003);F(1,1)=std::exp(-.003);
         const auto shear=model.update(F,zero);
         require(shear.surface==1 && shear.plastic_shear>0 && shear.state.kappa<0 && shear.plastic_stress_work>=0,"nonassociated shear and admissible work");
+        const Model zero_dilation=Model::fromCSV(argv[1],.79,0);
+        const auto shear0=zero_dilation.update(F,zero);
+        require(shear0.surface==1 && std::abs(shear0.state.kappa)<1e-10 && std::abs(shear0.q/initial.d-1)<1e-7,
+                "zero-dilation isochoric shear must return at p=0, q=d");
+        const auto cap0=zero_dilation.update(std::exp(-.06/3)*Tensor::Identity(),zero);
+        require(cap0.state.kappa>0 && std::abs(cap0.state.kappa-cap.state.kappa)<1e-8,
+                "changing shear dilation must retain hydrostatic cap compaction");
         const Tensor Q=Eigen::AngleAxisd(.71,Eigen::Vector3d(1,2,3).normalized()).toRotationMatrix();
         const auto rotated=model.update(Q*F,zero);
         require((rotated.sigma-Q*shear.sigma*Q.transpose()).norm()/shear.sigma.norm()<1e-9,"finite rotation objectivity");
@@ -34,6 +41,7 @@ int main(int argc,char **argv)
         std::cout<<std::setprecision(17)<<"{\"status\":\"PASSED_CONSTITUTIVE_ACCEPTANCE\",\"hydrostatic_p_Pa\":"<<cap.p
                  <<",\"hydrostatic_kappa\":"<<cap.state.kappa<<",\"residual_relative_density\":"<<cap.relative_density
                  <<",\"shear_kappa\":"<<shear.state.kappa<<",\"shear_plastic_stress_work_Pa\":"<<shear.plastic_stress_work
+                 <<",\"zero_dilation_shear_kappa\":"<<shear0.state.kappa<<",\"zero_dilation_cap_kappa\":"<<cap0.state.kappa
                  <<",\"scope\":\"material integration only; no spatial or experimental validation\"}\n";
         return 0;
     }catch(const std::exception&e){std::cerr<<"DPC ACCEPTANCE FAILED: "<<e.what()<<'\n';return 1;}

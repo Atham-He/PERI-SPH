@@ -35,7 +35,7 @@ struct Options
     std::string material = "elastic", output = "run", input_file, plate_contact = "legacy", interface_surface = "legacy_mid";
     size_t max_steps = 2000000;
     std::string dpc_table;
-    Real dpc_r0 = 0, dpc_solid_density = 0, constraint_E = 0;
+    Real dpc_r0 = 0, dpc_solid_density = 0, constraint_E = 0, dpc_shear_dilation = 1;
 
     void parse(int ac, char **av)
     {
@@ -85,6 +85,7 @@ struct Options
                 if (used != val.size() || !std::isfinite(x)) throw std::invalid_argument("non-finite/invalid number: " + key);
                 if (key == "dpc-r0") dpc_r0 = x;
                 else if (key == "dpc-solid-density") dpc_solid_density = x;
+                else if (key == "dpc-shear-dilation") dpc_shear_dilation = x;
                 else if (key == "constraint-E") constraint_E = x;
                 else if (key == "diameter") diameter = x;
                 else if (key == "thickness") thickness = x;
@@ -138,7 +139,7 @@ struct Options
         if (constraint_E < 0) throw std::invalid_argument("constraint-E must be zero (use core E) or positive");
         if (material == "dpc")
         {
-            auto model=dpc::Model::fromCSV(dpc_table,dpc_r0);auto p=model.parameters(dpc_r0);
+            auto model=dpc::Model::fromCSV(dpc_table,dpc_r0,dpc_shear_dilation);auto p=model.parameters(dpc_r0);
             auto close=[](Real a,Real b){return std::abs(a-b)<=1e-9*std::max(Real(1),std::abs(b));};
             if(dpc_solid_density<=0 || !close(core_rho,dpc_solid_density*dpc_r0) || !close(core_E,p.E) || !close(core_nu,p.nu))
                 throw std::invalid_argument("DPC initial E, nu and mass density must match table/r0/solid-density; no silent substitution");
@@ -660,7 +661,7 @@ int run(const Options &o)
     DruckerPragerCapSolid *dpc_material=nullptr;
     if (o.material == "dpc")
     {
-        core.defineMatterMaterial<DruckerPragerCapSolid>(o.core_rho,dpc::Model::fromCSV(o.dpc_table,o.dpc_r0));
+        core.defineMatterMaterial<DruckerPragerCapSolid>(o.core_rho,dpc::Model::fromCSV(o.dpc_table,o.dpc_r0,o.dpc_shear_dilation));
         dpc_material=&DynamicCast<DruckerPragerCapSolid>(&core,core.getMatterMaterial());
     }
     else if (o.material == "j2") core.defineMatterMaterial<HardeningPlasticSolid>(o.core_rho, o.core_E, o.core_nu, o.yield_stress, o.hardening);
@@ -759,7 +760,8 @@ int run(const Options &o)
         << "\nsource_sha256=" << CAPSULE_SOURCE_SHA256
         << "\ndpc_material_sha256=" << DPC_MATERIAL_SHA256
         << "\ndpc_r0=" << o.dpc_r0 << "\ndpc_solid_density=" << o.dpc_solid_density
-        << "\ndpc_flow=shifted_ellipse_c_equals_b_pa_Frenning2023\ndpc_reference_is_batch_calibrated=false"
+        << "\ndpc_flow=eta_scaled_shifted_ellipse_c_equals_b_pa\ndpc_shear_dilation=" << o.dpc_shear_dilation
+        << "\ndpc_reference_is_batch_calibrated=false"
         << "\ncore_material=" << o.material << "\nshell_material=" << (s ? "elastic_plane_stress" : "none")
         << "\ninterface=" << (s ? "affine_penalty_tie" : "none") << '\n'
         << "interface_surface=" << (s ? o.interface_surface : "none")

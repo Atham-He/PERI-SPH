@@ -2,7 +2,10 @@
  * SI units. Pressure is positive in compression; yield stresses are Cauchy.
  * Finite multiplicative plasticity with isotropic elastic Hencky strain.
  * K=1, transition alpha=0. Associated cap; nonassociated shear potential
- * g_s=b^2(p-pa)^2+(q+c)^2, c=b*pa (Frenning, Powder Technol. 423, 118503).
+ * g_s=eta*b^2(p-pa)^2+(q+c)^2, c=b*pa, 0<=eta<=1.
+ * eta=1 recovers the prior shifted ellipse; eta=0 suppresses SHEAR dilation
+ * while retaining associated cap compaction. This is a controlled assumption,
+ * not a new MCC measurement. See Frenning, Powder Technol. 423, 118503.
  * The shift is derived, not a fitted dilation parameter. Density-dependent
  * elasticity is an effective extension; plastic stress work below is NOT a
  * proof of a complete thermodynamic balance with evolving elastic moduli.
@@ -14,6 +17,7 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -42,10 +46,10 @@ struct Result
 class Model
 {
     std::vector<Node> nodes_;
-    double r0_;
+    double r0_, shear_dilation_;
     static bool finite(double x) { return std::isfinite(x); }
   public:
-    explicit Model(std::vector<Node> nodes, double r0) : nodes_(std::move(nodes)), r0_(r0)
+    explicit Model(std::vector<Node> nodes, double r0, double shear_dilation=1) : nodes_(std::move(nodes)), r0_(r0), shear_dilation_(shear_dilation)
     {
         if (nodes_.size() < 2 || !finite(r0_)) throw std::invalid_argument("DPC requires a density table and initial relative density");
         for (size_t i=0; i<nodes_.size(); ++i)
@@ -56,9 +60,10 @@ class Model
                 (i && (a.r<=nodes_[i-1].r || a.pb<nodes_[i-1].pb)))
                 throw std::invalid_argument("invalid or nonmonotone DPC density table (beta in radians, pressure in Pa)");
         }
+        if(!finite(shear_dilation_) || shear_dilation_<0 || shear_dilation_>1) throw std::invalid_argument("DPC shear-dilation scale must be in [0,1]");
         parameters(r0_);
     }
-    static Model fromCSV(const std::string &path, double r0)
+    static Model fromCSV(const std::string &path, double r0, double shear_dilation=1)
     {
         std::ifstream f(path); if (!f) throw std::invalid_argument("cannot read DPC density table: "+path);
         std::vector<Node> nodes;
@@ -72,9 +77,10 @@ class Model
                 throw std::invalid_argument("DPC CSV expects r,E_Pa,nu,d_Pa,beta_rad,R,pb_Pa");
             nodes.push_back(a);
         }
-        return Model(nodes,r0);
+        return Model(nodes,r0,shear_dilation);
     }
     double r0() const { return r0_; }
+    double shearDilation() const { return shear_dilation_; }
     double kappaMin() const { return std::log(nodes_.front().r/r0_); }
     double kappaMax() const { return std::log(nodes_.back().r/r0_); }
     const std::vector<Node> &nodes() const { return nodes_; }
@@ -98,6 +104,23 @@ class Model
         return p<=a.pa ? q-a.d-p*a.b : std::hypot(p-a.pa,a.R*q)-a.R*(a.d+a.pa*a.b);
     }
     Result update(const Tensor &F, const State &old) const
+    {
+        try { return integrate(F,old); }
+        catch(const std::exception &e)
+        {
+            // Exact local failure state enables an offline replay without
+            // rerunning the whole particle model or guessing at a guard stop.
+            std::ostringstream out;out<<std::setprecision(17)<<"DPC_FAILURE_STATE {\"reason\":"<<std::quoted(e.what())
+                <<",\"r0\":"<<r0_<<",\"eta\":"<<shear_dilation_<<",\"kappa\":"<<old.kappa
+                <<",\"F\":[";
+            for(int r=0;r<3;++r)for(int c=0;c<3;++c)out<<(r||c ? ",":"")<<F(r,c);
+            out<<"],\"inverse_Cp\":[";
+            for(int r=0;r<3;++r)for(int c=0;c<3;++c)out<<(r||c ? ",":"")<<old.inverse_Cp(r,c);
+            out<<"]}";throw std::runtime_error(out.str());
+        }
+    }
+  private:
+    Result integrate(const Tensor &F, const State &old) const
     {
         const double J=F.determinant();
         if (!F.allFinite() || J<=0 || !old.inverse_Cp.allFinite() || !finite(old.kappa))
@@ -131,7 +154,7 @@ class Model
                     double pp,qq; Parameters z; stress(v[0],v[1],pp,qq,z);
                     const double f=branch==1 ? qq-z.d-pp*z.b : std::hypot(pp-z.pa,z.R*qq)-z.R*(z.d+z.pa*z.b);
                     const double flow=branch==1 ?
-                        (v[0]-old.kappa)*(qq+z.c)-v[1]*(pp-z.pa)*z.b*z.b :
+                        (v[0]-old.kappa)*(qq+z.c)-shear_dilation_*v[1]*(pp-z.pa)*z.b*z.b :
                         (v[0]-old.kappa)*z.R*z.R*qq-v[1]*(pp-z.pa);
                     return Eigen::Vector2d(f/scale,flow/scale);
                 };
@@ -170,8 +193,20 @@ class Model
                 }
                 return false;
             };
+            // Hydrostatic compaction has an exact one-dimensional return.
+            // Bracketing avoids a Newton step landing on the back of the cap
+            // when an imposed volumetric increment is large.
+            bool hydro_returned=false;
+            if(eq<1e-14 && p>a.pb)
+            {
+                auto cap_tip=[&](double k){double pp,qq;Parameters z;stress(k,0,pp,qq,z);return pp-z.pb;};
+                double lo=old.kappa,hi=std::min(kappaMax(),old.kappa-etv);
+                if(cap_tip(hi)>1e-8*scale)throw std::runtime_error("hydrostatic cap return requires density above the table upper bound");
+                for(int it=0;it<70;++it){double mid=.5*(lo+hi);if(cap_tip(mid)>0)lo=mid;else hi=mid;}
+                kap=.5*(lo+hi);gam=0;surface=2;hydro_returned=true;
+            }
             const int first=p<=a.pa ? 1:2;
-            if(!attempt(first) && !attempt(3-first))
+            if(!hydro_returned && !attempt(first) && !attempt(3-first))
             {
                 // At the tensile apex, q=0 and the deviatoric subgradient is
                 // multivalued. Solve the volumetric return and check its cone.
@@ -180,7 +215,8 @@ class Model
                 if(apex(lo)<0 || apex(hi)>0) throw std::runtime_error("DPC return failed or density domain exhausted; no clamping/extrapolation");
                 for(int it=0;it<70;++it){double mid=.5*(lo+hi);if(apex(mid)>0)lo=mid;else hi=mid;}
                 kap=.5*(lo+hi);gam=eq;stress(kap,gam,p,q,a);
-                const double lambda=(kap-old.kappa)/((p-a.pa)*a.b*a.b);
+                if(shear_dilation_==0)throw std::runtime_error("zero-dilation shear cannot return a hydrostatic tensile apex; no extra tensile flow assumed");
+                const double lambda=(kap-old.kappa)/(shear_dilation_*(p-a.pa)*a.b*a.b);
                 if(lambda<0 || gam>lambda*a.c+1e-10)throw std::runtime_error("DPC tensile apex flow condition failed");
                 surface=3;
             }

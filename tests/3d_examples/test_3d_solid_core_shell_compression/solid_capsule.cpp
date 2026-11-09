@@ -29,7 +29,7 @@ struct Options
     Real core_rho = 1355, shell_rho = 1000;
     Real strain = 0.01, load_time = 3e-4, hold_time = 3e-4;
     Real contact_factor = 100, tie_factor = 20, cfl = 0.2, dt_scale = 1;
-    Real surface_mls_scale = 1, max_dt = std::numeric_limits<Real>::max();
+    Real surface_mls_scale = 1, contact_quadrature_scale = 1, max_dt = std::numeric_limits<Real>::max();
     Real drag = 0, yield_stress = 2e4, hardening = 0;
     Real relaxation_damping = 0.002, force_tolerance = 0.05, balance_tolerance = 0.02, kinetic_tolerance = 1e-4;
     size_t load_steps = 20, ramp_steps = 1000, max_stage_steps = 200000, threads = 1;
@@ -105,6 +105,7 @@ struct Options
                 else if (key == "cfl") cfl = x;
                 else if (key == "dt-scale") dt_scale = x;
                 else if (key == "surface-mls-scale") surface_mls_scale = x;
+                else if (key == "contact-quadrature-scale") contact_quadrature_scale = x;
                 else if (key == "max-dt") max_dt = x;
                 else if (key == "drag") drag = x;
                 else if (key == "yield-stress") yield_stress = x;
@@ -154,6 +155,9 @@ struct Options
         if (surface_mls_scale < 1 || surface_mls_scale > 2 || max_dt <= 0 ||
             (surface_mls_scale != 1 && (coated || plate_contact != "outer_surface")))
             throw std::invalid_argument("surface-mls-scale in [1,2] is a bare outer_surface diagnostic; max-dt must be positive");
+        if (contact_quadrature_scale < 0.25 || contact_quadrature_scale > 2 ||
+            (contact_quadrature_scale != 1 && (coated || plate_contact != "outer_surface")))
+            throw std::invalid_argument("contact-quadrature-scale in [0.25,2] requires bare outer_surface contact");
         if (relaxation_damping <= 0 || relaxation_damping > 0.1 || force_tolerance <= 0 || force_tolerance > .1 ||
             balance_tolerance <= 0 || balance_tolerance > .05 || kinetic_tolerance <= 0 || kinetic_tolerance > .01 || threads > 16 ||
             (quasistatic && (strain <= 0 || max_stage_steps <= ramp_steps || load_steps > 200 || drag != 0)))
@@ -477,13 +481,16 @@ struct PlaneContact
     StdVec<Vecd> x0, x, velocity, forces;
     std::vector<BondedInterface::Row> rows;
     PlaneContact(State &s, Real off, Real stiffness_per_area, Real depth,
-                 bool sampled_surface, bool shell_surface, Real R, Real t, Real dp, Real mls_scale = 1)
+                 bool sampled_surface, bool shell_surface, Real R, Real t, Real dp, Real mls_scale = 1, Real quadrature_scale = 1)
         : state(s), offset(off), stiffness(stiffness_per_area), sampled(sampled_surface),
           is_shell(shell_surface), radius(R), thickness(t)
     {
         if (sampled)
         {
-            auto directions = sphereDirections(R, dp);
+            // Surface integration resolution is independent of solid particle
+            // spacing and MLS support. Transpose scattering and per-area K
+            // retain their definitions; quadrature area is recomputed below.
+            auto directions = sphereDirections(R, quadrature_scale * dp);
             for (const auto &n : directions) x0.push_back(R * n);
             x.resize(x0.size()); velocity.resize(x0.size()); forces.resize(x0.size());
             area = 4 * Pi * R * R / x0.size();
@@ -725,7 +732,7 @@ int run(const Options &o)
     if (!s && o.plate_contact == "outer_surface") surface_offset = 0;
     PlaneContact contact(surface, surface_offset,
                          o.contact_factor * (o.constraint_E > 0 ? o.constraint_E : o.core_E) / o.spacing, contact_depth,
-                         o.plate_contact == "outer_surface", bool(s), R, o.thickness, o.spacing, o.surface_mls_scale);
+                         o.plate_contact == "outer_surface", bool(s), R, o.thickness, o.spacing, o.surface_mls_scale, o.contact_quadrature_scale);
     BodyStatesRecordingToVtp vtp(system);
     core.getBaseParticles().addVariableToWrite<Vecd>("Velocity");
     core.getBaseParticles().addVariableToWrite<Vecd>("ForcePrior");
@@ -777,6 +784,8 @@ int run(const Options &o)
         << "\ninterface_affine_error=" << (tie ? tie->affine_error : 0)
         << "\ninterface_reference_area_ratio=" << (tie ? (tie->inner_surface ? tie->reference_area_ratio : 1) : 0) << '\n'
         << "plate_contact=" << o.plate_contact << "\ncontact_quadrature_points=" << contact.x0.size()
+        << "\ncontact_quadrature_scale=" << o.contact_quadrature_scale
+        << "\ncontact_quadrature_spacing=" << o.contact_quadrature_scale * o.spacing
         << "\nsurface_mls_scale=" << o.surface_mls_scale
         << "\nsurface_mls_support_radius=" << 2.5 * o.surface_mls_scale * o.spacing
         << "\nmaximum_dt_cap=" << o.max_dt

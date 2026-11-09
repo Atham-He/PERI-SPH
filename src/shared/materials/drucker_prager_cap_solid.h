@@ -12,13 +12,24 @@ namespace SPH {
 class DruckerPragerCapSolid : public SaintVenantKirchhoffSolid
 {
     dpc::Model model_;
+    Real acoustic_modulus_bound_ = 0;
     Matd *inverse_cp_ = nullptr, *cauchy_ = nullptr;
     Real *kappa_ = nullptr, *relative_density_ = nullptr, *plastic_work_ = nullptr;
     Real *elastic_energy_ = nullptr, *yield_residual_ = nullptr, *active_surface_ = nullptr;
   public:
     DruckerPragerCapSolid(Real rho0,const dpc::Model &model)
         : SaintVenantKirchhoffSolid(rho0,model.parameters(model.r0()).E,model.parameters(model.r0()).nu),model_(model)
-    { material_type_name_="DruckerPragerCapSolid"; }
+    {
+        material_type_name_="DruckerPragerCapSolid";
+        // The table is immutable for this material instance. Cache exactly
+        // the same global modulus maximum used by acousticBound instead of
+        // scanning every table node for every particle at every time step.
+        for(const auto &row:model_.nodes())
+        {
+            const auto p=model_.parameters(row.r);
+            acoustic_modulus_bound_=std::max(acoustic_modulus_bound_,p.K+4*p.G/3);
+        }
+    }
     void initializeLocalParameters(BaseParticles *particles) override
     {
         SaintVenantKirchhoffSolid::initializeLocalParameters(particles);
@@ -52,9 +63,7 @@ class DruckerPragerCapSolid : public SaintVenantKirchhoffSolid
     { throw std::logic_error("DPC must not use a separated elastic deviatoric stress update"); }
     Real acousticBound(Real J) const
     {
-        Real maxmod=0;for(const auto &row:model_.nodes())
-        {auto p=model_.parameters(row.r);maxmod=std::max(maxmod,p.K+4*p.G/3);}
-        return std::sqrt(maxmod*J/rho0_);
+        return std::sqrt(acoustic_modulus_bound_*J/rho0_);
     }
 };
 } // namespace SPH

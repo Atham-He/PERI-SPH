@@ -5,6 +5,7 @@
  */
 #include "capsule_core_fixture.h"
 #include "all_peridynamics.h"
+#include "pd_quadratic_correspondence.h"
 #include "pd_solid_reference_coupling.h"
 #include <sstream>
 #include <map>
@@ -12,6 +13,7 @@
 struct HybridOptions : PDSolidCapsuleOptions
 {
     bool preflight_only=false;
+    bool quadratic_kinematics=false;
     size_t shell_layers=3;
     Real pd_spacing=0,pd_cfl=.1,pd_hourglass=.5;
     Real ramp_duration=2.8132387884274494e-6,max_stage_duration=1.4066193942137247e-5;
@@ -31,6 +33,7 @@ struct HybridOptions : PDSolidCapsuleOptions
                 {line=line.substr(0,line.find('#'));auto a=line.find_first_not_of(" \t\r");
                  if(a==std::string::npos)continue;line=line.substr(a,line.find_last_not_of(" \t\r")-a+1);consume("--"+line);}return;
             }
+            if(key=="pd-kinematics"){if(value!="linear" && value!="quadratic")throw std::invalid_argument("pd-kinematics must be linear or quadratic");quadratic_kinematics=value=="quadratic";return;}
             if(key=="core-backend"){if(value!="solid_sph")throw std::invalid_argument("Core requires solid_sph,not a WCSPH fluid");return;}
             if(key=="shell-backend"){if(value!="nosb_pd")throw std::invalid_argument("Shell requires nosb_pd");return;}
             if(key=="fracture-model"){if(value!="none")throw std::invalid_argument("First solid-core case requires fracture-model=none");return;}
@@ -120,7 +123,7 @@ int runHybrid(const HybridOptions &o)
     IO::getEnvironment().resetOutputFolder((out/"vtp").string(),true);
     SolidBody core(system,makeShared<GeometricShapeBall>(Vecd::Zero(),rc,"Core"));
     core.defineAdaptationRatios(1.15,1);
-    core.defineMatterMaterial<DruckerPragerCapSolid>(o.core_rho,dpc::Model::fromCSV(o.dpc_table,o.dpc_r0,o.dpc_shear_dilation));
+    core.defineMatterMaterial<DruckerPragerCapSolid>(o.core_rho,dpc::Model::fromCSV(o.dpc_table,o.dpc_r0,o.dpc_shear_dilation,o.dpc_shear_hardening));
     auto &dpc_material=DynamicCast<DruckerPragerCapSolid>(&core,core.getMatterMaterial());
     core.generateParticles<BaseParticles,CapsuleCoreGenerator>(rc,o.spacing);
     InnerRelation core_inner(core);
@@ -137,15 +140,21 @@ int runHybrid(const HybridOptions &o)
     SimpleDynamics<solid_dynamics::PDTimeStepInitialization> pd_initialize(shell,makeShared<Gravity>(Vecd::Zero()));
     InteractionWithUpdate<solid_dynamics::NosbPDShapeMatrix> pd_shape(shell_inner);
     SimpleDynamics<solid_dynamics::NosbPDFirstStep> pd_first(shell);
-    InteractionWithUpdate<solid_dynamics::NosbPDSecondStep> pd_second(shell_inner);
-    InteractionDynamics<solid_dynamics::NosbPDThirdStep> pd_third(shell_inner);
+    InteractionWithUpdate<solid_dynamics::NosbPDSecondStep> pd_linear_second(shell_inner);
+    solid_dynamics::PDQuadraticReference quadratic_reference(shell_inner);
+    InteractionWithUpdate<solid_dynamics::NosbPDQuadraticSecondStep> pd_quadratic_second(shell_inner,quadratic_reference);
+    auto pd_second=[&](Real dt){if(o.quadratic_kinematics)pd_quadratic_second.exec(dt);else pd_linear_second.exec(dt);};
+    InteractionDynamics<solid_dynamics::NosbPDThirdStep> pd_linear_third(shell_inner);
+    InteractionDynamics<solid_dynamics::NosbPDQuadraticThirdStep> pd_quadratic_third(shell_inner,quadratic_reference);
+    auto pd_third=[&](Real dt){if(o.quadratic_kinematics)pd_quadratic_third.exec(dt);else pd_linear_third.exec(dt);};
     InteractionDynamics<solid_dynamics::ProjectedPairStabilization> pd_stabilize(shell_inner,o.pd_hourglass,.1);
     InteractionDynamics<solid_dynamics::PairNumericalDampingforPD> pd_pair_damping(shell_inner);
     SimpleDynamics<RelaxedPDFourthStep> pd_fourth(shell,o.damping_rate);
     ReduceDynamics<solid_dynamics::PDTimeStep> pd_dt(shell,o.pd_cfl);
     State c(core),s(shell);
     system.initializeSystemCellLinkedLists();system.initializeSystemConfigurations();core_correction.exec();pd_shape.exec();
-    pd_second.exec(0);
+    if(o.quadratic_kinematics)quadratic_reference.build();
+    pd_second(0);
     SolidForcePort core_port(core,SolidForcePort::Storage::ForcePrior);
     SolidForcePort pd_port(shell,SolidForcePort::Storage::PDAccelerationPrior);
     auto interface_directions=sphereDirections(R,o.pd_spacing);
@@ -208,6 +217,10 @@ int runHybrid(const HybridOptions &o)
         <<"\ncombined_constraint_dt="<<constraint_dt<<"\nPD_radial_acoustic_dt="<<radial_dt
         <<"\nmaximum_dt_cap="<<o.max_dt<<"\nnumerical_ramp_duration="<<o.ramp_duration<<"\nnumerical_damping_rate="<<o.damping_rate
         <<"\nload_steps="<<o.load_steps<<"\nstrain="<<o.strain<<"\nthreads="<<o.threads
+        <<"\npd_kinematics="<<(o.quadratic_kinematics?"quadratic_reproducing":"linear_correspondence")
+        <<"\nquadratic_moment_condition_max="<<quadratic_reference.max_moment_condition<<"\nquadratic_reproduction_error="<<quadratic_reference.max_reproduction_error
+        <<"\nquadratic_initial_elastic_dt_bound="<<quadratic_reference.elastic_dt_bound
+        <<"\ndpc_shear_hardening="<<dpc_material.ShearHardeningModulus()
         <<"\nsource_sha256="<<CAPSULE_SOURCE_SHA256<<"\ndpc_material_sha256="<<DPC_MATERIAL_SHA256<<'\n';config.flush();
     if(o.preflight_only)
     {
@@ -216,7 +229,7 @@ int runHybrid(const HybridOptions &o)
         Matd affine=Matd::Identity();affine(0,0)=.998;affine(1,1)=1.001;affine(2,2)=.999;
         for(size_t i=0;i<c.n;++i){c.x[i]=affine*c.x0[i]+Vecd(5e-8,0,0);c.v[i]=Vecd(.2*std::sin(37*c.x0[i][0]/R),-.1,.3*c.x0[i][2]/R);}
         for(size_t i=0;i<s.n;++i){s.x[i]=affine*s.x0[i];s.v[i]=Vecd(-.1,.2*std::cos(19*s.x0[i][1]/R),-.2*s.x0[i][2]/R);}
-        pd_second.exec(0);Real affine_PD_error=0;
+        pd_second(0);Real affine_PD_error=0;
         for(size_t i=0;i<s.n;++i)affine_PD_error=std::max(affine_PD_error,(s.F[i]-affine).norm());
         auto energy_and_forces=[&](){core_port.clear();pd_port.clear();tie.apply();contact.apply(-R+2e-6,R-2e-6);return tie.energy+contact.energy;};
         energy_and_forces();Real force_power=0;
@@ -282,7 +295,8 @@ int runHybrid(const HybridOptions &o)
         min_core_J=std::min(min_core_J,jc);min_pd_J=std::min(min_pd_J,js);max_gap=std::max(max_gap,tie.max_gap);
         Real dpc_dt=std::numeric_limits<Real>::infinity();
         for(size_t i=0;i<c.n;++i)dpc_dt=std::min(dpc_dt,o.cfl*1.15*o.spacing/(dpc_material.acousticBound(c.F[i].determinant())+c.v[i].norm()));
-        Real dt=std::min({o.max_dt,core_dt.exec(),pd_dt.exec(),constraint_dt,radial_dt,dpc_dt})*o.dt_scale;
+        Real quadratic_dt=o.quadratic_kinematics?quadratic_reference.elastic_dt_bound:std::numeric_limits<Real>::infinity();
+        Real dt=std::min({o.max_dt,core_dt.exec(),pd_dt.exec(),constraint_dt,radial_dt,dpc_dt,quadratic_dt})*o.dt_scale;
         if(!std::isfinite(dt) || dt<1e-15 || step>=o.max_steps)throw std::runtime_error("Time step/count guard");
         if(step==0)write_fields(0);
         if(step%1000==0)
@@ -321,7 +335,7 @@ int runHybrid(const HybridOptions &o)
         // PD first-half copied old prior acceleration before drifting. Replace
         // it here with the common-midpoint interface/contact loads exactly once.
         for(size_t i=0;i<s.n;++i)pd_acc[i]=pd_port.external[i];
-        pd_second.exec(dt);pd_third.exec(dt);pd_stabilize.exec(dt);pd_pair_damping.exec(dt);
+        pd_second(dt);pd_third(dt);pd_stabilize.exec(dt);pd_pair_damping.exec(dt);
         particle_for(execution::ParallelPolicy(),core.LoopRange(),[&](size_t i){core_first.interaction(i,dt);});
         particle_for(execution::ParallelPolicy(),core.LoopRange(),[&](size_t i){core_first.update(i,dt);});
         Real factor=std::exp(-o.damping_rate*dt);

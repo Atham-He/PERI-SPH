@@ -1,5 +1,4 @@
 #pragma once
-/** Shared core lattice, SI input parsing and state views; no SPH shell implementation. */
 #include "sphinxsys.h"
 #include "drucker_prager_cap_solid.h"
 #include <Eigen/Cholesky>
@@ -33,7 +32,7 @@ struct PDSolidCapsuleOptions
     std::string material = "elastic", output = "run", input_file, plate_contact = "legacy", interface_surface = "legacy_mid";
     size_t max_steps = 2000000;
     std::string dpc_table;
-    Real dpc_r0 = 0, dpc_solid_density = 0, constraint_E = 0, dpc_shear_dilation = 1;
+    Real dpc_r0 = 0, dpc_solid_density = 0, constraint_E = 0, dpc_shear_dilation = 1, dpc_shear_hardening = 0;
 
     void parse(int ac, char **av)
     {
@@ -84,6 +83,7 @@ struct PDSolidCapsuleOptions
                 if (key == "dpc-r0") dpc_r0 = x;
                 else if (key == "dpc-solid-density") dpc_solid_density = x;
                 else if (key == "dpc-shear-dilation") dpc_shear_dilation = x;
+                else if (key == "dpc-shear-hardening") dpc_shear_hardening = x;
                 else if (key == "constraint-E") constraint_E = x;
                 else if (key == "diameter") diameter = x;
                 else if (key == "thickness") thickness = x;
@@ -138,9 +138,10 @@ struct PDSolidCapsuleOptions
             throw std::invalid_argument("parameters outside supported positive/pre-fracture ranges (strain <= 0.15)");
         if (material != "elastic" && material != "j2" && material != "dpc") throw std::invalid_argument("material must be elastic, j2 or dpc");
         if (constraint_E < 0) throw std::invalid_argument("constraint-E must be zero (use core E) or positive");
+        if(dpc_shear_hardening<0 || (dpc_shear_hardening>0 && material!="dpc"))throw std::invalid_argument("dpc-shear-hardening requires nonnegative DPC input");
         if (material == "dpc")
         {
-            auto model=dpc::Model::fromCSV(dpc_table,dpc_r0,dpc_shear_dilation);auto p=model.parameters(dpc_r0);
+            auto model=dpc::Model::fromCSV(dpc_table,dpc_r0,dpc_shear_dilation,dpc_shear_hardening);auto p=model.parameters(dpc_r0);
             auto close=[](Real a,Real b){return std::abs(a-b)<=1e-9*std::max(Real(1),std::abs(b));};
             if(dpc_solid_density<=0 || !close(core_rho,dpc_solid_density*dpc_r0) || !close(core_E,p.E) || !close(core_nu,p.nu))
                 throw std::invalid_argument("DPC initial E, nu and mass density must match table/r0/solid-density; no silent substitution");

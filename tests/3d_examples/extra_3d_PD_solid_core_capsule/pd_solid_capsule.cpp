@@ -9,6 +9,7 @@
 #include "pd_solid_reference_coupling.h"
 #include "pd_principal_stress_onset.h"
 #include "pd_fragment_contact.h"
+#include "pd_energy_crack_band.h"
 #include <sstream>
 #include <map>
 
@@ -22,7 +23,7 @@ struct HybridOptions : PDSolidCapsuleOptions
     Real interface_core_support=2.5,interface_shell_support=2.5;
     std::string shell_material="elastic",fracture_model="none",fracture_scope="none";
     std::string fragment_policy="error",core_contact_mesh;
-    Real shell_yield=0,shell_hardening=0,fracture_stress=0;
+    Real shell_yield=0,shell_hardening=0,fracture_stress=0,fracture_energy=0;
     Real pd_spacing=0,pd_cfl=.1,pd_hourglass=.5;
     Real ramp_duration=2.8132387884274494e-6,max_stage_duration=1.4066193942137247e-5;
     Real damping_rate=.002/2.8132387884274494e-10;
@@ -57,6 +58,7 @@ struct HybridOptions : PDSolidCapsuleOptions
             if(key=="shell-yield-stress")target=&shell_yield;
             if(key=="shell-hardening-modulus")target=&shell_hardening;
             if(key=="fracture-stress")target=&fracture_stress;
+            if(key=="fracture-energy")target=&fracture_energy;
             if(key=="interface-core-support-ratio")target=&interface_core_support;
             if(key=="interface-shell-support-ratio")target=&interface_shell_support;
             if(key=="pd-spacing")target=&pd_spacing;
@@ -70,21 +72,26 @@ struct HybridOptions : PDSolidCapsuleOptions
         };
         for(int i=1;i<argc;++i)consume(argv[i]);
         std::vector<char*> ptr;for(auto &a:base)ptr.push_back(a.data());
-        if(fracture_model=="principal_stress"&&fracture_scope=="growth")maximum_supported_strain=.25;
+        if((fracture_model=="principal_stress"||fracture_model=="crack_band_energy")&&fracture_scope=="growth")maximum_supported_strain=.25;
         PDSolidCapsuleOptions::parse(int(ptr.size()),ptr.data());
         if(pd_spacing==0)pd_spacing=spacing;
-        if(shell_material!="elastic"&&shell_material!="j2")throw std::invalid_argument("shell-material must be elastic or j2");
+        if(shell_material!="elastic"&&shell_material!="j2"&&shell_material!="corotated_biot")throw std::invalid_argument("Unknown shell material");
         if(shell_yield<0||shell_hardening<0||(shell_material=="j2"&&shell_yield<=0)||
-           (shell_material=="elastic"&&(shell_yield!=0||shell_hardening!=0)))
+           (shell_material!="j2"&&(shell_yield!=0||shell_hardening!=0)))
             throw std::invalid_argument("J2 requires an explicit positive shell-yield-stress; elastic forbids plastic parameters");
         if(fracture_model=="none")
-        {if(fracture_scope!="none"||fracture_stress!=0)throw std::invalid_argument("No-fracture mode forbids active fracture parameters");}
-        else if(fracture_model!="principal_stress"||(fracture_scope!="first_crack"&&fracture_scope!="growth")||fracture_stress<=0)
+        {if(fracture_scope!="none"||fracture_stress!=0||fracture_energy!=0)throw std::invalid_argument("No-fracture mode forbids active fracture parameters");}
+        else if(fracture_model=="crack_band_energy")
+        {if(fracture_scope!="growth"||shell_material!="corotated_biot"||fracture_stress<=0||fracture_energy<=0||!quadratic_kinematics||interface_order!=2)
+            throw std::invalid_argument("crack_band_energy requires corotated_biot, positive strength/Gc, quadratic PD and interface, growth scope");}
+        else if(fracture_model!="principal_stress"||(fracture_scope!="first_crack"&&fracture_scope!="growth")||fracture_stress<=0||fracture_energy!=0)
             throw std::invalid_argument("principal_stress requires explicit threshold and first_crack or growth scope");
+        if(shell_material=="corotated_biot"&&fracture_model!="crack_band_energy")throw std::invalid_argument("Biot energy material currently requires its verified crack-band assembly");
         if(fragment_policy!="error")throw std::invalid_argument("Only fragment-policy=error is allowed: numerical erosion is not a physical fracture parameter");
-        if(fracture_scope=="growth"&&(!quadratic_kinematics||interface_order!=2||core_contact_mesh.empty()))
+        if(fracture_scope=="growth"&&fracture_model=="principal_stress"&&(!quadratic_kinematics||interface_order!=2||core_contact_mesh.empty()))
             throw std::invalid_argument("Fracture growth requires quadratic PD, quadratic interface and a core-contact triangulation");
         if(postfracture_checkpoint_steps&&(fracture_scope!="growth"||preflight_only||postfracture_checkpoint_steps>max_steps))throw std::invalid_argument("Invalid fracture-growth diagnostic checkpoint");
+        if(postfracture_checkpoint_steps&&fracture_model=="crack_band_energy")throw std::invalid_argument("Use energy history outputs for continuous damage diagnostics");
         if(!coated || !quasistatic || material!="dpc" || plate_contact!="outer_surface" ||
             patch_test || rest_test || smoke_test || (shell_layers!=3 && shell_layers!=5) ||
             pd_spacing<=0 || pd_cfl<=0 || pd_cfl>.2 || pd_hourglass<0 ||
@@ -168,7 +175,7 @@ int runHybrid(const HybridOptions &o)
 
     PDBody shell(system,makeShared<DefaultShape>("PDShell"));
     shell.defineAdaptation<PDAdaptation>(1.5075,o.spacing/o.pd_spacing);
-    if(o.shell_material=="elastic")shell.defineMatterMaterial<HughesWingetSolid>(o.shell_rho,o.shell_E,o.shell_nu);
+    if(o.shell_material!="j2")shell.defineMatterMaterial<HughesWingetSolid>(o.shell_rho,o.shell_E,o.shell_nu);
     else shell.defineMatterMaterial<J2PlasticityforPD>(o.shell_rho,o.shell_E,o.shell_nu,o.shell_yield,
         PDIsotropicHardening::Linear(o.shell_hardening),0);
     shell.generateParticles<BaseParticles,LayeredPDCapsuleGenerator>(rc,o.thickness,o.pd_spacing,o.shell_layers);
@@ -177,7 +184,8 @@ int runHybrid(const HybridOptions &o)
     InteractionWithUpdate<solid_dynamics::NosbPDShapeMatrix> pd_shape(shell_inner);
     SimpleDynamics<solid_dynamics::NosbPDFirstStep> pd_first(shell);
     InteractionWithUpdate<solid_dynamics::NosbPDSecondStep> pd_linear_second(shell_inner);
-    bool growth=o.fracture_scope=="growth";
+    bool energy_growth=o.fracture_model=="crack_band_energy";
+    bool growth=o.fracture_scope=="growth"&&!energy_growth;
     UniquePtr<solid_dynamics::PDQuadraticReference> reference_owner;
     solid_dynamics::PDFractureReference *fracture_reference=nullptr;
     if(growth){auto r=makeUnique<solid_dynamics::PDFractureReference>(shell_inner);fracture_reference=r.get();reference_owner=std::move(r);}
@@ -190,17 +198,24 @@ int runHybrid(const HybridOptions &o)
         if(o.quadratic_kinematics)plastic_second=makeUnique<InteractionWithUpdate<solid_dynamics::NosbPDQuadraticSecondStepPlastic>>(shell_inner,quadratic_reference);
         else plastic_second=makeUnique<InteractionWithUpdate<solid_dynamics::NosbPDSecondStepPlastic>>(shell_inner);
     }
-    auto pd_second=[&](Real dt){if(plastic_second)plastic_second->exec(dt);else if(o.quadratic_kinematics)pd_quadratic_second.exec(dt);else pd_linear_second.exec(dt);};
+    UniquePtr<solid_dynamics::PDEnergyCrackBand> energy_model;
+    auto pd_second=[&](Real dt){if(energy_model)particle_for(execution::ParallelPolicy(),shell.LoopRange(),[&](size_t i){energy_model->evaluate(i,dt>0);});
+        else if(plastic_second)plastic_second->exec(dt);else if(o.quadratic_kinematics)pd_quadratic_second.exec(dt);else pd_linear_second.exec(dt);};
     InteractionDynamics<solid_dynamics::NosbPDThirdStep> pd_linear_third(shell_inner);
     InteractionDynamics<solid_dynamics::NosbPDQuadraticThirdStep> pd_quadratic_third(shell_inner,quadratic_reference);
-    auto pd_third=[&](Real dt){if(o.quadratic_kinematics)pd_quadratic_third.exec(dt);else pd_linear_third.exec(dt);};
+    auto pd_third=[&](Real dt){if(energy_model)particle_for(execution::ParallelPolicy(),shell.LoopRange(),[&](size_t i){energy_model->forces(i);});
+        else if(o.quadratic_kinematics)pd_quadratic_third.exec(dt);else pd_linear_third.exec(dt);};
     InteractionDynamics<solid_dynamics::ProjectedPairStabilization> pd_stabilize(shell_inner,o.pd_hourglass,.1);
     InteractionDynamics<solid_dynamics::PairNumericalDampingforPD> pd_pair_damping(shell_inner);
     SimpleDynamics<RelaxedPDFourthStep> pd_fourth(shell,o.damping_rate);
     ReduceDynamics<solid_dynamics::PDTimeStep> pd_dt(shell,o.pd_cfl);
+    if(energy_growth)energy_model=makeUnique<solid_dynamics::PDEnergyCrackBand>(shell_inner,quadratic_reference,o.shell_E,o.shell_nu,o.fracture_stress,o.fracture_energy,o.pd_hourglass,
+        shell.getSPHAdaptation().getKernel()->CutOffRadius());
+    auto pd_auxiliary=[&](Real dt){if(!energy_model){pd_stabilize.exec(dt);pd_pair_damping.exec(dt);}};
     State c(core),s(shell);
     system.initializeSystemCellLinkedLists();system.initializeSystemConfigurations();core_correction.exec();pd_shape.exec();
     if(growth)fracture_reference->initialize();else if(o.quadratic_kinematics)quadratic_reference.build();
+    if(energy_model)energy_model->initialize();
     pd_second(0);
     SolidForcePort core_port(core,SolidForcePort::Storage::ForcePrior);
     SolidForcePort pd_port(shell,SolidForcePort::Storage::PDAccelerationPrior);
@@ -248,7 +263,7 @@ int runHybrid(const HybridOptions &o)
     auto *failure=sp.getVariableDataByName<int>("NumericalFailureReason");
     auto *damage=sp.getVariableDataByName<Real>("Damage");
     UniquePtr<solid_dynamics::PrincipalStressBondOnset> onset;
-    if(o.fracture_model!="none")onset=makeUnique<solid_dynamics::PrincipalStressBondOnset>(shell_inner,o.fracture_stress,growth);
+    if(o.fracture_model=="principal_stress")onset=makeUnique<solid_dynamics::PrincipalStressBondOnset>(shell_inner,o.fracture_stress,growth);
     auto *dpc_r=cp.getVariableDataByName<Real>("DPCRelativeDensity");
     auto *dpc_kappa=cp.getVariableDataByName<Real>("DPCPlasticCompaction");
     auto *dpc_residual=cp.getVariableDataByName<Real>("DPCYieldResidual");
@@ -269,9 +284,10 @@ int runHybrid(const HybridOptions &o)
         throw std::runtime_error("Physical mass or initial PD affine kinematics failed");
     std::ofstream config(out/"parameters.txt");config<<std::setprecision(17)
         <<"status=CONFIGURED_PD_SOLID_CASE_NOT_CALIBRATED\ncore_backend=total_lagrangian_solid_SPH\nshell_backend=NOSB_PD_volume\nfluid_backend=none\n"
-        <<"shell_constitutive="<<(o.shell_material=="elastic"?"HughesWinget_elastic":"J2_HW_plastic")
+        <<"shell_constitutive="<<(energy_growth?"corotated_Biot_energy_damage":o.shell_material=="elastic"?"HughesWinget_elastic":"J2_HW_plastic")
         <<"\nfracture_model="<<o.fracture_model<<"\nfracture_scope="<<o.fracture_scope<<"\nfracture_stress="<<o.fracture_stress
-        <<"\nfragment_policy="<<o.fragment_policy<<"\ncore_contact_mesh="<<o.core_contact_mesh<<"\nfracture_energy_regularized=0"
+        <<"\nfragment_policy="<<o.fragment_policy<<"\ncore_contact_mesh="<<o.core_contact_mesh<<"\nfracture_energy_regularized="<<energy_growth
+        <<"\nfracture_energy_J_m2="<<o.fracture_energy<<"\nfracture_representation="<<(energy_growth?"diffuse_energy_damage":"sharp_bond_failure")
         <<"\npostfracture_checkpoint_steps="<<o.postfracture_checkpoint_steps
         <<"\nshell_yield_stress="<<o.shell_yield<<"\nshell_hardening_modulus="<<o.shell_hardening<<"\ncore_material=DPC\n"
         <<"shell_E="<<o.shell_E<<"\nshell_nu="<<o.shell_nu<<"\nshell_reference_density="<<o.shell_rho
@@ -295,7 +311,10 @@ int runHybrid(const HybridOptions &o)
         <<"\nquadratic_moment_condition_max="<<quadratic_reference.max_moment_condition<<"\nquadratic_reproduction_error="<<quadratic_reference.max_reproduction_error
         <<"\nquadratic_initial_elastic_dt_bound="<<quadratic_reference.elastic_dt_bound
         <<"\ndpc_shear_hardening="<<dpc_material.ShearHardeningModulus()
-        <<"\nsource_sha256="<<CAPSULE_SOURCE_SHA256<<"\ndpc_material_sha256="<<DPC_MATERIAL_SHA256<<'\n';config.flush();
+        <<"\nsource_sha256="<<CAPSULE_SOURCE_SHA256<<"\ndpc_material_sha256="<<DPC_MATERIAL_SHA256<<'\n';
+    if(energy_model)config<<"crack_band_width_m="<<energy_model->fracture.width<<"\ncrack_band_kappa0="<<energy_model->fracture.k0<<"\ncrack_band_kappaf="<<energy_model->fracture.kf
+        <<"\nenergy_stabilizer_dt="<<energy_model->stabilizer_dt<<"\nenergy_stabilizer=quadratic_LS_residual\nlegacy_pair_damping=disabled_in_energy_branch\nstrength_definition=uniaxial_nominal\n";
+    config.flush();
     if(o.preflight_only)
     {
         // Nonzero manufactured loads: check the implemented force ports and
@@ -334,10 +353,15 @@ int runHybrid(const HybridOptions &o)
     sp.addVariableToWrite<Matd>("PDStress");
     sp.addVariableToWrite<Real>("Damage");sp.addVariableToWrite<int>("BondNumber");sp.addVariableToWrite<int>("ParticleLive");
     if(growth){sp.addVariableToWrite<int>("PDReproductionOrder");sp.addVariableToWrite<int>("ResolutionEroded");}
+    if(energy_model){for(const auto&name:{"FractureDissipationDensity","ShellStoredEnergyDensity","ShellStabilizationEnergyDensity","FractureHistoryKappa"})sp.addVariableToWrite<Real>(name);
+        sp.addVariableToWrite<int>("MaterialTensileFailure");sp.addVariableToWrite<Vecd>("CrackNormalReference");}
     cp.addVariableToWrite<Matd>("DPCCauchyStress");
     BodyStatesRecordingToVtp vtp(system);
     std::ofstream eq(out/"equilibria.csv"),history(out/"material_history.csv"),progress(out/"progress.csv");
     std::ofstream fracture_events(out/"fracture_events.csv"),fracture_history(out/"fracture_history.csv");
+    std::ofstream energy_history,energy_events;
+    const std::string energy_columns="step,stage,strain,initiated_particles,tensile_failed_particles,max_damage,stored_J,stabilization_J,fracture_dissipation_J,equivalent_crack_area_m2\n";
+    if(energy_model){energy_history.open(out/"energy_history.csv");energy_events.open(out/"energy_events.csv");energy_history<<energy_columns;energy_events<<energy_columns;}
     fracture_events<<"event,step,stage,strain,new_physical_broken_bonds,total_physical_broken_bonds,resolution_removed_bonds,ballistic_particles,affine_gradient_rows,inactive_inner_points,inactive_outer_points,topology_version,gradient_dt_bound,tie_dt_bound,plate_dt_bound,fragment_dt_bound\n";
     fracture_history<<"stage,strain,total_physical_broken_bonds,maximum_damage,ballistic_particles,resolution_removed_bonds,affine_gradient_rows,inactive_inner_points,inactive_outer_points,self_contacts,core_contacts,debris_plate_contacts,fragment_force_residual,fragment_torque_residual,fragment_power_residual\n";
     eq<<std::setprecision(17)<<"load_step,relaxation_steps,compression_m,strain,upper_N,lower_N,force_residual,plate_imbalance,kinetic_ratio,max_tie_gap_m,min_core_J,min_PD_J,interface_force_residual,interface_torque_residual,interface_power_residual\n";
@@ -372,6 +396,10 @@ int runHybrid(const HybridOptions &o)
         for(size_t i=0;i<inner_points.size();++i)f<<inner_points[i][0]<<','<<inner_points[i][1]<<','<<inner_points[i][2]<<','<<tie.x_a[i][0]<<','<<tie.x_a[i][1]<<','<<tie.x_a[i][2]<<','
             <<tie.x_b[i][0]<<','<<tie.x_b[i][1]<<','<<tie.x_b[i][2]<<','<<tie.force_a[i][0]<<','<<tie.force_a[i][1]<<','<<tie.force_a[i][2]<<','<<inner_area[i]<<'\n';
     };
+    size_t last_energy_initiated=0,last_energy_failed=0,last_energy_vtp_failed=0,energy_event_count=0;
+    auto write_energy=[&](std::ostream&file,Real delta)
+    {auto a=energy_model->statistics();file<<std::setprecision(17)<<step<<','<<stage<<','<<delta/o.diameter<<','<<a.initiated<<','<<a.failed<<','<<a.max_damage<<','
+        <<a.stored<<','<<a.stabilization<<','<<a.dissipated<<','<<a.dissipated/o.fracture_energy<<'\n';file.flush();return a;};
     auto inspect=[&](State &a,Real &kinetic,Real &minimum,bool is_core)
     {
         for(size_t i=0;i<a.n;++i)
@@ -379,7 +407,7 @@ int runHybrid(const HybridOptions &o)
             Real J=a.F[i].determinant();if(!a.x[i].allFinite() || !a.v[i].allFinite() || !std::isfinite(J) || J<=.2)throw std::runtime_error("Invalid solid deformation state");
             minimum=std::min(minimum,J);kinetic+=.5*a.mass[i]*a.v[i].squaredNorm();
             if(is_core)ever_cap[i]=ever_cap[i] || dpc_surface[i]==2;
-            else if(failure[i]!=0 || (!growth&&damage[i]!=0) || !std::isfinite(damage[i])||damage[i]<0||damage[i]>1 || !pd_stress[i].allFinite())throw std::runtime_error("Invalid PD damage/material state");
+            else if(failure[i]!=0 || (!growth&&!energy_growth&&damage[i]!=0) || !std::isfinite(damage[i])||damage[i]<0||damage[i]>1 || !pd_stress[i].allFinite())throw std::runtime_error("Invalid PD damage/material state");
         }
     };
     while(true)
@@ -394,7 +422,7 @@ int runHybrid(const HybridOptions &o)
                 fracture_inner->rebuildChanged();fracture_outer->rebuildChanged();
                 tie.stable_dt=ReferenceSolidSurface::stableBound(pd_inner,&core_surface,tie.stiffness);
                 contact.stable_dt=ReferenceSolidSurface::stableBound(pd_outer,nullptr,contact.stiffness);update_constraint_bound();
-                pd_second(0);for(size_t i=0;i<s.n;++i)pd_acc[i].setZero();pd_third(0);pd_stabilize.exec(0);pd_pair_damping.exec(0);
+                pd_second(0);for(size_t i=0;i<s.n;++i)pd_acc[i].setZero();pd_third(0);pd_auxiliary(0);
                 apply(delta,plate_speed(stage_time));for(size_t i=0;i<s.n;++i)pd_acc[i]+=pd_port.external[i];consecutive=0;
                 if(fracture_event_count==0)first_fracture_step=step;++fracture_event_count;
                 fracture_events<<std::setprecision(17)<<fracture_event_count<<','<<step<<','<<stage<<','<<delta/o.diameter<<','<<newly<<','<<onset->total_physical_broken_bonds<<','
@@ -424,6 +452,12 @@ int runHybrid(const HybridOptions &o)
             }
         }
         Real kinetic=0,jc=1,js=1;inspect(c,kinetic,jc,true);inspect(s,kinetic,js,false);
+        if(energy_model&&step%200==0)
+        {auto a=energy_model->statistics();if(a.initiated!=last_energy_initiated||a.failed!=last_energy_failed)
+         {bool frame=(last_energy_initiated==0&&a.initiated>0)||(last_energy_failed==0&&a.failed>0)||a.failed>=last_energy_vtp_failed+std::max(size_t(1),s.n/100);
+          write_energy(energy_events,delta);++energy_event_count;if(frame){write_fields(100000+energy_event_count);last_energy_vtp_failed=a.failed;}
+          if(last_energy_initiated==0||last_energy_failed==0&&a.failed>0)std::cout<<"ENERGY_DAMAGE strain="<<delta/o.diameter<<" initiated="<<a.initiated<<" failed="<<a.failed<<" dissipation="<<a.dissipated<<std::endl;
+          last_energy_initiated=a.initiated;last_energy_failed=a.failed;}}
         min_core_J=std::min(min_core_J,jc);min_pd_J=std::min(min_pd_J,js);max_gap=std::max(max_gap,tie.max_gap);
         if(o.postfracture_checkpoint_steps&&fracture_event_count&&step-first_fracture_step>=o.postfracture_checkpoint_steps)
         {
@@ -441,7 +475,8 @@ int runHybrid(const HybridOptions &o)
         for(size_t i=0;i<c.n;++i)dpc_dt=std::min(dpc_dt,o.cfl*1.15*o.spacing/(dpc_material.acousticBound(c.F[i].determinant())+c.v[i].norm()));
         Real quadratic_dt=o.quadratic_kinematics?quadratic_reference.elastic_dt_bound:std::numeric_limits<Real>::infinity();
         Real fragment_dt=growth?fragment_contact->stable_dt:std::numeric_limits<Real>::infinity();
-        Real dt=std::min({o.max_dt,core_dt.exec(),pd_dt.exec(),constraint_dt,radial_dt,dpc_dt,quadratic_dt,fragment_dt})*o.dt_scale;
+        Real energy_dt=energy_model?energy_model->stabilizer_dt:std::numeric_limits<Real>::infinity();
+        Real dt=std::min({o.max_dt,core_dt.exec(),pd_dt.exec(),constraint_dt,radial_dt,dpc_dt,quadratic_dt,fragment_dt,energy_dt})*o.dt_scale;
         if(!std::isfinite(dt) || dt<1e-15 || step>=o.max_steps)throw std::runtime_error("Time step/count guard");
         if(step==0)write_fields(0);
         if(step%1000==0)
@@ -470,6 +505,7 @@ int runHybrid(const HybridOptions &o)
                 if(growth){fracture_history<<std::setprecision(17)<<stage<<','<<delta/o.diameter<<','<<onset->total_physical_broken_bonds<<','<<onset->maximum_damage<<','
                     <<fracture_reference->ballistic_particles<<','<<fracture_reference->resolution_removed_bonds<<','<<fracture_reference->affine_rows<<','<<fracture_inner->inactive_points<<','<<fracture_outer->inactive_points<<','
                     <<fragment_contact->self_contacts<<','<<fragment_contact->core_contacts<<','<<fragment_contact->plane_contacts<<','<<fragment_contact->force_residual<<','<<fragment_contact->torque_residual<<','<<fragment_contact->power_residual<<'\n';fracture_history.flush();}
+                if(energy_model)write_energy(energy_history,delta);
                 write_fields(stage);
                 std::cout<<"ACCEPTED load="<<stage<<'/'<<o.load_steps<<" strain="<<delta/o.diameter<<" force="<<mean<<" residual="<<residual<<" imbalance="<<imbalance<<std::endl;
                 if(stage==o.load_steps)break;
@@ -483,7 +519,7 @@ int runHybrid(const HybridOptions &o)
         // PD first-half copied old prior acceleration before drifting. Replace
         // it here with the common-midpoint interface/contact loads exactly once.
         for(size_t i=0;i<s.n;++i)pd_acc[i]=pd_port.external[i];
-        pd_second(dt);pd_third(dt);pd_stabilize.exec(dt);pd_pair_damping.exec(dt);
+        pd_second(dt);pd_third(dt);pd_auxiliary(dt);
         particle_for(execution::ParallelPolicy(),core.LoopRange(),[&](size_t i){core_first.interaction(i,dt);});
         particle_for(execution::ParallelPolicy(),core.LoopRange(),[&](size_t i){core_first.update(i,dt);});
         Real factor=std::exp(-o.damping_rate*dt);
@@ -507,6 +543,11 @@ int runHybrid(const HybridOptions &o)
         <<",\"inactive_outer_points\":"<<fracture_outer->inactive_points<<",\"shell_mass_preserved\":"<<(std::abs(s.totalMass()/expected_shell_mass-1)<1e-10?"true":"false")
         <<",\"max_fragment_force_residual\":"<<maximum_fragment_force_error<<",\"max_fragment_torque_residual\":"<<maximum_fragment_torque_error
         <<",\"max_fragment_power_residual\":"<<maximum_fragment_power_error<<",\"fracture_energy_regularized\":false,\"experimentally_calibrated_fracture\":false}\n";}
+    if(energy_model){auto a=energy_model->statistics();std::ofstream f(out/"energy_summary.json");f<<std::setprecision(17)
+        <<"{\"status\":\"COMPLETED_NOSB_PD_ENERGY_DAMAGE_COMPRESSION\",\"ft_Pa\":"<<o.fracture_stress<<",\"Gc_J_m2\":"<<o.fracture_energy
+        <<",\"band_width_m\":"<<energy_model->fracture.width<<",\"initiated_particles\":"<<a.initiated<<",\"tensile_failed_particles\":"<<a.failed
+        <<",\"maximum_damage\":"<<a.max_damage<<",\"stored_J\":"<<a.stored<<",\"stabilization_J\":"<<a.stabilization<<",\"fracture_dissipated_J\":"<<a.dissipated
+        <<",\"equivalent_fracture_area_m2\":"<<a.dissipated/o.fracture_energy<<",\"numerical_erosion_bonds\":0,\"interface_releases\":0,\"sharp_crack_geometry_claimed\":false,\"core_fracture_implemented\":false,\"material_calibrated\":false}\n";}
     return 0;
 }
 

@@ -8,17 +8,20 @@
 #include "pd_quadratic_correspondence.h"
 #include "pd_solid_reference_coupling.h"
 #include "pd_principal_stress_onset.h"
+#include "pd_fragment_contact.h"
 #include <sstream>
 #include <map>
 
 struct HybridOptions : PDSolidCapsuleOptions
 {
     bool preflight_only=false;
+    size_t postfracture_checkpoint_steps=0;
     bool quadratic_kinematics=false;
     size_t shell_layers=3;
     unsigned interface_order=1;
     Real interface_core_support=2.5,interface_shell_support=2.5;
     std::string shell_material="elastic",fracture_model="none",fracture_scope="none";
+    std::string fragment_policy="error",core_contact_mesh;
     Real shell_yield=0,shell_hardening=0,fracture_stress=0;
     Real pd_spacing=0,pd_cfl=.1,pd_hourglass=.5;
     Real ramp_duration=2.8132387884274494e-6,max_stage_duration=1.4066193942137247e-5;
@@ -45,6 +48,10 @@ struct HybridOptions : PDSolidCapsuleOptions
             if(key=="shell-material"){shell_material=value;return;}
             if(key=="fracture-model"){fracture_model=value;return;}
             if(key=="fracture-scope"){fracture_scope=value;return;}
+            if(key=="fragment-policy"){fragment_policy=value;return;}
+            if(key=="core-contact-mesh"){core_contact_mesh=value;return;}
+            if(key=="postfracture-checkpoint-steps")
+            {size_t used=0;postfracture_checkpoint_steps=std::stoull(value,&used);if(used!=value.size())throw std::invalid_argument("Invalid checkpoint count");return;}
             if(key=="shell-layers"){size_t used=0;shell_layers=std::stoul(value,&used);if(used!=value.size())throw std::invalid_argument("Invalid layer count");return;}
             Real *target=nullptr;
             if(key=="shell-yield-stress")target=&shell_yield;
@@ -63,6 +70,7 @@ struct HybridOptions : PDSolidCapsuleOptions
         };
         for(int i=1;i<argc;++i)consume(argv[i]);
         std::vector<char*> ptr;for(auto &a:base)ptr.push_back(a.data());
+        if(fracture_model=="principal_stress"&&fracture_scope=="growth")maximum_supported_strain=.25;
         PDSolidCapsuleOptions::parse(int(ptr.size()),ptr.data());
         if(pd_spacing==0)pd_spacing=spacing;
         if(shell_material!="elastic"&&shell_material!="j2")throw std::invalid_argument("shell-material must be elastic or j2");
@@ -71,8 +79,12 @@ struct HybridOptions : PDSolidCapsuleOptions
             throw std::invalid_argument("J2 requires an explicit positive shell-yield-stress; elastic forbids plastic parameters");
         if(fracture_model=="none")
         {if(fracture_scope!="none"||fracture_stress!=0)throw std::invalid_argument("No-fracture mode forbids active fracture parameters");}
-        else if(fracture_model!="principal_stress"||fracture_scope!="first_crack"||fracture_stress<=0)
-            throw std::invalid_argument("Only principal_stress with explicit threshold and fracture-scope=first_crack is supported; post-fracture reconstruction/contact are unqualified");
+        else if(fracture_model!="principal_stress"||(fracture_scope!="first_crack"&&fracture_scope!="growth")||fracture_stress<=0)
+            throw std::invalid_argument("principal_stress requires explicit threshold and first_crack or growth scope");
+        if(fragment_policy!="error"&&fragment_policy!="ballistic_erosion")throw std::invalid_argument("Unknown fragment resolution policy");
+        if(fracture_scope=="growth"&&(!quadratic_kinematics||interface_order!=2||core_contact_mesh.empty()))
+            throw std::invalid_argument("Fracture growth requires quadratic PD, quadratic interface and a core-contact triangulation");
+        if(postfracture_checkpoint_steps&&(fracture_scope!="growth"||preflight_only||postfracture_checkpoint_steps>max_steps))throw std::invalid_argument("Invalid fracture-growth diagnostic checkpoint");
         if(!coated || !quasistatic || material!="dpc" || plate_contact!="outer_surface" ||
             patch_test || rest_test || smoke_test || (shell_layers!=3 && shell_layers!=5) ||
             pd_spacing<=0 || pd_cfl<=0 || pd_cfl>.2 || pd_hourglass<0 ||
@@ -165,7 +177,12 @@ int runHybrid(const HybridOptions &o)
     InteractionWithUpdate<solid_dynamics::NosbPDShapeMatrix> pd_shape(shell_inner);
     SimpleDynamics<solid_dynamics::NosbPDFirstStep> pd_first(shell);
     InteractionWithUpdate<solid_dynamics::NosbPDSecondStep> pd_linear_second(shell_inner);
-    solid_dynamics::PDQuadraticReference quadratic_reference(shell_inner);
+    bool growth=o.fracture_scope=="growth";
+    UniquePtr<solid_dynamics::PDQuadraticReference> reference_owner;
+    solid_dynamics::PDFractureReference *fracture_reference=nullptr;
+    if(growth){auto r=makeUnique<solid_dynamics::PDFractureReference>(shell_inner,o.fragment_policy=="ballistic_erosion");fracture_reference=r.get();reference_owner=std::move(r);}
+    else reference_owner=makeUnique<solid_dynamics::PDQuadraticReference>(shell_inner);
+    auto &quadratic_reference=*reference_owner;
     InteractionWithUpdate<solid_dynamics::NosbPDQuadraticSecondStep> pd_quadratic_second(shell_inner,quadratic_reference);
     UniquePtr<BaseDynamics<void>> plastic_second;
     if(o.shell_material=="j2")
@@ -183,7 +200,7 @@ int runHybrid(const HybridOptions &o)
     ReduceDynamics<solid_dynamics::PDTimeStep> pd_dt(shell,o.pd_cfl);
     State c(core),s(shell);
     system.initializeSystemCellLinkedLists();system.initializeSystemConfigurations();core_correction.exec();pd_shape.exec();
-    if(o.quadratic_kinematics)quadratic_reference.build();
+    if(growth)fracture_reference->initialize();else if(o.quadratic_kinematics)quadratic_reference.build();
     pd_second(0);
     SolidForcePort core_port(core,SolidForcePort::Storage::ForcePrior);
     SolidForcePort pd_port(shell,SolidForcePort::Storage::PDAccelerationPrior);
@@ -193,8 +210,13 @@ int runHybrid(const HybridOptions &o)
     for(const auto &n:interface_directions)inner_points.push_back(rc*n);
     for(const auto &n:contact_directions)outer_points.push_back(R*n);
     ReferenceSolidSurface core_surface(core_port,inner_points,o.spacing,o.interface_core_support,o.interface_order);
-    ReferenceSolidSurface pd_inner(pd_port,inner_points,o.pd_spacing,o.interface_shell_support,o.interface_order);
-    ReferenceSolidSurface pd_outer(pd_port,outer_points,o.pd_spacing);
+    UniquePtr<ReferenceSolidSurface> inner_owner,outer_owner;
+    FractureAwareSurface *fracture_inner=nullptr,*fracture_outer=nullptr;
+    if(growth)
+    {auto a=makeUnique<FractureAwareSurface>(pd_port,inner_points,o.pd_spacing,o.interface_shell_support,o.interface_order,*fracture_reference);fracture_inner=a.get();inner_owner=std::move(a);
+     auto b=makeUnique<FractureAwareSurface>(pd_port,outer_points,o.pd_spacing,2.5,1,*fracture_reference);fracture_outer=b.get();outer_owner=std::move(b);}
+    else {inner_owner=makeUnique<ReferenceSolidSurface>(pd_port,inner_points,o.pd_spacing,o.interface_shell_support,o.interface_order);outer_owner=makeUnique<ReferenceSolidSurface>(pd_port,outer_points,o.pd_spacing);}
+    auto &pd_inner=*inner_owner;auto &pd_outer=*outer_owner;
     Real Eref=o.constraint_E>0?o.constraint_E:o.core_E;
     StdVec<Real> inner_area(inner_points.size(),4*Pi*rc*rc/inner_points.size());
     StdVec<Real> outer_area(outer_points.size(),4*Pi*R*R/outer_points.size());
@@ -206,6 +228,18 @@ int runHybrid(const HybridOptions &o)
     for(size_t i=1;i<quadrature.xi.size();++i)radial_spacing=std::min(radial_spacing,.5*o.thickness*(quadrature.xi[i]-quadrature.xi[i-1]));
     auto &pd_material=DynamicCast<HughesWingetSolid>(&shell,shell.getMatterMaterial());
     Real radial_dt=o.pd_cfl*std::min(radial_spacing,o.pd_spacing)/pd_material.ReferenceSoundSpeed();
+    UniquePtr<ReferenceSolidSurface> exposed_surface;UniquePtr<ExposedCorePlaneContact> exposed_contact;UniquePtr<PDFragmentContact> fragment_contact;
+    if(growth)
+    {
+        StdVec<Vecd> q;for(const auto &n:contact_directions)q.push_back(rc*n);
+        exposed_surface=makeUnique<ReferenceSolidSurface>(core_port,q,o.spacing);
+        StdVec<Real> area(q.size(),4*Pi*rc*rc/q.size());exposed_contact=makeUnique<ExposedCorePlaneContact>(*exposed_surface,pd_outer,area,o.contact_factor*Eref/o.spacing);
+        StdVec<Matd> metric(s.n);
+        for(size_t i=0;i<s.n;++i){Real r=s.x0[i].norm();Vecd n=s.x0[i]/r;
+            Real ar=std::min(.5*radial_spacing,.75*std::min(r-rc,R-r)),at=.5*o.pd_spacing;
+            metric[i]=at*at*Matd::Identity()+(ar*ar-at*at)*n*n.transpose();}
+        fragment_contact=makeUnique<PDFragmentContact>(pd_port,*fracture_reference,core_surface,tie.x_b,metric,o.contact_factor*Eref/o.spacing,o.core_contact_mesh);
+    }
     auto &cp=core.getBaseParticles();auto &sp=shell.getBaseParticles();
     auto *pd_acc=sp.getVariableDataByName<Vecd>("PDAcceleration");
     auto *pd_internal=sp.getVariableDataByName<Vecd>("PDInternalForce");
@@ -214,7 +248,7 @@ int runHybrid(const HybridOptions &o)
     auto *failure=sp.getVariableDataByName<int>("NumericalFailureReason");
     auto *damage=sp.getVariableDataByName<Real>("Damage");
     UniquePtr<solid_dynamics::PrincipalStressBondOnset> onset;
-    if(o.fracture_model!="none")onset=makeUnique<solid_dynamics::PrincipalStressBondOnset>(shell_inner,o.fracture_stress);
+    if(o.fracture_model!="none")onset=makeUnique<solid_dynamics::PrincipalStressBondOnset>(shell_inner,o.fracture_stress,growth);
     auto *dpc_r=cp.getVariableDataByName<Real>("DPCRelativeDensity");
     auto *dpc_kappa=cp.getVariableDataByName<Real>("DPCPlasticCompaction");
     auto *dpc_residual=cp.getVariableDataByName<Real>("DPCYieldResidual");
@@ -237,6 +271,8 @@ int runHybrid(const HybridOptions &o)
         <<"status=CONFIGURED_PD_SOLID_CASE_NOT_CALIBRATED\ncore_backend=total_lagrangian_solid_SPH\nshell_backend=NOSB_PD_volume\nfluid_backend=none\n"
         <<"shell_constitutive="<<(o.shell_material=="elastic"?"HughesWinget_elastic":"J2_HW_plastic")
         <<"\nfracture_model="<<o.fracture_model<<"\nfracture_scope="<<o.fracture_scope<<"\nfracture_stress="<<o.fracture_stress
+        <<"\nfragment_policy="<<o.fragment_policy<<"\ncore_contact_mesh="<<o.core_contact_mesh<<"\nfracture_energy_regularized=0"
+        <<"\npostfracture_checkpoint_steps="<<o.postfracture_checkpoint_steps
         <<"\nshell_yield_stress="<<o.shell_yield<<"\nshell_hardening_modulus="<<o.shell_hardening<<"\ncore_material=DPC\n"
         <<"shell_E="<<o.shell_E<<"\nshell_nu="<<o.shell_nu<<"\nshell_reference_density="<<o.shell_rho
         <<"\ninterface_law=perfect_bond_vector_penalty\n"
@@ -297,9 +333,13 @@ int runHybrid(const HybridOptions &o)
     {body->getBaseParticles().addVariableToWrite<Vecd>("Velocity");body->getBaseParticles().addVariableToWrite<Matd>("DeformationGradient");}
     sp.addVariableToWrite<Matd>("PDStress");
     sp.addVariableToWrite<Real>("Damage");sp.addVariableToWrite<int>("BondNumber");sp.addVariableToWrite<int>("ParticleLive");
+    if(growth){sp.addVariableToWrite<int>("PDReproductionOrder");sp.addVariableToWrite<int>("ResolutionEroded");}
     cp.addVariableToWrite<Matd>("DPCCauchyStress");
     BodyStatesRecordingToVtp vtp(system);
     std::ofstream eq(out/"equilibria.csv"),history(out/"material_history.csv"),progress(out/"progress.csv");
+    std::ofstream fracture_events(out/"fracture_events.csv"),fracture_history(out/"fracture_history.csv");
+    fracture_events<<"event,step,stage,strain,new_physical_broken_bonds,total_physical_broken_bonds,resolution_removed_bonds,ballistic_particles,affine_gradient_rows,inactive_inner_points,inactive_outer_points,topology_version,gradient_dt_bound,tie_dt_bound,plate_dt_bound,fragment_dt_bound\n";
+    fracture_history<<"stage,strain,total_physical_broken_bonds,maximum_damage,ballistic_particles,resolution_removed_bonds,affine_gradient_rows,inactive_inner_points,inactive_outer_points,self_contacts,core_contacts,debris_plate_contacts,fragment_force_residual,fragment_torque_residual,fragment_power_residual\n";
     eq<<std::setprecision(17)<<"load_step,relaxation_steps,compression_m,strain,upper_N,lower_N,force_residual,plate_imbalance,kinetic_ratio,max_tie_gap_m,min_core_J,min_PD_J,interface_force_residual,interface_torque_residual,interface_power_residual\n";
     history<<std::setprecision(17)<<"load_step,strain,core_volume_ratio,min_relative_density,max_relative_density,min_hardening_strain,max_hardening_strain,ever_cap_fraction,plastic_stress_work_J,max_yield_residual\n";
     progress<<std::setprecision(17)<<"step,stage,stage_time_s,dt_s,compression_m,upper_N,lower_N,kinetic_J,interface_J,contact_J,min_core_J,min_PD_J\n";
@@ -307,8 +347,23 @@ int runHybrid(const HybridOptions &o)
     size_t stage=1,stage_step=0,step=0,consecutive=0;Real stage_time=0,max_gap=0,min_core_J=1,min_pd_J=1,work=0,core_relax_loss=0;
     auto delta_at=[&](Real t){Real a=std::clamp(t/o.ramp_duration,Real(0),Real(1));
         return o.strain*o.diameter*(Real(stage-1)+.5*(1-std::cos(Pi*a)))/o.load_steps;};
-    auto apply=[&](Real delta)
-    {core_port.clear();pd_port.clear();tie.apply();contact.apply(-R+.5*delta,R-.5*delta);};
+    size_t fracture_event_count=0,first_fracture_step=0;Real maximum_fragment_force_error=0,maximum_fragment_torque_error=0,maximum_fragment_power_error=0;
+    auto update_constraint_bound=[&]()
+    {Real rate=1/(tie.stable_dt*tie.stable_dt)+1/(contact.stable_dt*contact.stable_dt);
+     if(growth&&fracture_outer->inactive_points)rate+=1/(exposed_contact->stable_dt*exposed_contact->stable_dt);constraint_dt=1/std::sqrt(rate);};
+    auto plate_speed=[&](Real t){Real a=std::clamp(t/o.ramp_duration,Real(0),Real(1));
+        return t<o.ramp_duration?o.strain*o.diameter*.5*Pi*std::sin(Pi*a)/(o.load_steps*o.ramp_duration):0;};
+    auto apply=[&](Real delta,Real speed=0)
+    {
+        core_port.clear();pd_port.clear();tie.apply();contact.apply(-R+.5*delta,R-.5*delta);
+        if(growth&&fracture_reference->topology_version)
+        {exposed_contact->apply(-R+.5*delta,R-.5*delta);fragment_contact->apply(-R+.5*delta,R-.5*delta,.5*speed,-.5*speed);
+         contact.upper+=exposed_contact->upper+fragment_contact->upper;contact.lower+=exposed_contact->lower+fragment_contact->lower;
+         contact.energy+=exposed_contact->energy+fragment_contact->energy;
+         maximum_fragment_force_error=std::max(maximum_fragment_force_error,fragment_contact->force_residual);
+         maximum_fragment_torque_error=std::max(maximum_fragment_torque_error,fragment_contact->torque_residual);
+         maximum_fragment_power_error=std::max(maximum_fragment_power_error,fragment_contact->power_residual);}
+    };
     auto write_fields=[&](size_t frame)
     {
         vtp.writeToFile(frame);
@@ -324,14 +379,33 @@ int runHybrid(const HybridOptions &o)
             Real J=a.F[i].determinant();if(!a.x[i].allFinite() || !a.v[i].allFinite() || !std::isfinite(J) || J<=.2)throw std::runtime_error("Invalid solid deformation state");
             minimum=std::min(minimum,J);kinetic+=.5*a.mass[i]*a.v[i].squaredNorm();
             if(is_core)ever_cap[i]=ever_cap[i] || dpc_surface[i]==2;
-            else if(failure[i]!=0 || damage[i]!=0 || !pd_stress[i].allFinite())throw std::runtime_error("PD failure in an intact prefracture case");
+            else if(failure[i]!=0 || (!growth&&damage[i]!=0) || !std::isfinite(damage[i])||damage[i]<0||damage[i]>1 || !pd_stress[i].allFinite())throw std::runtime_error("Invalid PD damage/material state");
         }
     };
     while(true)
     {
-        Real delta=delta_at(stage_time);apply(delta);
+        Real delta=delta_at(stage_time);apply(delta,plate_speed(stage_time));
         if(onset && step%200==0 && onset->scan())
         {
+            if(growth)
+            {
+                onset->commitFirstBreak();size_t newly=onset->candidates.size();fracture_reference->updateAfterFailure();
+                onset->maximum_damage=std::max(onset->maximum_damage,*std::max_element(damage,damage+s.n));
+                fracture_inner->rebuildChanged();fracture_outer->rebuildChanged();
+                tie.stable_dt=ReferenceSolidSurface::stableBound(pd_inner,&core_surface,tie.stiffness);
+                contact.stable_dt=ReferenceSolidSurface::stableBound(pd_outer,nullptr,contact.stiffness);update_constraint_bound();
+                pd_second(0);for(size_t i=0;i<s.n;++i)pd_acc[i].setZero();pd_third(0);pd_stabilize.exec(0);pd_pair_damping.exec(0);
+                apply(delta,plate_speed(stage_time));for(size_t i=0;i<s.n;++i)pd_acc[i]+=pd_port.external[i];consecutive=0;
+                if(fracture_event_count==0)first_fracture_step=step;++fracture_event_count;
+                fracture_events<<std::setprecision(17)<<fracture_event_count<<','<<step<<','<<stage<<','<<delta/o.diameter<<','<<newly<<','<<onset->total_physical_broken_bonds<<','
+                    <<fracture_reference->resolution_removed_bonds<<','<<fracture_reference->ballistic_particles<<','<<fracture_reference->affine_rows<<','
+                    <<fracture_inner->inactive_points<<','<<fracture_outer->inactive_points<<','<<fracture_reference->topology_version<<','<<quadratic_reference.elastic_dt_bound<<','
+                    <<tie.stable_dt<<','<<contact.stable_dt<<','<<fragment_contact->stable_dt<<'\n';fracture_events.flush();
+                if(fracture_event_count==1 || fracture_event_count%10==0)write_fields(100000+fracture_event_count);
+                std::cout<<"FRACTURE event="<<fracture_event_count<<" strain="<<delta/o.diameter<<" new_bonds="<<newly<<" ballistic="<<fracture_reference->ballistic_particles<<std::endl;
+            }
+            else
+            {
             // A genuine reciprocal bond-state change is written, but NO force,
             // constitutive or MLS update is evaluated on the broken topology.
             // This explicit boundary prevents a first-crack diagnostic from
@@ -347,13 +421,27 @@ int runHybrid(const HybridOptions &o)
                 <<",\"postfracture_evolution\":false,\"postfracture_equilibrium\":false,\"fracture_energy_calibrated\":false}\n";
             std::cout<<"FIRST_CRACK strain="<<delta/o.diameter<<" broken_bonds="<<onset->candidates.size()<<"; diagnostic stopped before post-fracture evolution"<<std::endl;
             return 0;
+            }
         }
         Real kinetic=0,jc=1,js=1;inspect(c,kinetic,jc,true);inspect(s,kinetic,js,false);
         min_core_J=std::min(min_core_J,jc);min_pd_J=std::min(min_pd_J,js);max_gap=std::max(max_gap,tie.max_gap);
+        if(o.postfracture_checkpoint_steps&&fracture_event_count&&step-first_fracture_step>=o.postfracture_checkpoint_steps)
+        {
+            write_fields(200000);std::ofstream f(out/"continuation_checkpoint.json");f<<std::setprecision(17)
+                <<"{\"status\":\"DIAGNOSTIC_POSTFRACTURE_CONTINUATION_NOT_EQUILIBRATED\",\"step\":"<<step<<",\"first_fracture_step\":"<<first_fracture_step
+                <<",\"postfracture_steps\":"<<step-first_fracture_step<<",\"events\":"<<fracture_event_count<<",\"physical_broken_bonds\":"<<onset->total_physical_broken_bonds
+                <<",\"resolution_removed_bonds\":"<<fracture_reference->resolution_removed_bonds<<",\"ballistic_particles\":"<<fracture_reference->ballistic_particles
+                <<",\"mass_preserved\":"<<(std::abs(s.totalMass()/expected_shell_mass-1)<1e-10&&std::abs(c.totalMass()/expected_core_mass-1)<1e-10?"true":"false")
+                <<",\"all_inspected_states_finite\":true,\"min_core_J\":"<<min_core_J<<",\"min_PD_J\":"<<min_pd_J
+                <<",\"max_fragment_force_residual\":"<<maximum_fragment_force_error<<",\"max_fragment_torque_residual\":"<<maximum_fragment_torque_error
+                <<",\"max_fragment_power_residual\":"<<maximum_fragment_power_error<<",\"quasistatic_equilibrium_claimed\":false,\"experimental_curve_claimed\":false}\n";
+            std::cout<<"CONTINUATION_CHECKPOINT passed; diagnostic only, no equilibrated curve claimed"<<std::endl;return 0;
+        }
         Real dpc_dt=std::numeric_limits<Real>::infinity();
         for(size_t i=0;i<c.n;++i)dpc_dt=std::min(dpc_dt,o.cfl*1.15*o.spacing/(dpc_material.acousticBound(c.F[i].determinant())+c.v[i].norm()));
         Real quadratic_dt=o.quadratic_kinematics?quadratic_reference.elastic_dt_bound:std::numeric_limits<Real>::infinity();
-        Real dt=std::min({o.max_dt,core_dt.exec(),pd_dt.exec(),constraint_dt,radial_dt,dpc_dt,quadratic_dt})*o.dt_scale;
+        Real fragment_dt=growth?fragment_contact->stable_dt:std::numeric_limits<Real>::infinity();
+        Real dt=std::min({o.max_dt,core_dt.exec(),pd_dt.exec(),constraint_dt,radial_dt,dpc_dt,quadratic_dt,fragment_dt})*o.dt_scale;
         if(!std::isfinite(dt) || dt<1e-15 || step>=o.max_steps)throw std::runtime_error("Time step/count guard");
         if(step==0)write_fields(0);
         if(step%1000==0)
@@ -379,6 +467,9 @@ int runHybrid(const HybridOptions &o)
                 for(size_t i=0;i<c.n;++i){V+=c.measure[i]*c.F[i].determinant();V0+=c.measure[i];W+=c.measure[i]*dpc_work[i];yr=std::max(yr,dpc_residual[i]);cap+=ever_cap[i];}
                 history<<stage<<','<<delta/o.diameter<<','<<V/V0<<','<<*std::min_element(dpc_r,dpc_r+c.n)<<','<<*std::max_element(dpc_r,dpc_r+c.n)<<','
                     <<*std::min_element(dpc_kappa,dpc_kappa+c.n)<<','<<*std::max_element(dpc_kappa,dpc_kappa+c.n)<<','<<Real(cap)/c.n<<','<<W<<','<<yr<<'\n';history.flush();
+                if(growth){fracture_history<<std::setprecision(17)<<stage<<','<<delta/o.diameter<<','<<onset->total_physical_broken_bonds<<','<<onset->maximum_damage<<','
+                    <<fracture_reference->ballistic_particles<<','<<fracture_reference->resolution_removed_bonds<<','<<fracture_reference->affine_rows<<','<<fracture_inner->inactive_points<<','<<fracture_outer->inactive_points<<','
+                    <<fragment_contact->self_contacts<<','<<fragment_contact->core_contacts<<','<<fragment_contact->plane_contacts<<','<<fragment_contact->force_residual<<','<<fragment_contact->torque_residual<<','<<fragment_contact->power_residual<<'\n';fracture_history.flush();}
                 write_fields(stage);
                 std::cout<<"ACCEPTED load="<<stage<<'/'<<o.load_steps<<" strain="<<delta/o.diameter<<" force="<<mean<<" residual="<<residual<<" imbalance="<<imbalance<<std::endl;
                 if(stage==o.load_steps)break;
@@ -388,7 +479,7 @@ int runHybrid(const HybridOptions &o)
         if(stage_time>o.max_stage_duration)throw std::runtime_error("Hybrid load step did not reach equilibrium;no complete result written");
         particle_for(execution::ParallelPolicy(),core.LoopRange(),[&](size_t i){core_first.initialization(i,dt);});
         pd_first.exec(dt);
-        apply(delta_at(stage_time+.5*dt));
+        apply(delta_at(stage_time+.5*dt),plate_speed(stage_time+.5*dt));
         // PD first-half copied old prior acceleration before drifting. Replace
         // it here with the common-midpoint interface/contact loads exactly once.
         for(size_t i=0;i<s.n;++i)pd_acc[i]=pd_port.external[i];
@@ -409,6 +500,13 @@ int runHybrid(const HybridOptions &o)
         <<",\n\"max_contact_force_mapping_residual\":"<<contact.worst_force<<",\n\"max_contact_torque_mapping_residual\":"<<contact.worst_torque<<",\n\"max_contact_power_mapping_residual\":"<<contact.worst_power
         <<",\n\"plate_work_quadrature_J\":"<<work<<",\n\"core_global_relaxation_loss_J\":"<<core_relax_loss
         <<",\n\"material_calibrated\":false,\n\"thin_layer_spatial_convergence\":false,\n\"full_stored_energy_audit\":false\n}\n";
+    if(growth){std::ofstream f(out/"fracture_summary.json");f<<std::setprecision(17)
+        <<"{\"status\":\"COMPLETED_STRENGTH_CONTROLLED_FRACTURE_GROWTH\",\"events\":"<<fracture_event_count
+        <<",\"physical_broken_bonds\":"<<onset->total_physical_broken_bonds<<",\"resolution_removed_bonds\":"<<fracture_reference->resolution_removed_bonds
+        <<",\"ballistic_particles\":"<<fracture_reference->ballistic_particles<<",\"inactive_inner_points\":"<<fracture_inner->inactive_points
+        <<",\"inactive_outer_points\":"<<fracture_outer->inactive_points<<",\"shell_mass_preserved\":"<<(std::abs(s.totalMass()/expected_shell_mass-1)<1e-10?"true":"false")
+        <<",\"max_fragment_force_residual\":"<<maximum_fragment_force_error<<",\"max_fragment_torque_residual\":"<<maximum_fragment_torque_error
+        <<",\"max_fragment_power_residual\":"<<maximum_fragment_power_error<<",\"fracture_energy_regularized\":false,\"experimentally_calibrated_fracture\":false}\n";}
     return 0;
 }
 

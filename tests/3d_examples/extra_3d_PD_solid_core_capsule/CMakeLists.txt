@@ -14,7 +14,21 @@ file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/capsule_core_fixture.h FIXTURE_HASH)
 file(SHA256 ${PERI_SHARED}/peridynamics/pd_solid_reference_coupling.h COUPLING_HASH)
 file(SHA256 ${PERI_SHARED}/materials/drucker_prager_cap_kernel.h KERNEL_HASH)
 file(SHA256 ${PERI_SHARED}/materials/drucker_prager_cap_solid.h ADAPTER_HASH)
-string(SHA256 ASSEMBLY_HASH "${MAIN_HASH};${FIXTURE_HASH};${COUPLING_HASH}")
+set(PD_ASSEMBLY_HASHES "${MAIN_HASH};${FIXTURE_HASH};${COUPLING_HASH}")
+foreach(PD_HEADER pd_quadratic_correspondence.h pd_principal_stress_onset.h
+        pd_fracture_correspondence.h pd_fracture_surface.h pd_fragment_contact.h)
+    set(PD_HEADER_PATH ${PERI_SHARED}/peridynamics/${PD_HEADER})
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${PD_HEADER_PATH})
+    file(SHA256 ${PD_HEADER_PATH} PD_HEADER_HASH)
+    string(APPEND PD_ASSEMBLY_HASHES ";${PD_HEADER_HASH}")
+endforeach()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/pd_solid_capsule.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/capsule_core_fixture.h
+    ${PERI_SHARED}/peridynamics/pd_solid_reference_coupling.h
+    ${PERI_SHARED}/materials/drucker_prager_cap_kernel.h
+    ${PERI_SHARED}/materials/drucker_prager_cap_solid.h)
+string(SHA256 ASSEMBLY_HASH "${PD_ASSEMBLY_HASHES}")
 string(SHA256 MATERIAL_HASH "${KERNEL_HASH};${ADAPTER_HASH}")
 add_executable(pd_solid_capsule pd_solid_capsule.cpp)
 target_link_libraries(pd_solid_capsule sphinxsys_3d)

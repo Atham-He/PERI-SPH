@@ -26,6 +26,7 @@ class PDQuadraticReference : public LocalDynamics, public DataDelegateInner
       : LocalDynamics(relation.getSPHBody()), DataDelegateInner(relation),
         volume(particles_->getVariableDataByName<Real>("VolumetricMeasure")),
         position(particles_->getVariableDataByName<Vecd>("Position")) {}
+    virtual ~PDQuadraticReference()=default;
 
     void build()
     {
@@ -98,7 +99,7 @@ class PDQuadraticReference : public LocalDynamics, public DataDelegateInner
         elastic_dt_bound=.2/std::sqrt(bound);
     }
 
-    void checkIntact(size_t i) const
+    virtual void checkIntact(size_t i) const
     {
         const auto &nb=inner_configuration_[i];
         if(nb.current_size_!=rows[i].size())throw std::runtime_error("Quadratic PD: reference neighbors changed");

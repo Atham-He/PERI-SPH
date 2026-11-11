@@ -57,6 +57,7 @@ class ReferenceSolidSurface
     StdVec<Vecd> points;
     StdVec<Row> rows;
     Real affine_error=0, polynomial_error=0, largest_condition_number=0;
+    virtual ~ReferenceSolidSurface()=default;
     const unsigned reproduction_order;
     ReferenceSolidSurface(SolidForcePort &p,const StdVec<Vecd> &targets,Real spacing,Real support_ratio=2.5,unsigned order=1)
         : port(p),points(targets),reproduction_order(order)
@@ -206,6 +207,8 @@ class BondedSolidInterface
         energy=max_gap=0;Vecd sum=Vecd::Zero(),torque=Vecd::Zero();Real power=0,fs=0,ps=0;
         for(size_t i=0;i<stiffness.size();++i)
         {
+            if(a.rows[i].index.empty()||b.rows[i].index.empty())
+            {x_b[i]=b.rows[i].index.empty()?Vecd::Zero():b.position(i);x_a[i]=x_b[i];force_a[i].setZero();continue;}
             Vecd xa=a.position(i),xb=b.position(i),va=a.velocity(i),vb=b.velocity(i);
             Vecd gap=xa-xb,f=-stiffness[i]*gap;
             x_a[i]=xa;x_b[i]=xb;force_a[i]=f;
@@ -252,6 +255,7 @@ class SolidSurfacePlaneContact
         upper=lower=energy=max_penetration=0;Vecd ferr=Vecd::Zero(),terr=Vecd::Zero();Real perr=0,fs=0,ps=0;
         for(size_t i=0;i<stiffness.size();++i)
         {
+            if(surface.rows[i].index.empty()){position[i].setZero();force[i].setZero();continue;}
             Vecd x=surface.position(i),v=surface.velocity(i);
             Real pb=std::max(bottom-x[2],Real(0)),pt=std::max(x[2]-top,Real(0));
             Vecd f(0,0,stiffness[i]*(pb-pt));position[i]=x;force[i]=f;

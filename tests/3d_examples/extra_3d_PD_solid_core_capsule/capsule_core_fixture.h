@@ -18,6 +18,8 @@ namespace fs = std::filesystem;
 
 struct PDSolidCapsuleOptions
 {
+    // A derived solver must explicitly qualify a larger loading range.
+    Real maximum_supported_strain = 0.15;
     bool coated = true, patch_test = false, rest_test = false, smoke_test = false;
     bool quasistatic = false;
     Real diameter = 1e-3, thickness = 1e-5, spacing = 1e-4;
@@ -132,10 +134,10 @@ struct PDSolidCapsuleOptions
         if (diameter <= 0 || thickness <= 0 || thickness >= diameter / 4 || spacing < diameter / 80 || spacing > diameter / 4 ||
             core_E <= 0 || shell_E <= 0 || core_rho <= 0 || shell_rho <= 0 ||
             core_nu < 0 || core_nu >= 0.49 || shell_nu < 0 || shell_nu >= 0.49 ||
-            strain < 0 || strain > 0.15 || load_time <= 0 || hold_time < 0 ||
+            strain < 0 || strain > maximum_supported_strain || load_time <= 0 || hold_time < 0 ||
             contact_factor <= 0 || tie_factor <= 0 || cfl <= 0 || cfl > 0.3 ||
             dt_scale <= 0 || dt_scale > 1 || drag < 0 || yield_stress <= 0 || hardening < 0)
-            throw std::invalid_argument("parameters outside supported positive/pre-fracture ranges (strain <= 0.15)");
+            throw std::invalid_argument("parameters outside the solver's supported positive/loading ranges");
         if (material != "elastic" && material != "j2" && material != "dpc") throw std::invalid_argument("material must be elastic, j2 or dpc");
         if (constraint_E < 0) throw std::invalid_argument("constraint-E must be zero (use core E) or positive");
         if(dpc_shear_hardening<0 || (dpc_shear_hardening>0 && material!="dpc"))throw std::invalid_argument("dpc-shear-hardening requires nonnegative DPC input");

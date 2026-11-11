@@ -130,6 +130,23 @@ class NosbPDQuadraticSecondStep : public NosbPDSecondStep
     }
 };
 
+/** Same intact quadratic kinematics, with the native plastic material update.
+ * Material selection does not alter the fracture criterion or reference fit. */
+class NosbPDQuadraticSecondStepPlastic : public NosbPDSecondStepPlastic
+{
+    PDQuadraticReference &reference_;
+  public:
+    NosbPDQuadraticSecondStepPlastic(BaseInnerRelation &relation,PDQuadraticReference &reference)
+      :NosbPDSecondStepPlastic(relation),reference_(reference){}
+    void interaction(size_t i,Real dt=0)
+    {
+        reference_.checkIntact(i);Matd f=Matd::Zero(),increment=Matd::Zero();
+        for(const auto &e:reference_.rows[i])
+        {f+=(pos_[e.j]-pos_[i])*e.gradient.transpose();increment+=dt*(vel_[e.j]-vel_[i])*e.gradient.transpose();}
+        Matd K=shape_K_1_[i].inverse();N_[i]=f*K;N_deltaU_[i]=increment*K;N_half_[i]=(f-.5*increment)*K;
+    }
+};
+
 class NosbPDQuadraticThirdStep : public LocalDynamics
 {
     PDQuadraticReference &reference_;Real *volume_,*mass_;Vecd *acc_,*force_;Matd *P_;

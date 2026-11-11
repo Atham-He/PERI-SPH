@@ -7,6 +7,7 @@
 #include "all_peridynamics.h"
 #include "pd_quadratic_correspondence.h"
 #include "pd_solid_reference_coupling.h"
+#include "pd_principal_stress_onset.h"
 #include <sstream>
 #include <map>
 
@@ -17,6 +18,8 @@ struct HybridOptions : PDSolidCapsuleOptions
     size_t shell_layers=3;
     unsigned interface_order=1;
     Real interface_core_support=2.5,interface_shell_support=2.5;
+    std::string shell_material="elastic",fracture_model="none",fracture_scope="none";
+    Real shell_yield=0,shell_hardening=0,fracture_stress=0;
     Real pd_spacing=0,pd_cfl=.1,pd_hourglass=.5;
     Real ramp_duration=2.8132387884274494e-6,max_stage_duration=1.4066193942137247e-5;
     Real damping_rate=.002/2.8132387884274494e-10;
@@ -39,9 +42,14 @@ struct HybridOptions : PDSolidCapsuleOptions
             if(key=="interface-order"){if(value!="1" && value!="2")throw std::invalid_argument("interface-order must be 1 or 2");interface_order=unsigned(value[0]-'0');return;}
             if(key=="core-backend"){if(value!="solid_sph")throw std::invalid_argument("Core requires solid_sph,not a WCSPH fluid");return;}
             if(key=="shell-backend"){if(value!="nosb_pd")throw std::invalid_argument("Shell requires nosb_pd");return;}
-            if(key=="fracture-model"){if(value!="none")throw std::invalid_argument("First solid-core case requires fracture-model=none");return;}
+            if(key=="shell-material"){shell_material=value;return;}
+            if(key=="fracture-model"){fracture_model=value;return;}
+            if(key=="fracture-scope"){fracture_scope=value;return;}
             if(key=="shell-layers"){size_t used=0;shell_layers=std::stoul(value,&used);if(used!=value.size())throw std::invalid_argument("Invalid layer count");return;}
             Real *target=nullptr;
+            if(key=="shell-yield-stress")target=&shell_yield;
+            if(key=="shell-hardening-modulus")target=&shell_hardening;
+            if(key=="fracture-stress")target=&fracture_stress;
             if(key=="interface-core-support-ratio")target=&interface_core_support;
             if(key=="interface-shell-support-ratio")target=&interface_shell_support;
             if(key=="pd-spacing")target=&pd_spacing;
@@ -57,6 +65,14 @@ struct HybridOptions : PDSolidCapsuleOptions
         std::vector<char*> ptr;for(auto &a:base)ptr.push_back(a.data());
         PDSolidCapsuleOptions::parse(int(ptr.size()),ptr.data());
         if(pd_spacing==0)pd_spacing=spacing;
+        if(shell_material!="elastic"&&shell_material!="j2")throw std::invalid_argument("shell-material must be elastic or j2");
+        if(shell_yield<0||shell_hardening<0||(shell_material=="j2"&&shell_yield<=0)||
+           (shell_material=="elastic"&&(shell_yield!=0||shell_hardening!=0)))
+            throw std::invalid_argument("J2 requires an explicit positive shell-yield-stress; elastic forbids plastic parameters");
+        if(fracture_model=="none")
+        {if(fracture_scope!="none"||fracture_stress!=0)throw std::invalid_argument("No-fracture mode forbids active fracture parameters");}
+        else if(fracture_model!="principal_stress"||fracture_scope!="first_crack"||fracture_stress<=0)
+            throw std::invalid_argument("Only principal_stress with explicit threshold and fracture-scope=first_crack is supported; post-fracture reconstruction/contact are unqualified");
         if(!coated || !quasistatic || material!="dpc" || plate_contact!="outer_surface" ||
             patch_test || rest_test || smoke_test || (shell_layers!=3 && shell_layers!=5) ||
             pd_spacing<=0 || pd_cfl<=0 || pd_cfl>.2 || pd_hourglass<0 ||
@@ -140,7 +156,9 @@ int runHybrid(const HybridOptions &o)
 
     PDBody shell(system,makeShared<DefaultShape>("PDShell"));
     shell.defineAdaptation<PDAdaptation>(1.5075,o.spacing/o.pd_spacing);
-    shell.defineMatterMaterial<HughesWingetSolid>(o.shell_rho,o.shell_E,o.shell_nu);
+    if(o.shell_material=="elastic")shell.defineMatterMaterial<HughesWingetSolid>(o.shell_rho,o.shell_E,o.shell_nu);
+    else shell.defineMatterMaterial<J2PlasticityforPD>(o.shell_rho,o.shell_E,o.shell_nu,o.shell_yield,
+        PDIsotropicHardening::Linear(o.shell_hardening),0);
     shell.generateParticles<BaseParticles,LayeredPDCapsuleGenerator>(rc,o.thickness,o.pd_spacing,o.shell_layers);
     InnerRelation shell_inner(shell);
     SimpleDynamics<solid_dynamics::PDTimeStepInitialization> pd_initialize(shell,makeShared<Gravity>(Vecd::Zero()));
@@ -149,7 +167,13 @@ int runHybrid(const HybridOptions &o)
     InteractionWithUpdate<solid_dynamics::NosbPDSecondStep> pd_linear_second(shell_inner);
     solid_dynamics::PDQuadraticReference quadratic_reference(shell_inner);
     InteractionWithUpdate<solid_dynamics::NosbPDQuadraticSecondStep> pd_quadratic_second(shell_inner,quadratic_reference);
-    auto pd_second=[&](Real dt){if(o.quadratic_kinematics)pd_quadratic_second.exec(dt);else pd_linear_second.exec(dt);};
+    UniquePtr<BaseDynamics<void>> plastic_second;
+    if(o.shell_material=="j2")
+    {
+        if(o.quadratic_kinematics)plastic_second=makeUnique<InteractionWithUpdate<solid_dynamics::NosbPDQuadraticSecondStepPlastic>>(shell_inner,quadratic_reference);
+        else plastic_second=makeUnique<InteractionWithUpdate<solid_dynamics::NosbPDSecondStepPlastic>>(shell_inner);
+    }
+    auto pd_second=[&](Real dt){if(plastic_second)plastic_second->exec(dt);else if(o.quadratic_kinematics)pd_quadratic_second.exec(dt);else pd_linear_second.exec(dt);};
     InteractionDynamics<solid_dynamics::NosbPDThirdStep> pd_linear_third(shell_inner);
     InteractionDynamics<solid_dynamics::NosbPDQuadraticThirdStep> pd_quadratic_third(shell_inner,quadratic_reference);
     auto pd_third=[&](Real dt){if(o.quadratic_kinematics)pd_quadratic_third.exec(dt);else pd_linear_third.exec(dt);};
@@ -189,6 +213,8 @@ int runHybrid(const HybridOptions &o)
     auto *pd_stress=sp.getVariableDataByName<Matd>("PDStress");
     auto *failure=sp.getVariableDataByName<int>("NumericalFailureReason");
     auto *damage=sp.getVariableDataByName<Real>("Damage");
+    UniquePtr<solid_dynamics::PrincipalStressBondOnset> onset;
+    if(o.fracture_model!="none")onset=makeUnique<solid_dynamics::PrincipalStressBondOnset>(shell_inner,o.fracture_stress);
     auto *dpc_r=cp.getVariableDataByName<Real>("DPCRelativeDensity");
     auto *dpc_kappa=cp.getVariableDataByName<Real>("DPCPlasticCompaction");
     auto *dpc_residual=cp.getVariableDataByName<Real>("DPCYieldResidual");
@@ -209,7 +235,9 @@ int runHybrid(const HybridOptions &o)
         throw std::runtime_error("Physical mass or initial PD affine kinematics failed");
     std::ofstream config(out/"parameters.txt");config<<std::setprecision(17)
         <<"status=CONFIGURED_PD_SOLID_CASE_NOT_CALIBRATED\ncore_backend=total_lagrangian_solid_SPH\nshell_backend=NOSB_PD_volume\nfluid_backend=none\n"
-        <<"shell_constitutive=HughesWinget_elastic\nfracture_model=none\ncore_material=DPC\n"
+        <<"shell_constitutive="<<(o.shell_material=="elastic"?"HughesWinget_elastic":"J2_HW_plastic")
+        <<"\nfracture_model="<<o.fracture_model<<"\nfracture_scope="<<o.fracture_scope<<"\nfracture_stress="<<o.fracture_stress
+        <<"\nshell_yield_stress="<<o.shell_yield<<"\nshell_hardening_modulus="<<o.shell_hardening<<"\ncore_material=DPC\n"
         <<"shell_E="<<o.shell_E<<"\nshell_nu="<<o.shell_nu<<"\nshell_reference_density="<<o.shell_rho
         <<"\ninterface_law=perfect_bond_vector_penalty\n"
         <<"core_particles="<<c.n<<"\nshell_particles="<<s.n<<"\nshell_layers="<<o.shell_layers
@@ -268,6 +296,7 @@ int runHybrid(const HybridOptions &o)
     for(auto *body:{static_cast<RealBody*>(&core),static_cast<RealBody*>(&shell)})
     {body->getBaseParticles().addVariableToWrite<Vecd>("Velocity");body->getBaseParticles().addVariableToWrite<Matd>("DeformationGradient");}
     sp.addVariableToWrite<Matd>("PDStress");
+    sp.addVariableToWrite<Real>("Damage");sp.addVariableToWrite<int>("BondNumber");sp.addVariableToWrite<int>("ParticleLive");
     cp.addVariableToWrite<Matd>("DPCCauchyStress");
     BodyStatesRecordingToVtp vtp(system);
     std::ofstream eq(out/"equilibria.csv"),history(out/"material_history.csv"),progress(out/"progress.csv");
@@ -301,6 +330,24 @@ int runHybrid(const HybridOptions &o)
     while(true)
     {
         Real delta=delta_at(stage_time);apply(delta);
+        if(onset && step%200==0 && onset->scan())
+        {
+            // A genuine reciprocal bond-state change is written, but NO force,
+            // constitutive or MLS update is evaluated on the broken topology.
+            // This explicit boundary prevents a first-crack diagnostic from
+            // masquerading as a qualified post-fracture capsule simulation.
+            onset->commitFirstBreak();onset->writeBonds((out/"first_crack_bonds.csv").string());write_fields(stage);
+            std::ofstream event(out/"first_crack.json");event<<std::setprecision(17)
+                <<"{\"status\":\"FIRST_CRACK_DETECTED_STOPPED_BEFORE_POSTFRACTURE_UPDATE\",\"step\":"<<step
+                <<",\"stage\":"<<stage<<",\"nominal_strain\":"<<delta/o.diameter<<",\"compression_m\":"<<delta
+                <<",\"tensile_threshold_Pa\":"<<onset->threshold()<<",\"maximum_particle_tension_Pa\":"<<onset->maximum_particle_tension
+                <<",\"maximum_triggered_pair_tension_Pa\":"<<onset->maximum_triggered_pair_tension
+                <<",\"broken_undirected_bonds\":"<<onset->candidates.size()<<",\"maximum_damage\":"<<onset->maximum_damage
+                <<",\"reaction_before_break_N\":"<<.5*(contact.upper+contact.lower)
+                <<",\"postfracture_evolution\":false,\"postfracture_equilibrium\":false,\"fracture_energy_calibrated\":false}\n";
+            std::cout<<"FIRST_CRACK strain="<<delta/o.diameter<<" broken_bonds="<<onset->candidates.size()<<"; diagnostic stopped before post-fracture evolution"<<std::endl;
+            return 0;
+        }
         Real kinetic=0,jc=1,js=1;inspect(c,kinetic,jc,true);inspect(s,kinetic,js,false);
         min_core_J=std::min(min_core_J,jc);min_pd_J=std::min(min_pd_J,js);max_gap=std::max(max_gap,tie.max_gap);
         Real dpc_dt=std::numeric_limits<Real>::infinity();

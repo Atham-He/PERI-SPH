@@ -15,6 +15,8 @@ struct HybridOptions : PDSolidCapsuleOptions
     bool preflight_only=false;
     bool quadratic_kinematics=false;
     size_t shell_layers=3;
+    unsigned interface_order=1;
+    Real interface_core_support=2.5,interface_shell_support=2.5;
     Real pd_spacing=0,pd_cfl=.1,pd_hourglass=.5;
     Real ramp_duration=2.8132387884274494e-6,max_stage_duration=1.4066193942137247e-5;
     Real damping_rate=.002/2.8132387884274494e-10;
@@ -34,11 +36,14 @@ struct HybridOptions : PDSolidCapsuleOptions
                  if(a==std::string::npos)continue;line=line.substr(a,line.find_last_not_of(" \t\r")-a+1);consume("--"+line);}return;
             }
             if(key=="pd-kinematics"){if(value!="linear" && value!="quadratic")throw std::invalid_argument("pd-kinematics must be linear or quadratic");quadratic_kinematics=value=="quadratic";return;}
+            if(key=="interface-order"){if(value!="1" && value!="2")throw std::invalid_argument("interface-order must be 1 or 2");interface_order=unsigned(value[0]-'0');return;}
             if(key=="core-backend"){if(value!="solid_sph")throw std::invalid_argument("Core requires solid_sph,not a WCSPH fluid");return;}
             if(key=="shell-backend"){if(value!="nosb_pd")throw std::invalid_argument("Shell requires nosb_pd");return;}
             if(key=="fracture-model"){if(value!="none")throw std::invalid_argument("First solid-core case requires fracture-model=none");return;}
             if(key=="shell-layers"){size_t used=0;shell_layers=std::stoul(value,&used);if(used!=value.size())throw std::invalid_argument("Invalid layer count");return;}
             Real *target=nullptr;
+            if(key=="interface-core-support-ratio")target=&interface_core_support;
+            if(key=="interface-shell-support-ratio")target=&interface_shell_support;
             if(key=="pd-spacing")target=&pd_spacing;
             if(key=="pd-cfl")target=&pd_cfl;
             if(key=="pd-hourglass")target=&pd_hourglass;
@@ -55,7 +60,8 @@ struct HybridOptions : PDSolidCapsuleOptions
         if(!coated || !quasistatic || material!="dpc" || plate_contact!="outer_surface" ||
             patch_test || rest_test || smoke_test || (shell_layers!=3 && shell_layers!=5) ||
             pd_spacing<=0 || pd_cfl<=0 || pd_cfl>.2 || pd_hourglass<0 ||
-            ramp_duration<=0 || max_stage_duration<=ramp_duration || damping_rate<0)
+            ramp_duration<=0 || max_stage_duration<=ramp_duration || damping_rate<0 ||
+            interface_core_support<=1 || interface_shell_support<=1)
             throw std::invalid_argument("Invalid PD-solid configuration or unsupported dynamic/fracture path");
     }
 };
@@ -162,8 +168,8 @@ int runHybrid(const HybridOptions &o)
     StdVec<Vecd> inner_points,outer_points;
     for(const auto &n:interface_directions)inner_points.push_back(rc*n);
     for(const auto &n:contact_directions)outer_points.push_back(R*n);
-    ReferenceSolidSurface core_surface(core_port,inner_points,o.spacing);
-    ReferenceSolidSurface pd_inner(pd_port,inner_points,o.pd_spacing);
+    ReferenceSolidSurface core_surface(core_port,inner_points,o.spacing,o.interface_core_support,o.interface_order);
+    ReferenceSolidSurface pd_inner(pd_port,inner_points,o.pd_spacing,o.interface_shell_support,o.interface_order);
     ReferenceSolidSurface pd_outer(pd_port,outer_points,o.pd_spacing);
     Real Eref=o.constraint_E>0?o.constraint_E:o.core_E;
     StdVec<Real> inner_area(inner_points.size(),4*Pi*rc*rc/inner_points.size());
@@ -204,6 +210,8 @@ int runHybrid(const HybridOptions &o)
     std::ofstream config(out/"parameters.txt");config<<std::setprecision(17)
         <<"status=CONFIGURED_PD_SOLID_CASE_NOT_CALIBRATED\ncore_backend=total_lagrangian_solid_SPH\nshell_backend=NOSB_PD_volume\nfluid_backend=none\n"
         <<"shell_constitutive=HughesWinget_elastic\nfracture_model=none\ncore_material=DPC\n"
+        <<"shell_E="<<o.shell_E<<"\nshell_nu="<<o.shell_nu<<"\nshell_reference_density="<<o.shell_rho
+        <<"\ninterface_law=perfect_bond_vector_penalty\n"
         <<"core_particles="<<c.n<<"\nshell_particles="<<s.n<<"\nshell_layers="<<o.shell_layers
         <<"\ncore_diameter="<<2*rc<<"\nouter_diameter="<<2*R<<"\nshell_thickness="<<o.thickness
         <<"\ncore_spacing="<<o.spacing<<"\npd_tangential_spacing="<<o.pd_spacing<<"\nminimum_PD_radial_spacing="<<radial_spacing
@@ -212,6 +220,8 @@ int runHybrid(const HybridOptions &o)
         <<"\nPD_shape_condition_max="<<shape_condition<<"\ninitial_PD_F_error="<<initial_F_error
         <<"\ninterface_points="<<inner_points.size()<<"\ncontact_points="<<outer_points.size()
         <<"\ncore_surface_affine_error="<<core_surface.affine_error<<"\nPD_inner_affine_error="<<pd_inner.affine_error<<"\nPD_outer_affine_error="<<pd_outer.affine_error
+        <<"\ninterface_order="<<o.interface_order<<"\ninterface_core_support_ratio="<<o.interface_core_support<<"\ninterface_shell_support_ratio="<<o.interface_shell_support
+        <<"\ncore_surface_polynomial_error="<<core_surface.polynomial_error<<"\nPD_inner_polynomial_error="<<pd_inner.polynomial_error
         <<"\ninterface_K="<<o.tie_factor*Eref/o.spacing<<"\ncontact_K="<<o.contact_factor*Eref/o.spacing
         <<"\ninterface_dt_bound="<<tie.stable_dt<<"\ncontact_dt_bound="<<contact.stable_dt
         <<"\ncombined_constraint_dt="<<constraint_dt<<"\nPD_radial_acoustic_dt="<<radial_dt

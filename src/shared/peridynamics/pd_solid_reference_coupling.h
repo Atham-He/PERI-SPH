@@ -46,7 +46,7 @@ class SolidForcePort
     {external[i] += storage==Storage::ForcePrior ? force : force/mass[i];}
 };
 
-/** Fixed-reference, affine-reproducing MLS surface evaluation. It supports
+/** Fixed-reference polynomial-reproducing MLS surface evaluation. It supports
  * nonuniform particle volumes, including explicitly resolved thickness layers.
  * It supplies no bending law and does not turn a volume body into a shell. */
 class ReferenceSolidSurface
@@ -56,13 +56,15 @@ class ReferenceSolidSurface
     SolidForcePort &port;
     StdVec<Vecd> points;
     StdVec<Row> rows;
-    Real affine_error=0, largest_condition_number=0;
-    ReferenceSolidSurface(SolidForcePort &p,const StdVec<Vecd> &targets,Real spacing,Real support_ratio=2.5)
-        : port(p),points(targets)
+    Real affine_error=0, polynomial_error=0, largest_condition_number=0;
+    const unsigned reproduction_order;
+    ReferenceSolidSurface(SolidForcePort &p,const StdVec<Vecd> &targets,Real spacing,Real support_ratio=2.5,unsigned order=1)
+        : port(p),points(targets),reproduction_order(order)
     {
         static_assert(Dimensions==3,"ReferenceSolidSurface currently implements three-dimensional affine reconstruction");
         if(spacing<=0 || support_ratio<=1 || !std::isfinite(spacing*support_ratio))
             throw std::invalid_argument("Invalid reference-surface support");
+        if(order!=1 && order!=2)throw std::invalid_argument("Reference surface supports polynomial order 1 or 2");
         const Real support=spacing*support_ratio;
         using Cell=std::array<long long,3>;
         struct Hash {size_t operator()(const Cell &a) const
@@ -90,6 +92,42 @@ class ReferenceSolidSurface
                     row.index.push_back(j);basis.push_back(phi);kernel.push_back(w);
                 }
             }
+            if(order==2)
+            {
+                // Degree two requires at least three resolved normal levels on
+                // a planar volume support. Reject rank loss rather than adding
+                // a diagonal regularizer that silently changes reproduction.
+                using V10=Eigen::Matrix<Real,10,1>;using M10=Eigen::Matrix<Real,10,10>;
+                Real total=0;Matd covariance=Matd::Zero();
+                for(size_t a=0;a<row.index.size();++a)
+                {Vecd q=(port.reference[row.index[a]]-target)/spacing;
+                 total+=kernel[a];covariance+=kernel[a]*q*q.transpose();}
+                if(row.index.size()<10 || total<=0)throw std::runtime_error("Insufficient quadratic surface support");
+                covariance/=total;Eigen::SelfAdjointEigenSolver<Matd> ceig(covariance);
+                if(ceig.info()!=Eigen::Success || ceig.eigenvalues().minCoeff()<=0)
+                    throw std::runtime_error("Invalid quadratic surface covariance");
+                Matd L=ceig.eigenvectors()*ceig.eigenvalues().cwiseSqrt().cwiseInverse().asDiagonal()*ceig.eigenvectors().transpose();
+                auto basis2=[&](size_t j)->V10 {Vecd z=L*((port.reference[j]-target)/spacing);
+                    V10 phi;phi<<1,z[0],z[1],z[2],z[0]*z[0],z[1]*z[1],z[2]*z[2],z[0]*z[1],z[0]*z[2],z[1]*z[2];return phi;};
+                M10 m=M10::Zero();
+                for(size_t a=0;a<row.index.size();++a){V10 phi=basis2(row.index[a]);m+=kernel[a]*phi*phi.transpose();}
+                Eigen::SelfAdjointEigenSolver<M10> eig2(m);
+                if(eig2.info()!=Eigen::Success || eig2.eigenvalues().minCoeff()<=1e-12*eig2.eigenvalues().maxCoeff())
+                    throw std::runtime_error("Rank-deficient quadratic volume-to-surface mapping; increase resolved normal support");
+                largest_condition_number=std::max(largest_condition_number,eig2.eigenvalues().maxCoeff()/eig2.eigenvalues().minCoeff());
+                V10 e0=V10::Zero();e0[0]=1;V10 coeff=m.ldlt().solve(e0),reproduced_basis=V10::Zero();
+                if(!coeff.allFinite())throw std::runtime_error("Non-finite quadratic reference surface coefficients");
+                Real sum=0;Vecd reproduced=Vecd::Zero();
+                for(size_t a=0;a<row.index.size();++a)
+                {V10 phi=basis2(row.index[a]);Real w=kernel[a]*phi.dot(coeff);row.weight.push_back(w);
+                 sum+=w;reproduced+=w*port.reference[row.index[a]];reproduced_basis+=w*phi;}
+                affine_error=std::max({affine_error,std::abs(sum-1),(reproduced-target).norm()/spacing});
+                polynomial_error=std::max(polynomial_error,(reproduced_basis-e0).cwiseAbs().maxCoeff());
+                if(!std::isfinite(polynomial_error) || polynomial_error>1e-8 || !std::isfinite(affine_error) || affine_error>1e-8)
+                    throw std::runtime_error("Quadratic reference surface reproduction failed");
+                rows.push_back(std::move(row));continue;
+            }
+            // Preserve the legacy affine arithmetic and default behavior.
             Eigen::SelfAdjointEigenSolver<Eigen::Matrix4d> eig(moment);
             if(row.index.size()<8 || eig.info()!=Eigen::Success ||
                 eig.eigenvalues().minCoeff()<=1e-12*eig.eigenvalues().maxCoeff())

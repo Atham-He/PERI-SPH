@@ -81,7 +81,7 @@ struct HybridOptions : PDSolidCapsuleOptions
         {if(fracture_scope!="none"||fracture_stress!=0)throw std::invalid_argument("No-fracture mode forbids active fracture parameters");}
         else if(fracture_model!="principal_stress"||(fracture_scope!="first_crack"&&fracture_scope!="growth")||fracture_stress<=0)
             throw std::invalid_argument("principal_stress requires explicit threshold and first_crack or growth scope");
-        if(fragment_policy!="error"&&fragment_policy!="ballistic_erosion")throw std::invalid_argument("Unknown fragment resolution policy");
+        if(fragment_policy!="error")throw std::invalid_argument("Only fragment-policy=error is allowed: numerical erosion is not a physical fracture parameter");
         if(fracture_scope=="growth"&&(!quadratic_kinematics||interface_order!=2||core_contact_mesh.empty()))
             throw std::invalid_argument("Fracture growth requires quadratic PD, quadratic interface and a core-contact triangulation");
         if(postfracture_checkpoint_steps&&(fracture_scope!="growth"||preflight_only||postfracture_checkpoint_steps>max_steps))throw std::invalid_argument("Invalid fracture-growth diagnostic checkpoint");
@@ -180,7 +180,7 @@ int runHybrid(const HybridOptions &o)
     bool growth=o.fracture_scope=="growth";
     UniquePtr<solid_dynamics::PDQuadraticReference> reference_owner;
     solid_dynamics::PDFractureReference *fracture_reference=nullptr;
-    if(growth){auto r=makeUnique<solid_dynamics::PDFractureReference>(shell_inner,o.fragment_policy=="ballistic_erosion");fracture_reference=r.get();reference_owner=std::move(r);}
+    if(growth){auto r=makeUnique<solid_dynamics::PDFractureReference>(shell_inner);fracture_reference=r.get();reference_owner=std::move(r);}
     else reference_owner=makeUnique<solid_dynamics::PDQuadraticReference>(shell_inner);
     auto &quadratic_reference=*reference_owner;
     InteractionWithUpdate<solid_dynamics::NosbPDQuadraticSecondStep> pd_quadratic_second(shell_inner,quadratic_reference);

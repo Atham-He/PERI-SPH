@@ -53,6 +53,8 @@ class FractureAwareSurface : public ReferenceSolidSurface
         for(size_t j:original[q].index)if(visited[j]==token)result.index.push_back(j);
         if(reproduction_order==2&&fit(q,result,2)){rows[q]=std::move(result);row_order[q]=2;return;}
         result.weight.clear();if(fit(q,result,1)){rows[q]=std::move(result);row_order[q]=1;return;}
+        if(reference.degree[anchor[q]]>0)
+            throw std::runtime_error("Live shell material has an unresolved surface trace; numerical fit failure must not release the core-shell interface");
         rows[q]=Row{};row_order[q]=0;
     }
     bool fit(size_t q,Row &r,unsigned order)

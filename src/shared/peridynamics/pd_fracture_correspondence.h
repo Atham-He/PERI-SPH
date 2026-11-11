@@ -3,8 +3,8 @@
  * The reference coordinates remain fixed. Only the live support changes.
  * All force rows retain the original reciprocal indexing, with zero gradient
  * on a broken bond. The existing EXACT transpose force operator is reused.
- * A rank-complete affine fallback is explicit; rank-deficient fragments are
- * either rejected or converted to mass-retaining ballistic debris by policy.
+ * A rank-complete affine fallback is explicit. Rank-deficient live supports
+ * stop the calculation; numerical rank loss must not cause material failure.
  * This is not a calibrated fracture-energy regularization.
  */
 #include "pd_quadratic_correspondence.h"
@@ -18,16 +18,16 @@ class PDFractureReference : public PDQuadraticReference
     StdVec<int> degree;
     StdVec<size_t> changed_particles;
     size_t topology_version=0,affine_rows=0,ballistic_particles=0,resolution_removed_bonds=0;
-    bool allow_resolution_erosion;
     Real maximum_affine_error=0;
-    PDFractureReference(BaseInnerRelation &relation,bool erode)
-      :PDQuadraticReference(relation),allow_resolution_erosion(erode),
+    PDFractureReference(BaseInnerRelation &relation,bool erode=false)
+      :PDQuadraticReference(relation),
        particle_live(particles_->getVariableDataByName<int>("ParticleLive")),
        damage(particles_->getVariableDataByName<Real>("Damage")),
        bonds(particles_->getVariableDataByName<int>("BondNumber")),
        stress(particles_->getVariableDataByName<Matd>("PDStress")),
        reproduction(particles_->registerStateVariableData<int>("PDReproductionOrder")),
-       eroded(particles_->registerStateVariableData<int>("ResolutionEroded")) {}
+       eroded(particles_->registerStateVariableData<int>("ResolutionEroded"))
+    {if(erode)throw std::invalid_argument("Numerical resolution erosion is excluded from physical fracture calibration");}
     void initialize()
     {
         X.assign(position,position+particles_->TotalRealParticles());PDQuadraticReference::build();
@@ -92,16 +92,7 @@ class PDFractureReference : public PDQuadraticReference
             }
             if(!unsupported.empty())
             {
-                if(!allow_resolution_erosion)throw std::runtime_error("Unresolved fragment: live support is not 3-D; choose explicit ballistic_erosion or refine resolution");
-                // Explicit numerical resolution policy, separate from the
-                // physical tensile criterion. No mass or momentum is deleted.
-                for(size_t i:unsupported)
-                {
-                    eroded[i]=1;auto &nb=inner_configuration_[i];
-                    for(size_t n=0;n<rows[i].size();++n)if(nb.bondLive_[n])
-                    {const auto &e=rows[i][n];nb.bondLive_[n]=false;inner_configuration_[e.j].bondLive_[e.reverse]=false;++resolution_removed_bonds;}
-                }
-                repeat=true;
+                throw std::runtime_error("Unresolved live PD support: refine or use a separately verified discretization; no bonds or interface constraints were removed to bypass rank loss");
             }
         }
         changed_particles.clear();

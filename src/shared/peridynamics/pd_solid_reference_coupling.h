@@ -59,8 +59,13 @@ class ReferenceSolidSurface
     Real affine_error=0, polynomial_error=0, largest_condition_number=0;
     virtual ~ReferenceSolidSurface()=default;
     const unsigned reproduction_order;
+  protected:
+    struct DeferredBuildTag {};
+    ReferenceSolidSurface(SolidForcePort &p,const StdVec<Vecd>&targets,unsigned order,DeferredBuildTag)
+        :port(p),points(targets),reproduction_order(order){}
+  public:
     ReferenceSolidSurface(SolidForcePort &p,const StdVec<Vecd> &targets,Real spacing,Real support_ratio=2.5,unsigned order=1)
-        : port(p),points(targets),reproduction_order(order)
+        : ReferenceSolidSurface(p,targets,order,DeferredBuildTag{})
     {
         static_assert(Dimensions==3,"ReferenceSolidSurface currently implements three-dimensional affine reconstruction");
         if(spacing<=0 || support_ratio<=1 || !std::isfinite(spacing*support_ratio))

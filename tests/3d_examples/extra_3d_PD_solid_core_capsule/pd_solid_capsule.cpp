@@ -10,6 +10,8 @@
 #include "pd_principal_stress_onset.h"
 #include "pd_fragment_contact.h"
 #include "pd_energy_crack_band.h"
+#include "pd_layered_correspondence.h"
+#include "pd_layered_surface.h"
 #include <sstream>
 #include <map>
 
@@ -17,7 +19,8 @@ struct HybridOptions : PDSolidCapsuleOptions
 {
     bool preflight_only=false;
     size_t postfracture_checkpoint_steps=0;
-    bool quadratic_kinematics=false;
+    bool quadratic_kinematics=false,layered_kinematics=false;
+    unsigned plate_surface_order=1;
     size_t shell_layers=3;
     unsigned interface_order=1;
     Real interface_core_support=2.5,interface_shell_support=2.5;
@@ -42,7 +45,8 @@ struct HybridOptions : PDSolidCapsuleOptions
                 {line=line.substr(0,line.find('#'));auto a=line.find_first_not_of(" \t\r");
                  if(a==std::string::npos)continue;line=line.substr(a,line.find_last_not_of(" \t\r")-a+1);consume("--"+line);}return;
             }
-            if(key=="pd-kinematics"){if(value!="linear" && value!="quadratic")throw std::invalid_argument("pd-kinematics must be linear or quadratic");quadratic_kinematics=value=="quadratic";return;}
+            if(key=="pd-kinematics"){if(value!="linear"&&value!="quadratic"&&value!="layered_quadratic")throw std::invalid_argument("pd-kinematics must be linear, quadratic or layered_quadratic");quadratic_kinematics=value!="linear";layered_kinematics=value=="layered_quadratic";return;}
+            if(key=="plate-surface-order"){if(value!="1"&&value!="2")throw std::invalid_argument("plate-surface-order must be 1 or 2");plate_surface_order=unsigned(value[0]-'0');return;}
             if(key=="interface-order"){if(value!="1" && value!="2")throw std::invalid_argument("interface-order must be 1 or 2");interface_order=unsigned(value[0]-'0');return;}
             if(key=="core-backend"){if(value!="solid_sph")throw std::invalid_argument("Core requires solid_sph,not a WCSPH fluid");return;}
             if(key=="shell-backend"){if(value!="nosb_pd")throw std::invalid_argument("Shell requires nosb_pd");return;}
@@ -92,6 +96,7 @@ struct HybridOptions : PDSolidCapsuleOptions
             throw std::invalid_argument("Fracture growth requires quadratic PD, quadratic interface and a core-contact triangulation");
         if(postfracture_checkpoint_steps&&(fracture_scope!="growth"||preflight_only||postfracture_checkpoint_steps>max_steps))throw std::invalid_argument("Invalid fracture-growth diagnostic checkpoint");
         if(postfracture_checkpoint_steps&&fracture_model=="crack_band_energy")throw std::invalid_argument("Use energy history outputs for continuous damage diagnostics");
+        if(layered_kinematics&&(interface_order!=2||plate_surface_order!=2||fracture_model!="crack_band_energy"))throw std::invalid_argument("The qualified layered volume path requires quadratic inner/outer traces and energy crack-band damage");
         if(!coated || !quasistatic || material!="dpc" || plate_contact!="outer_surface" ||
             patch_test || rest_test || smoke_test || (shell_layers!=3 && shell_layers!=5) ||
             pd_spacing<=0 || pd_cfl<=0 || pd_cfl>.2 || pd_hourglass<0 ||
@@ -187,9 +192,18 @@ int runHybrid(const HybridOptions &o)
     bool energy_growth=o.fracture_model=="crack_band_energy";
     if(energy_growth&&o.shell_material!="finite_volume_biot")throw std::invalid_argument("Use shell-material=finite_volume_biot for the actual-volume corrected crack-band model; legacy Biot remains in its archived executable");
     bool growth=o.fracture_scope=="growth"&&!energy_growth;
+    UniquePtr<LayeredParticleGeometry> layered_geometry;
+    if(o.layered_kinematics)
+    {
+        auto&p=shell.getBaseParticles();size_t columns_count=p.TotalRealParticles()/o.shell_layers;auto*x=p.getVariableDataByName<Vecd>("Position");
+        StdVec<StdVec<size_t>> columns(columns_count);StdVec<Vecd>directors(columns_count);
+        for(size_t c=0;c<columns_count;++c){for(size_t l=0;l<o.shell_layers;++l)columns[c].push_back(l*columns_count+c);directors[c]=x[c].normalized();}
+        ThicknessQuadrature normal_rule(o.shell_layers);layered_geometry=makeUnique<LayeredParticleGeometry>(p,columns,directors,normal_rule.xi);
+    }
     UniquePtr<solid_dynamics::PDQuadraticReference> reference_owner;
     solid_dynamics::PDFractureReference *fracture_reference=nullptr;
     if(growth){auto r=makeUnique<solid_dynamics::PDFractureReference>(shell_inner);fracture_reference=r.get();reference_owner=std::move(r);}
+    else if(layered_geometry)reference_owner=makeUnique<solid_dynamics::PDLayeredQuadraticReference>(shell_inner,*layered_geometry);
     else reference_owner=makeUnique<solid_dynamics::PDQuadraticReference>(shell_inner);
     auto &quadratic_reference=*reference_owner;
     InteractionWithUpdate<solid_dynamics::NosbPDQuadraticSecondStep> pd_quadratic_second(shell_inner,quadratic_reference);
@@ -231,7 +245,10 @@ int runHybrid(const HybridOptions &o)
     if(growth)
     {auto a=makeUnique<FractureAwareSurface>(pd_port,inner_points,o.pd_spacing,o.interface_shell_support,o.interface_order,*fracture_reference);fracture_inner=a.get();inner_owner=std::move(a);
      auto b=makeUnique<FractureAwareSurface>(pd_port,outer_points,o.pd_spacing,2.5,1,*fracture_reference);fracture_outer=b.get();outer_owner=std::move(b);}
-    else {inner_owner=makeUnique<ReferenceSolidSurface>(pd_port,inner_points,o.pd_spacing,o.interface_shell_support,o.interface_order);outer_owner=makeUnique<ReferenceSolidSurface>(pd_port,outer_points,o.pd_spacing);}
+    else if(layered_geometry)
+    {inner_owner=makeUnique<LayeredSolidSurface>(pd_port,inner_points,*layered_geometry,-1,o.pd_spacing,o.interface_shell_support);
+     outer_owner=makeUnique<LayeredSolidSurface>(pd_port,outer_points,*layered_geometry,1,o.pd_spacing,2.5);}
+    else {inner_owner=makeUnique<ReferenceSolidSurface>(pd_port,inner_points,o.pd_spacing,o.interface_shell_support,o.interface_order);outer_owner=makeUnique<ReferenceSolidSurface>(pd_port,outer_points,o.pd_spacing,2.5,o.plate_surface_order);}
     auto &pd_inner=*inner_owner;auto &pd_outer=*outer_owner;
     Real Eref=o.constraint_E>0?o.constraint_E:o.core_E;
     StdVec<Real> inner_area(inner_points.size(),4*Pi*rc*rc/inner_points.size());
@@ -301,14 +318,14 @@ int runHybrid(const HybridOptions &o)
         <<"\nPD_shape_condition_max="<<shape_condition<<"\ninitial_PD_F_error="<<initial_F_error
         <<"\ninterface_points="<<inner_points.size()<<"\ncontact_points="<<outer_points.size()
         <<"\ncore_surface_affine_error="<<core_surface.affine_error<<"\nPD_inner_affine_error="<<pd_inner.affine_error<<"\nPD_outer_affine_error="<<pd_outer.affine_error
-        <<"\ninterface_order="<<o.interface_order<<"\ninterface_core_support_ratio="<<o.interface_core_support<<"\ninterface_shell_support_ratio="<<o.interface_shell_support
+        <<"\nplate_surface_order="<<o.plate_surface_order<<"\nshell_surface_reconstruction="<<(layered_geometry?"normal_Lagrange_then_quadratic_surface_MLS":"volume_MLS")<<"\ninterface_order="<<o.interface_order<<"\ninterface_core_support_ratio="<<o.interface_core_support<<"\ninterface_shell_support_ratio="<<o.interface_shell_support
         <<"\ncore_surface_polynomial_error="<<core_surface.polynomial_error<<"\nPD_inner_polynomial_error="<<pd_inner.polynomial_error
         <<"\ninterface_K="<<o.tie_factor*Eref/o.spacing<<"\ncontact_K="<<o.contact_factor*Eref/o.spacing
         <<"\ninterface_dt_bound="<<tie.stable_dt<<"\ncontact_dt_bound="<<contact.stable_dt
         <<"\ncombined_constraint_dt="<<constraint_dt<<"\nPD_radial_acoustic_dt="<<radial_dt
         <<"\nmaximum_dt_cap="<<o.max_dt<<"\nnumerical_ramp_duration="<<o.ramp_duration<<"\nnumerical_damping_rate="<<o.damping_rate
         <<"\nload_steps="<<o.load_steps<<"\nstrain="<<o.strain<<"\nthreads="<<o.threads
-        <<"\npd_kinematics="<<(o.quadratic_kinematics?"quadratic_reproducing":"linear_correspondence")
+        <<"\npd_kinematics="<<(o.layered_kinematics?"layered_quadratic_reproducing":o.quadratic_kinematics?"quadratic_reproducing":"linear_correspondence")
         <<"\nquadratic_moment_condition_max="<<quadratic_reference.max_moment_condition<<"\nquadratic_reproduction_error="<<quadratic_reference.max_reproduction_error
         <<"\nquadratic_initial_elastic_dt_bound="<<quadratic_reference.elastic_dt_bound
         <<"\ndpc_shear_hardening="<<dpc_material.ShearHardeningModulus()

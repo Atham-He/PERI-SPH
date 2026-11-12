@@ -25,7 +25,7 @@ static Real simpson(const std::function<Real(Real)>&f,Real a,Real b,Real tol,int
      return rec(x,m,fx,fl,fm,one,err/2,d-1)+rec(m,y,fm,fr,fy,two,err/2,d-1);};
     return rec(a,b,fa,fc,fb,whole,tol,depth);
 }
-struct PatchResult {Real dp,Gc_recovered,work_error,force_FD,force_balance,torque_balance,quadratic_HG_ratio,terminal_traction_ratio;size_t particles;};
+struct PatchResult {Real dp,Gc_recovered,work_error,force_FD,force_balance,torque_balance,quadratic_HG_ratio,terminal_traction_ratio,mixed_surface_work_error,quadratic_surface_work_error,layered_surface_work_error;size_t particles;};
 static PatchResult patch(Real dp)
 {
     const Real E=2.151e9,nu=.3,Gc=100,ft=46.4e6,t=10e-6;const int nx=16,ny=10;
@@ -33,11 +33,31 @@ static PatchResult patch(Real dp)
     PDBody body(system,makeShared<DefaultShape>("EnergySlab"));body.defineAdaptation<PDAdaptation>(1.5075,1);
     body.defineMatterMaterial<HughesWingetSolid>(1200,E,nu);body.generateParticles<BaseParticles,EnergySlabGenerator>(dp,t,nx,ny);
     InnerRelation inner(body);SimpleDynamics<PDTimeStepInitialization> init(body,makeShared<Gravity>(Vecd::Zero()));SimpleDynamics<NosbPDFirstStep> first(body);
-    InteractionWithUpdate<NosbPDShapeMatrix> shape(inner);PDQuadraticReference ref(inner);InteractionWithUpdate<NosbPDQuadraticSecondStep> second(inner,ref);
+    InteractionWithUpdate<NosbPDShapeMatrix> shape(inner);size_t columns_count=body.getBaseParticles().TotalRealParticles()/3;
+    StdVec<StdVec<size_t>>columns(columns_count);StdVec<Vecd>directors(columns_count,Vecd(0,0,1));
+    for(size_t c=0;c<columns_count;++c)for(size_t l=0;l<3;++l)columns[c].push_back(l*columns_count+c);
+    ThicknessQuadrature normal_rule(3);peridynamics::LayeredParticleGeometry geometry(body.getBaseParticles(),columns,directors,normal_rule.xi);
+    PDLayeredQuadraticReference ref(inner,geometry);InteractionWithUpdate<NosbPDQuadraticSecondStep> second(inner,ref);
     InteractionDynamics<NosbPDQuadraticThirdStep> third(inner,ref);InteractionDynamics<ProjectedPairStabilization> old_hg(inner,.5,.1);InteractionDynamics<PairNumericalDampingforPD> old_damping(inner);
     PDEnergyCrackBand model(inner,ref,E,nu,ft,Gc,.5,body.getSPHAdaptation().getKernel()->CutOffRadius());
     system.initializeSystemCellLinkedLists();system.initializeSystemConfigurations();shape.exec();ref.build();model.initialize();State s(body);
-    auto&particles=body.getBaseParticles();auto*acc=particles.getVariableDataByName<Vecd>("PDAcceleration");auto*force=particles.getVariableDataByName<Vecd>("PDInternalForce");auto*hgforce=particles.getVariableDataByName<Vecd>("HourglassForce");
+
+    // Uniform normal traction does zero work on v_z=(2*z/t)^2: the
+    // two faces have equal velocity and opposite tractions. The actual
+    // volume derivative and mapped face loads must agree on this mode.
+    peridynamics::SolidForcePort port(body,peridynamics::SolidForcePort::Storage::PDAccelerationPrior);
+    StdVec<Vecd>top,bottom;for(size_t c=0;c<columns_count;++c){Vecd X=s.x0[c];top.push_back(Vecd(X[0],X[1],t/2));bottom.push_back(Vecd(X[0],X[1],-t/2));}
+    peridynamics::ReferenceSolidSurface top1(port,top,dp,2.5,1),top2(port,top,dp,2.5,2),bottom2(port,bottom,dp,2.5,2);
+    peridynamics::LayeredSolidSurface layered_top(port,top,geometry,1,dp),layered_bottom(port,bottom,geometry,-1,dp);
+    const Real pressure=1000,area=columns_count*dp*dp;Real volume_work=0;
+    for(size_t i=0;i<s.n;++i)s.v[i]=Vecd(0,0,std::pow(2*s.x0[i][2]/t,2));
+    for(size_t i=0;i<s.n;++i){Matd gv=Matd::Zero();for(auto&e:ref.rows[i])gv+=(s.v[e.j]-s.v[i])*e.gradient.transpose();volume_work-=s.measure[i]*pressure*gv(2,2);}
+    auto boundary_work=[&](peridynamics::ReferenceSolidSurface&a,peridynamics::ReferenceSolidSurface&b){port.clear();for(size_t c=0;c<columns_count;++c){a.scatter(c,Vecd(0,0,-pressure*dp*dp));b.scatter(c,Vecd(0,0,pressure*dp*dp));}Real work=0;for(size_t i=0;i<s.n;++i)work+=s.mass[i]*port.external[i].dot(s.v[i]);return work;};
+    Real mixed_surface_error=std::abs(boundary_work(top1,bottom2)-volume_work)/(pressure*area);
+    Real quadratic_surface_error=std::abs(boundary_work(top2,bottom2)-volume_work)/(pressure*area);
+    Real layered_surface_error=std::abs(boundary_work(layered_top,layered_bottom)-volume_work)/(pressure*area);
+    if(mixed_surface_error<.01||quadratic_surface_error>1e-8||layered_surface_error>1e-8)throw std::runtime_error("Normal traction/volume quadratic-mode consistency audit failed");
+auto&particles=body.getBaseParticles();auto*acc=particles.getVariableDataByName<Vecd>("PDAcceleration");auto*force=particles.getVariableDataByName<Vecd>("PDInternalForce");auto*hgforce=particles.getVariableDataByName<Vecd>("HourglassForce");
     auto evaluate=[&](bool advance){for(size_t i=0;i<s.n;++i)model.evaluate(i,advance);for(size_t i=0;i<s.n;++i){acc[i].setZero();model.forces(i);}return model.statistics();};
     // Full P2 residual must leave the already-verified bending kinematics intact.
     for(size_t i=0;i<s.n;++i){Vecd X=s.x0[i];s.x[i]=X+Vecd(.001*X[0]+50*X[1]*X[1],-30*X[0]*X[1],20*X[0]*X[0]);}
@@ -71,7 +91,7 @@ static PatchResult patch(Real dp)
     Real recovered=complete.dissipated/(ny*dp*t),workerr=std::abs(work-complete.dissipated)/expected;
     Vecd right=Vecd::Zero();for(size_t i=0;i<s.n;++i)if(s.x0[i][0]>0)right+=force[i]+hgforce[i];Real traction=right.norm()/(ft*ny*dp*t);
     if(std::abs(recovered/Gc-1)>.02||workerr>1e-5||traction>1e-6)throw std::runtime_error("Unit crack work does not reproduce input Gc or leave a traction-free opening");
-    
+
     Matd G=.97*Matd::Identity();G(0,1)=.097;
     for(size_t i=0;i<s.n;++i){s.x[i]=G*s.x0[i];model.history[i]={model.fracture.kf,1,model.fracture.Gc/model.fracture.width};}
     auto comp=evaluate(false);Real cp=0;for(size_t i=0;i<s.n;++i)cp+=(force[i]+hgforce[i]).dot(s.v[i]);
@@ -79,7 +99,7 @@ static PatchResult patch(Real dp)
     for(size_t i=0;i<s.n;++i)s.x[i]-=2*eps*s.v[i];Real cminus=evaluate(false).stored;
     Real cfd=std::abs((cplus-cminus)/(2*eps)+cp)/std::max(std::abs(cp),Real(1e-30));
     if(cfd>1e-5||comp.stored<=0||comp.stabilization!=0)throw std::runtime_error("Fully failed compressed NOSB operator is not variational");
-return {dp,recovered,workerr,fd,balance,torque,qratio,traction,s.n};
+return {dp,recovered,workerr,fd,balance,torque,qratio,traction,mixed_surface_error,quadratic_surface_error,layered_surface_error,s.n};
 }
 int main(int argc,char**argv)
 {
@@ -97,7 +117,7 @@ int main(int argc,char**argv)
     auto compressed=elastic.evaluate(.97*Matd::Identity());LinearEnergyCrackBand::History c;law.advance(c,compressed.positive,compressed.max_effective_tension>1e-12*E);
     if(c.damage!=0||compressed.negative<=0)throw std::runtime_error("Hydrostatic compression was damaged");
     bool invalid=false;try{LinearEnergyCrackBand bad(E,ft,1,h);}catch(const std::invalid_argument&){invalid=true;}if(!invalid)throw std::runtime_error("Under-resolved fracture energy silently accepted");
-    
+
     // Reproduce the constitutive defect without any PD discretization or
     // interface: finite isochoric shear under hydrostatic precompression.
     CorotatedBiotEnergy legacy(E,nu);Matd C=.97*Matd::Identity(),H=Matd::Identity();H(0,1)=.1;
@@ -133,7 +153,7 @@ auto a=patch(25e-6),b=patch(12.5e-6);std::ofstream out(argv[1]);out<<std::setpre
       <<",\"uniaxial_peak_Pa\":"<<peak<<",\"uniaxial_work_J_m2\":"<<work<<",\"objective_stress_error_over_E\":"<<objective_stress_error<<",\"objective_energy_relative_error\":"<<objective_energy_error
       <<",\"unloading_irreversible\":true,\"rotation_objective\":true,\"compression_retained\":true,\"inadmissible_parameters_rejected\":true,\"patches\":[";
     int index=0;for(auto r:{a,b}){if(index++)out<<',';out<<"{\"spacing_m\":"<<r.dp<<",\"particles\":"<<r.particles<<",\"recovered_Gc_J_m2\":"<<r.Gc_recovered<<",\"external_work_balance_error\":"<<r.work_error
-      <<",\"force_energy_FD_error\":"<<r.force_FD<<",\"force_balance\":"<<r.force_balance<<",\"torque_balance\":"<<r.torque_balance<<",\"quadratic_HG_energy_ratio\":"<<r.quadratic_HG_ratio<<",\"terminal_traction_ratio\":"<<r.terminal_traction_ratio<<'}';}
+      <<",\"force_energy_FD_error\":"<<r.force_FD<<",\"force_balance\":"<<r.force_balance<<",\"torque_balance\":"<<r.torque_balance<<",\"quadratic_HG_energy_ratio\":"<<r.quadratic_HG_ratio<<",\"terminal_traction_ratio\":"<<r.terminal_traction_ratio<<",\"mixed_surface_quadratic_work_error\":"<<r.mixed_surface_work_error<<",\"quadratic_surface_work_error\":"<<r.quadratic_surface_work_error<<",\"layered_surface_work_error\":"<<r.layered_surface_work_error<<'}';}
     out<<"],\"physical_compression_histories\":0,\"mixed_mode_fracture_calibrated\":false,\"capsule_spatial_convergence\":false}\n";std::cout<<"ENERGY_CRACK_BAND_AUDIT_PASSED"<<std::endl;return 0;
  }catch(const std::exception&e){std::cerr<<e.what()<<std::endl;return 1;}
 }

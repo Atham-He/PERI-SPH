@@ -16,7 +16,8 @@ file(SHA256 ${PERI_SHARED}/materials/drucker_prager_cap_kernel.h KERNEL_HASH)
 file(SHA256 ${PERI_SHARED}/materials/drucker_prager_cap_solid.h ADAPTER_HASH)
 set(PD_ASSEMBLY_HASHES "${MAIN_HASH};${FIXTURE_HASH};${COUPLING_HASH}")
 foreach(PD_HEADER pd_quadratic_correspondence.h pd_principal_stress_onset.h
-        pd_fracture_correspondence.h pd_fracture_surface.h pd_fragment_contact.h pd_energy_crack_band.h)
+        pd_fracture_correspondence.h pd_fracture_surface.h pd_fragment_contact.h pd_energy_crack_band.h
+        pd_layered_geometry.h pd_layered_correspondence.h pd_layered_surface.h)
     set(PD_HEADER_PATH ${PERI_SHARED}/peridynamics/${PD_HEADER})
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${PD_HEADER_PATH})
     file(SHA256 ${PD_HEADER_PATH} PD_HEADER_HASH)

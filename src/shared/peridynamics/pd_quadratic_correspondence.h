@@ -28,7 +28,7 @@ class PDQuadraticReference : public LocalDynamics, public DataDelegateInner
         position(particles_->getVariableDataByName<Vecd>("Position")) {}
     virtual ~PDQuadraticReference()=default;
 
-    void build()
+    virtual void build()
     {
         static_assert(Dimensions==3,"Quadratic correspondence currently supports 3-D");
         using V9=Eigen::Matrix<Real,9,1>;using M9=Eigen::Matrix<Real,9,9>;

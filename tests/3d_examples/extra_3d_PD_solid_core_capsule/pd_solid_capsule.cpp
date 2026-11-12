@@ -31,6 +31,7 @@ struct HybridOptions : PDSolidCapsuleOptions
     Real pd_spacing=0,pd_cfl=.1,pd_hourglass=.5;
     Real ramp_duration=2.8132387884274494e-6,max_stage_duration=1.4066193942137247e-5;
     Real damping_rate=.002/2.8132387884274494e-10;
+    Real plate_friction=0,plate_tangent_factor=1;
     void parseHybrid(int argc,char **argv)
     {
         std::vector<std::string> base{argv[0]};
@@ -75,6 +76,8 @@ struct HybridOptions : PDSolidCapsuleOptions
             if(key=="ramp-duration")target=&ramp_duration;
             if(key=="max-stage-duration")target=&max_stage_duration;
             if(key=="damping-rate")target=&damping_rate;
+            if(key=="plate-friction")target=&plate_friction;
+            if(key=="plate-tangent-factor")target=&plate_tangent_factor;
             if(target){size_t used=0;*target=std::stod(value,&used);if(used!=value.size() || !std::isfinite(*target))throw std::invalid_argument("Invalid hybrid number");return;}
             base.push_back(arg);
         };
@@ -110,6 +113,10 @@ struct HybridOptions : PDSolidCapsuleOptions
             ramp_duration<=0 || max_stage_duration<=ramp_duration || damping_rate<0 ||
             interface_core_support<=1 || interface_shell_support<=1)
             throw std::invalid_argument("Invalid PD-solid configuration or unsupported dynamic/fracture path");
+        if(plate_friction<0||plate_tangent_factor<=0)
+            throw std::invalid_argument("Coulomb friction must be nonnegative and tangent factor positive");
+        if(plate_friction>0&&fracture_model=="principal_stress"&&fracture_scope=="growth")
+            throw std::invalid_argument("Platen friction is not qualified for sharp-fragment contact; use the energy-damage path");
     }
 };
 
@@ -261,7 +268,7 @@ int runHybrid(const HybridOptions &o)
     StdVec<Real> inner_area(inner_points.size(),4*Pi*rc*rc/inner_points.size());
     StdVec<Real> outer_area(outer_points.size(),4*Pi*R*R/outer_points.size());
     BondedSolidInterface tie(pd_inner,core_surface,inner_area,o.tie_factor*Eref/o.spacing,R);
-    SolidSurfacePlaneContact contact(pd_outer,outer_area,o.contact_factor*Eref/o.spacing,R);
+    SolidSurfacePlaneContact contact(pd_outer,outer_area,o.contact_factor*Eref/o.spacing,R,o.plate_friction,o.plate_tangent_factor);
     Real constraint_dt=1/std::sqrt(1/(tie.stable_dt*tie.stable_dt)+1/(contact.stable_dt*contact.stable_dt));
     ThicknessQuadrature quadrature(o.shell_layers);
     Real radial_spacing=o.thickness;
@@ -330,7 +337,9 @@ int runHybrid(const HybridOptions &o)
         <<"\ncore_surface_polynomial_error_applicable="<<(o.interface_core_order==2)
         <<"\ncore_surface_polynomial_error="<<core_surface.polynomial_error<<"\nPD_inner_polynomial_error="<<pd_inner.polynomial_error
         <<"\ninterface_K="<<o.tie_factor*Eref/o.spacing<<"\ncontact_K="<<o.contact_factor*Eref/o.spacing
-        <<"\ninterface_dt_bound="<<tie.stable_dt<<"\ncontact_dt_bound="<<contact.stable_dt
+        <<"\nplate_contact_law="<<(o.plate_friction>0?"normal_penalty_coulomb":"normal_penalty_frictionless")
+        <<"\nplate_friction_mu="<<o.plate_friction<<"\nplate_tangent_factor="<<o.plate_tangent_factor
+        <<"\nfriction_history_time_layer=midpoint_commit\ninterface_dt_bound="<<tie.stable_dt<<"\ncontact_dt_bound="<<contact.stable_dt
         <<"\ncombined_constraint_dt="<<constraint_dt<<"\nPD_radial_acoustic_dt="<<radial_dt
         <<"\nmaximum_dt_cap="<<o.max_dt<<"\nnumerical_ramp_duration="<<o.ramp_duration<<"\nnumerical_damping_rate="<<o.damping_rate
         <<"\nload_steps="<<o.load_steps<<"\nstrain="<<o.strain<<"\nthreads="<<o.threads
@@ -366,12 +375,37 @@ int runHybrid(const HybridOptions &o)
         if(affine_PD_error>1e-9 || finite_difference_error>1e-5 ||
             std::max({tie.worst_force,tie.worst_torque,tie.worst_power,contact.worst_force,contact.worst_torque,contact.worst_power})>1e-9)
             throw std::runtime_error("Manufactured affine PD/loaded interface virtual-work check failed");
+        Real friction_force_sum=0,friction_cone_ratio=0,friction_stored=0;
+        if(o.plate_friction>0)
+        {
+            // The preceding conservative FD audit uses uncommitted, zero
+            // tangential histories. Sliding is checked separately, not falsely
+            // treated as the gradient of a conservative scalar potential.
+            core_port.clear();pd_port.clear();contact.apply(-R+2e-6,R-2e-6,true);
+            for(size_t i=0;i<c.n;++i)c.x[i]+=Vecd(2e-8,-1e-8,0);
+            for(size_t i=0;i<s.n;++i)s.x[i]+=Vecd(2e-8,-1e-8,0);
+            auto commits=contact.history_commits;Real prior_D=contact.slip_dissipation;
+            core_port.clear();pd_port.clear();tie.apply();contact.apply(-R+2e-6,R-2e-6);
+            friction_force_sum=contact.tangential_force_sum;friction_cone_ratio=contact.max_cone_ratio;
+            friction_stored=contact.tangent_energy;
+            core_port.clear();pd_port.clear();tie.apply();contact.apply(-R+2e-6,R-2e-6);
+            if(friction_force_sum<=0||friction_stored<=0||friction_cone_ratio>1+1e-12||
+               contact.history_commits!=commits||contact.slip_dissipation!=prior_D||
+               std::max({contact.worst_force,contact.worst_torque,contact.worst_power})>1e-9)
+                throw std::runtime_error("Nonzero Coulomb force-map or const-trial check failed");
+            core_port.clear();pd_port.clear();contact.apply(-R+2e-6,R-2e-6,true);
+            if(contact.slip_dissipation<0||contact.release_energy<0)
+                throw std::runtime_error("Negative Coulomb dissipation");
+        }
         std::ofstream f(out/"preflight.json");f<<std::setprecision(17)
             <<"{\"status\":\"INITIAL_GEOMETRY_AFFINE_AND_LOADED_FORCE_MAPS_PASSED\",\"core_particles\":"<<c.n<<",\"PD_particles\":"<<s.n
             <<",\"PD_shape_condition_max\":"<<shape_condition<<",\"initial_F_error\":"<<initial_F_error
             <<",\"manufactured_PD_affine_error\":"<<affine_PD_error<<",\"loaded_energy_gradient_relative_error\":"<<finite_difference_error
             <<",\"interface_force_residual\":"<<tie.worst_force<<",\"interface_torque_residual\":"<<tie.worst_torque<<",\"interface_power_residual\":"<<tie.worst_power
             <<",\"contact_force_residual\":"<<contact.worst_force<<",\"contact_torque_residual\":"<<contact.worst_torque<<",\"contact_power_residual\":"<<contact.worst_power
+            <<",\"friction_mu\":"<<o.plate_friction<<",\"nonzero_friction_force_sum_N\":"<<friction_force_sum
+            <<",\"friction_cone_ratio\":"<<friction_cone_ratio<<",\"friction_stored_J\":"<<friction_stored
+            <<",\"loaded_energy_FD_includes_friction_history\":false,\"friction_trial_is_const\":true"
             <<",\"full_bending_validation\":false,\"physical_history_points\":0}\n";
         std::cout<<"PREFLIGHT geometry and affine reference maps passed;no compression history evolved."<<std::endl;return 0;
     }
@@ -404,9 +438,9 @@ int runHybrid(const HybridOptions &o)
      if(growth&&fracture_outer->inactive_points)rate+=1/(exposed_contact->stable_dt*exposed_contact->stable_dt);constraint_dt=1/std::sqrt(rate);};
     auto plate_speed=[&](Real t){Real a=std::clamp(t/o.ramp_duration,Real(0),Real(1));
         return t<o.ramp_duration?o.strain*o.diameter*.5*Pi*std::sin(Pi*a)/(o.load_steps*o.ramp_duration):0;};
-    auto apply=[&](Real delta,Real speed=0)
+    auto apply=[&](Real delta,Real speed=0,bool commit_friction=false)
     {
-        core_port.clear();pd_port.clear();tie.apply();contact.apply(-R+.5*delta,R-.5*delta);
+        core_port.clear();pd_port.clear();tie.apply();contact.apply(-R+.5*delta,R-.5*delta,commit_friction);
         if(growth&&fracture_reference->topology_version)
         {exposed_contact->apply(-R+.5*delta,R-.5*delta);fragment_contact->apply(-R+.5*delta,R-.5*delta,.5*speed,-.5*speed);
          contact.upper+=exposed_contact->upper+fragment_contact->upper;contact.lower+=exposed_contact->lower+fragment_contact->lower;
@@ -415,9 +449,22 @@ int runHybrid(const HybridOptions &o)
          maximum_fragment_torque_error=std::max(maximum_fragment_torque_error,fragment_contact->torque_residual);
          maximum_fragment_power_error=std::max(maximum_fragment_power_error,fragment_contact->power_residual);}
     };
+    std::ofstream friction_output(out/"friction_history.csv");
+    friction_output<<std::setprecision(17)<<"kind,step,stage,strain,normal_penalty_J,tangent_penalty_J,slip_dissipation_J,contact_release_J,active_points,sliding_points,max_cone_ratio,history_commits\n";
+    auto write_friction=[&](const char *kind,Real delta)
+    {friction_output<<kind<<','<<step<<','<<stage<<','<<delta/o.diameter<<','<<contact.energy-contact.tangent_energy<<','
+        <<contact.tangent_energy<<','<<contact.slip_dissipation<<','<<contact.release_energy<<','<<contact.active_friction_points<<','
+        <<contact.sliding_points<<','<<contact.max_cone_ratio<<','<<contact.history_commits<<'\n';friction_output.flush();};
     auto write_fields=[&](size_t frame)
     {
         vtp.writeToFile(frame);
+        if(o.plate_friction>0)
+        {
+            fs::create_directories(out/"platen_surface");std::ofstream q(out/"platen_surface"/("platen_"+std::to_string(frame)+".csv"));
+            q<<std::setprecision(17)<<"x_m,y_m,z_m,fx_N,fy_N,fz_N,area_m2,contact_side\n";
+            for(size_t i=0;i<contact.position.size();++i)q<<contact.position[i][0]<<','<<contact.position[i][1]<<','<<contact.position[i][2]<<','
+                <<contact.force[i][0]<<','<<contact.force[i][1]<<','<<contact.force[i][2]<<','<<outer_area[i]<<','<<contact.friction_history[i].side<<'\n';
+        }
         fs::create_directories(out/"interface_surface");std::ofstream f(out/"interface_surface"/("interface_"+std::to_string(frame)+".csv"));
         f<<std::setprecision(17)<<"x0_m,y0_m,z0_m,PD_x_m,PD_y_m,PD_z_m,core_x_m,core_y_m,core_z_m,fx_N,fy_N,fz_N,area_m2\n";
         for(size_t i=0;i<inner_points.size();++i)f<<inner_points[i][0]<<','<<inner_points[i][1]<<','<<inner_points[i][2]<<','<<tie.x_a[i][0]<<','<<tie.x_a[i][1]<<','<<tie.x_a[i][2]<<','
@@ -465,7 +512,7 @@ int runHybrid(const HybridOptions &o)
                 onset->maximum_damage=std::max(onset->maximum_damage,*std::max_element(damage,damage+s.n));
                 fracture_inner->rebuildChanged();fracture_outer->rebuildChanged();
                 tie.stable_dt=ReferenceSolidSurface::stableBound(pd_inner,&core_surface,tie.stiffness);
-                contact.stable_dt=ReferenceSolidSurface::stableBound(pd_outer,nullptr,contact.stiffness);update_constraint_bound();
+                contact.refreshTimeStepBound();update_constraint_bound();
                 pd_second(0);for(size_t i=0;i<s.n;++i)pd_acc[i].setZero();pd_third(0);pd_auxiliary(0);
                 apply(delta,plate_speed(stage_time));for(size_t i=0;i<s.n;++i)pd_acc[i]+=pd_port.external[i];consecutive=0;
                 if(fracture_event_count==0)first_fracture_step=step;++fracture_event_count;
@@ -532,7 +579,7 @@ int runHybrid(const HybridOptions &o)
         if(!std::isfinite(dt) || dt<1e-15 || step>=o.max_steps)throw std::runtime_error("Time step/count guard");
         if(step==0)write_fields(0);
         if(step%1000==0)
-        {progress<<step<<','<<stage<<','<<stage_time<<','<<dt<<','<<delta<<','<<contact.upper<<','<<contact.lower<<','<<kinetic<<','<<tie.energy<<','<<contact.energy<<','<<jc<<','<<js<<'\n';progress.flush();}
+        {progress<<step<<','<<stage<<','<<stage_time<<','<<dt<<','<<delta<<','<<contact.upper<<','<<contact.lower<<','<<kinetic<<','<<tie.energy<<','<<contact.energy<<','<<jc<<','<<js<<'\n';progress.flush();write_friction("progress",delta);}
         if(stage_time>=o.ramp_duration && stage_step%200==0)
         {
             Real squared=0;
@@ -558,6 +605,7 @@ int runHybrid(const HybridOptions &o)
                     <<fracture_reference->ballistic_particles<<','<<fracture_reference->resolution_removed_bonds<<','<<fracture_reference->affine_rows<<','<<fracture_inner->inactive_points<<','<<fracture_outer->inactive_points<<','
                     <<fragment_contact->self_contacts<<','<<fragment_contact->core_contacts<<','<<fragment_contact->plane_contacts<<','<<fragment_contact->force_residual<<','<<fragment_contact->torque_residual<<','<<fragment_contact->power_residual<<'\n';fracture_history.flush();}
                 if(energy_model)write_energy(energy_history,delta);
+                write_friction("equilibrium",delta);
                 write_fields(stage);
                 std::cout<<"ACCEPTED load="<<stage<<'/'<<o.load_steps<<" strain="<<delta/o.diameter<<" force="<<mean<<" residual="<<residual<<" imbalance="<<imbalance<<std::endl;
                 if(stage==o.load_steps)break;
@@ -567,7 +615,7 @@ int runHybrid(const HybridOptions &o)
         if(stage_time>o.max_stage_duration)throw std::runtime_error("Hybrid load step did not reach equilibrium;no complete result written");
         particle_for(execution::ParallelPolicy(),core.LoopRange(),[&](size_t i){core_first.initialization(i,dt);});
         pd_first.exec(dt);
-        apply(delta_at(stage_time+.5*dt),plate_speed(stage_time+.5*dt));
+        apply(delta_at(stage_time+.5*dt),plate_speed(stage_time+.5*dt),true);
         // PD first-half copied old prior acceleration before drifting. Replace
         // it here with the common-midpoint interface/contact loads exactly once.
         for(size_t i=0;i<s.n;++i)pd_acc[i]=pd_port.external[i];
@@ -588,6 +636,9 @@ int runHybrid(const HybridOptions &o)
         <<",\n\"max_interface_force_mapping_residual\":"<<tie.worst_force<<",\n\"max_interface_torque_mapping_residual\":"<<tie.worst_torque<<",\n\"max_interface_power_mapping_residual\":"<<tie.worst_power
         <<",\n\"max_contact_force_mapping_residual\":"<<contact.worst_force<<",\n\"max_contact_torque_mapping_residual\":"<<contact.worst_torque<<",\n\"max_contact_power_mapping_residual\":"<<contact.worst_power
         <<",\n\"plate_work_quadrature_J\":"<<work<<",\n\"core_global_relaxation_loss_J\":"<<core_relax_loss
+        <<",\n\"plate_friction_mu\":"<<o.plate_friction<<",\n\"plate_tangent_factor\":"<<o.plate_tangent_factor
+        <<",\n\"friction_slip_dissipation_J\":"<<contact.slip_dissipation<<",\n\"friction_contact_release_J\":"<<contact.release_energy
+        <<",\n\"friction_tangent_penalty_J\":"<<contact.tangent_energy<<",\n\"friction_history_commits\":"<<contact.history_commits
         <<",\n\"material_calibrated\":false,\n\"thin_layer_spatial_convergence\":false,\n\"full_stored_energy_audit\":false\n}\n";
     if(growth){std::ofstream f(out/"fracture_summary.json");f<<std::setprecision(17)
         <<"{\"status\":\"COMPLETED_STRENGTH_CONTROLLED_FRACTURE_GROWTH\",\"events\":"<<fracture_event_count

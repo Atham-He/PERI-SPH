@@ -3,6 +3,7 @@
 #define PD_SOLID_REFERENCE_COUPLING_H
 
 #include "base_particles.hpp"
+#include "pd_coulomb_friction.h"
 #include "base_body.h"
 #include <Eigen/Cholesky>
 #include <Eigen/Eigenvalues>
@@ -238,38 +239,79 @@ class BondedSolidInterface
     }
 };
 
-/** Frictionless analytic planes acting on a reconstructed physical surface. */
+/** Analytic parallel planes, with optional rate-independent Coulomb friction.
+ * Plane motion is normal to z; the prescribed tangential plane velocity is zero.
+ * The same surface interpolation and transpose force map serve all components. */
 class SolidSurfacePlaneContact
 {
   public:
     ReferenceSolidSurface &surface;
     StdVec<Real> areas,stiffness;
     StdVec<Vecd> position,force;
+    using FrictionHistory=CoulombTangentialHistory<Vecd>;
+    StdVec<FrictionHistory> friction_history;
+    Real friction,tangent_factor;
     Real stable_dt,upper=0,lower=0,energy=0,max_penetration=0;
+    Real tangent_energy=0,slip_dissipation=0,release_energy=0,max_cone_ratio=0;
+    Real tangential_force_sum=0;
+    size_t active_friction_points=0,sliding_points=0,history_commits=0;
     Real worst_force=0,worst_torque=0,worst_power=0,length_scale;
-    SolidSurfacePlaneContact(ReferenceSolidSurface &s,const StdVec<Real> &area,Real stiffness_per_area,Real length)
-        : surface(s),areas(area),length_scale(length)
+    SolidSurfacePlaneContact(ReferenceSolidSurface &s,const StdVec<Real> &area,
+                             Real stiffness_per_area,Real length,Real mu=0,Real kt_over_kn=1)
+        : surface(s),areas(area),friction(mu),tangent_factor(kt_over_kn),length_scale(length)
     {
-        if(areas.size()!=s.rows.size())throw std::invalid_argument("Contact area count differs");
+        if(areas.size()!=s.rows.size()||!std::isfinite(mu)||mu<0||
+           !std::isfinite(kt_over_kn)||kt_over_kn<=0)
+            throw std::invalid_argument("Invalid contact areas or Coulomb parameters");
         for(Real a:areas){if(a<=0)throw std::invalid_argument("Contact areas must be positive");stiffness.push_back(a*stiffness_per_area);}
         position.resize(area.size());force.resize(area.size());
-        stable_dt=ReferenceSolidSurface::stableBound(surface,nullptr,stiffness);
+        if(friction>0)friction_history.resize(area.size());
+        refreshTimeStepBound();
     }
-    void apply(Real bottom,Real top)
+    void refreshTimeStepBound()
     {
-        upper=lower=energy=max_penetration=0;Vecd ferr=Vecd::Zero(),terr=Vecd::Zero();Real perr=0,fs=0,ps=0;
+        // Stick: Kt P_t + Kn n*n^T. Sliding also couples Ft to Fn with
+        // derivative bounded by mu*Kn. The sum of these operator norms is
+        // a conservative bound; mu=0 preserves the original bound exactly.
+        if(friction==0){stable_dt=ReferenceSolidSurface::stableBound(surface,nullptr,stiffness);return;}
+        StdVec<Real> bound=stiffness;for(auto &k:bound)k*=1+tangent_factor+friction;
+        stable_dt=ReferenceSolidSurface::stableBound(surface,nullptr,bound);
+    }
+    void apply(Real bottom,Real top,bool commit_history=false)
+    {
+        upper=lower=energy=max_penetration=tangent_energy=max_cone_ratio=tangential_force_sum=0;
+        active_friction_points=sliding_points=0;
+        Vecd ferr=Vecd::Zero(),terr=Vecd::Zero();Real perr=0,fs=0,ps=0;
         for(size_t i=0;i<stiffness.size();++i)
         {
-            if(surface.rows[i].index.empty()){position[i].setZero();force[i].setZero();continue;}
+            if(surface.rows[i].index.empty())
+            {
+                if(friction>0&&commit_history&&friction_history[i].side)
+                {auto r=friction_history[i].trial(Vecd::Zero(),0,0,stiffness[i]*tangent_factor,friction);
+                 friction_history[i].commit(r);release_energy+=r.release_energy;}
+                position[i].setZero();force[i].setZero();continue;
+            }
             Vecd x=surface.position(i);
             Real pb=std::max(bottom-x[2],Real(0)),pt=std::max(x[2]-top,Real(0));
-            position[i]=x;
-            // An inactive unilateral constraint contributes exactly zero.
-            // Preserve its recorded position/force; avoid interpolating its
-            // velocity and scattering/auditing zero force to every support node.
-            if(pb==0 && pt==0){force[i].setZero();continue;}
-            Vecd v=surface.velocity(i),f(0,0,stiffness[i]*(pb-pt));force[i]=f;
-            upper+=stiffness[i]*pt;lower+=stiffness[i]*pb;
+            position[i]=x;Vecd ft=Vecd::Zero();
+            if(friction>0)
+            {
+                int side=pb>0?-1:pt>0?1:0;
+                if(side||friction_history[i].side)
+                {
+                    Vecd tangent=x;tangent[2]=0;
+                    auto r=friction_history[i].trial(tangent,side,stiffness[i]*(pb+pt),stiffness[i]*tangent_factor,friction);
+                    ft=r.force;tangent_energy+=r.stored;sliding_points+=r.sliding;active_friction_points+=side!=0;
+                    tangential_force_sum+=ft.norm();
+                    if(pb+pt>0)max_cone_ratio=std::max(max_cone_ratio,ft.norm()/(friction*stiffness[i]*(pb+pt)));
+                    if(commit_history){friction_history[i].commit(r);slip_dissipation+=r.slip_dissipation;release_energy+=r.release_energy;}
+                }
+            }
+            // The default zero-friction arithmetic follows the original path.
+            if(pb==0&&pt==0){force[i].setZero();continue;}
+            Vecd v=surface.velocity(i),f(0,0,stiffness[i]*(pb-pt));
+            if(friction>0)f+=ft;
+            force[i]=f;upper+=stiffness[i]*pt;lower+=stiffness[i]*pb;
             energy+=.5*stiffness[i]*(pb*pb+pt*pt);max_penetration=std::max({max_penetration,pb,pt});
             surface.scatter(i,f);ferr-=f;terr-=x.cross(f);perr-=f.dot(v);ps+=std::abs(f.dot(v));
             const auto &r=surface.rows[i];
@@ -277,10 +319,12 @@ class SolidSurfacePlaneContact
             {size_t id=r.index[j];Vecd fj=r.weight[j]*f;ferr+=fj;terr+=surface.port.position[id].cross(fj);
              Real p=fj.dot(surface.port.velocity[id]);perr+=p;fs+=fj.norm();ps+=std::abs(p);}
         }
+        energy+=tangent_energy;if(friction>0&&commit_history)++history_commits;
         worst_force=std::max(worst_force,ferr.norm()/std::max(fs,Real(1e-30)));
         worst_torque=std::max(worst_torque,terr.norm()/std::max(length_scale*fs,Real(1e-30)));
         worst_power=std::max(worst_power,std::abs(perr)/std::max(ps,Real(1e-30)));
     }
 };
+
 } // namespace SPH::peridynamics
 #endif

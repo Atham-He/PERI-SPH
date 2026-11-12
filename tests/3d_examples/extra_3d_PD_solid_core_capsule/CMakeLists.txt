@@ -17,7 +17,7 @@ file(SHA256 ${PERI_SHARED}/materials/drucker_prager_cap_solid.h ADAPTER_HASH)
 set(PD_ASSEMBLY_HASHES "${MAIN_HASH};${FIXTURE_HASH};${COUPLING_HASH}")
 foreach(PD_HEADER pd_quadratic_correspondence.h pd_principal_stress_onset.h
         pd_fracture_correspondence.h pd_fracture_surface.h pd_fragment_contact.h pd_energy_crack_band.h
-        pd_layered_geometry.h pd_layered_correspondence.h pd_layered_surface.h)
+        pd_layered_geometry.h pd_layered_correspondence.h pd_layered_surface.h pd_coulomb_friction.h)
     set(PD_HEADER_PATH ${PERI_SHARED}/peridynamics/${PD_HEADER})
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${PD_HEADER_PATH})
     file(SHA256 ${PD_HEADER_PATH} PD_HEADER_HASH)
@@ -37,3 +37,7 @@ target_compile_features(pd_solid_capsule PRIVATE cxx_std_17)
 target_compile_definitions(pd_solid_capsule PRIVATE
     CAPSULE_SOURCE_SHA256="${ASSEMBLY_HASH}"
     DPC_MATERIAL_SHA256="${MATERIAL_HASH}")
+
+add_executable(pd_coulomb_law_check test_coulomb_friction.cpp)
+target_link_libraries(pd_coulomb_law_check sphinxsys_3d)
+target_compile_features(pd_coulomb_law_check PRIVATE cxx_std_17)

@@ -83,7 +83,8 @@ struct HybridOptions : PDSolidCapsuleOptions
         };
         for(int i=1;i<argc;++i)consume(argv[i]);
         std::vector<char*> ptr;for(auto &a:base)ptr.push_back(a.data());
-        if((fracture_model=="principal_stress"||fracture_model=="crack_band_energy")&&fracture_scope=="growth")maximum_supported_strain=.25;
+        if(fracture_model=="crack_band_energy"&&fracture_scope=="growth")maximum_supported_strain=.5;
+        else if(fracture_model=="principal_stress"&&fracture_scope=="growth")maximum_supported_strain=.25;
         PDSolidCapsuleOptions::parse(int(ptr.size()),ptr.data());
         if(pd_spacing==0)pd_spacing=spacing;
         if(interface_core_order==0)interface_core_order=interface_order;

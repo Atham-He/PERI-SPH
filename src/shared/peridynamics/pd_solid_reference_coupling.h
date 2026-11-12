@@ -261,9 +261,14 @@ class SolidSurfacePlaneContact
         for(size_t i=0;i<stiffness.size();++i)
         {
             if(surface.rows[i].index.empty()){position[i].setZero();force[i].setZero();continue;}
-            Vecd x=surface.position(i),v=surface.velocity(i);
+            Vecd x=surface.position(i);
             Real pb=std::max(bottom-x[2],Real(0)),pt=std::max(x[2]-top,Real(0));
-            Vecd f(0,0,stiffness[i]*(pb-pt));position[i]=x;force[i]=f;
+            position[i]=x;
+            // An inactive unilateral constraint contributes exactly zero.
+            // Preserve its recorded position/force; avoid interpolating its
+            // velocity and scattering/auditing zero force to every support node.
+            if(pb==0 && pt==0){force[i].setZero();continue;}
+            Vecd v=surface.velocity(i),f(0,0,stiffness[i]*(pb-pt));force[i]=f;
             upper+=stiffness[i]*pt;lower+=stiffness[i]*pb;
             energy+=.5*stiffness[i]*(pb*pb+pt*pt);max_penetration=std::max({max_penetration,pb,pt});
             surface.scatter(i,f);ferr-=f;terr-=x.cross(f);perr-=f.dot(v);ps+=std::abs(f.dot(v));

@@ -14,6 +14,7 @@
 #include "pd_layered_surface.h"
 #include <sstream>
 #include <map>
+#include <tbb/task_arena.h>
 
 struct HybridOptions : PDSolidCapsuleOptions
 {
@@ -605,6 +606,11 @@ int runHybrid(const HybridOptions &o)
 
 int main(int argc,char **argv)
 {
-    try{HybridOptions options;options.parseHybrid(argc,argv);return runHybrid(options);}
+    try{HybridOptions options;options.parseHybrid(argc,argv);
+        // Match the arena concurrency to the configured worker limit. The
+        // implicit hardware-sized arena can retain affinity proxy tasks when
+        // oneTBB global_control limits the workers (upstream issue #1403).
+        tbb::task_arena arena(options.threads);
+        return arena.execute([&](){return runHybrid(options);});}
     catch(const std::exception &e){std::cerr<<"ERROR: "<<e.what()<<std::endl;return 1;}
 }

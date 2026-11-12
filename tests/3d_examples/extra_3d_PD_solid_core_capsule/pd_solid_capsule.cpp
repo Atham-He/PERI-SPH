@@ -22,7 +22,7 @@ struct HybridOptions : PDSolidCapsuleOptions
     bool quadratic_kinematics=false,layered_kinematics=false;
     unsigned plate_surface_order=1;
     size_t shell_layers=3;
-    unsigned interface_order=1;
+    unsigned interface_order=1,interface_core_order=0; // zero inherits the common order
     Real interface_core_support=2.5,interface_shell_support=2.5;
     std::string shell_material="elastic",fracture_model="none",fracture_scope="none";
     std::string fragment_policy="error",core_contact_mesh;
@@ -48,6 +48,9 @@ struct HybridOptions : PDSolidCapsuleOptions
             if(key=="pd-kinematics"){if(value!="linear"&&value!="quadratic"&&value!="layered_quadratic")throw std::invalid_argument("pd-kinematics must be linear, quadratic or layered_quadratic");quadratic_kinematics=value!="linear";layered_kinematics=value=="layered_quadratic";return;}
             if(key=="plate-surface-order"){if(value!="1"&&value!="2")throw std::invalid_argument("plate-surface-order must be 1 or 2");plate_surface_order=unsigned(value[0]-'0');return;}
             if(key=="interface-order"){if(value!="1" && value!="2")throw std::invalid_argument("interface-order must be 1 or 2");interface_order=unsigned(value[0]-'0');return;}
+            if(key=="interface-core-order")
+            {if(value=="inherit")interface_core_order=0;else if(value=="1"||value=="2")interface_core_order=unsigned(value[0]-'0');
+             else throw std::invalid_argument("interface-core-order must be inherit, 1 or 2");return;}
             if(key=="core-backend"){if(value!="solid_sph")throw std::invalid_argument("Core requires solid_sph,not a WCSPH fluid");return;}
             if(key=="shell-backend"){if(value!="nosb_pd")throw std::invalid_argument("Shell requires nosb_pd");return;}
             if(key=="shell-material"){shell_material=value;return;}
@@ -79,6 +82,7 @@ struct HybridOptions : PDSolidCapsuleOptions
         if((fracture_model=="principal_stress"||fracture_model=="crack_band_energy")&&fracture_scope=="growth")maximum_supported_strain=.25;
         PDSolidCapsuleOptions::parse(int(ptr.size()),ptr.data());
         if(pd_spacing==0)pd_spacing=spacing;
+        if(interface_core_order==0)interface_core_order=interface_order;
         if(shell_material!="elastic"&&shell_material!="j2"&&shell_material!="corotated_biot"&&shell_material!="finite_volume_biot")throw std::invalid_argument("Unknown shell material");
         if(shell_yield<0||shell_hardening<0||(shell_material=="j2"&&shell_yield<=0)||
            (shell_material!="j2"&&(shell_yield!=0||shell_hardening!=0)))
@@ -94,6 +98,8 @@ struct HybridOptions : PDSolidCapsuleOptions
         if(fragment_policy!="error")throw std::invalid_argument("Only fragment-policy=error is allowed: numerical erosion is not a physical fracture parameter");
         if(fracture_scope=="growth"&&fracture_model=="principal_stress"&&(!quadratic_kinematics||interface_order!=2||core_contact_mesh.empty()))
             throw std::invalid_argument("Fracture growth requires quadratic PD, quadratic interface and a core-contact triangulation");
+        if(fracture_model=="principal_stress"&&fracture_scope=="growth"&&interface_core_order!=interface_order)
+            throw std::invalid_argument("Mixed core/PD reconstruction orders are not qualified for sharp-fracture growth");
         if(postfracture_checkpoint_steps&&(fracture_scope!="growth"||preflight_only||postfracture_checkpoint_steps>max_steps))throw std::invalid_argument("Invalid fracture-growth diagnostic checkpoint");
         if(postfracture_checkpoint_steps&&fracture_model=="crack_band_energy")throw std::invalid_argument("Use energy history outputs for continuous damage diagnostics");
         if(layered_kinematics&&(interface_order!=2||plate_surface_order!=2||fracture_model!="crack_band_energy"))throw std::invalid_argument("The qualified layered volume path requires quadratic inner/outer traces and energy crack-band damage");
@@ -239,7 +245,7 @@ int runHybrid(const HybridOptions &o)
     StdVec<Vecd> inner_points,outer_points;
     for(const auto &n:interface_directions)inner_points.push_back(rc*n);
     for(const auto &n:contact_directions)outer_points.push_back(R*n);
-    ReferenceSolidSurface core_surface(core_port,inner_points,o.spacing,o.interface_core_support,o.interface_order);
+    ReferenceSolidSurface core_surface(core_port,inner_points,o.spacing,o.interface_core_support,o.interface_core_order);
     UniquePtr<ReferenceSolidSurface> inner_owner,outer_owner;
     FractureAwareSurface *fracture_inner=nullptr,*fracture_outer=nullptr;
     if(growth)
@@ -319,6 +325,8 @@ int runHybrid(const HybridOptions &o)
         <<"\ninterface_points="<<inner_points.size()<<"\ncontact_points="<<outer_points.size()
         <<"\ncore_surface_affine_error="<<core_surface.affine_error<<"\nPD_inner_affine_error="<<pd_inner.affine_error<<"\nPD_outer_affine_error="<<pd_outer.affine_error
         <<"\nplate_surface_order="<<o.plate_surface_order<<"\nshell_surface_reconstruction="<<(layered_geometry?"normal_Lagrange_then_quadratic_surface_MLS":"volume_MLS")<<"\ninterface_order="<<o.interface_order<<"\ninterface_core_support_ratio="<<o.interface_core_support<<"\ninterface_shell_support_ratio="<<o.interface_shell_support
+        <<"\ninterface_core_order="<<o.interface_core_order<<"\ninterface_shell_order="<<(layered_geometry?2:o.interface_order)
+        <<"\ncore_surface_polynomial_error_applicable="<<(o.interface_core_order==2)
         <<"\ncore_surface_polynomial_error="<<core_surface.polynomial_error<<"\nPD_inner_polynomial_error="<<pd_inner.polynomial_error
         <<"\ninterface_K="<<o.tie_factor*Eref/o.spacing<<"\ncontact_K="<<o.contact_factor*Eref/o.spacing
         <<"\ninterface_dt_bound="<<tie.stable_dt<<"\ncontact_dt_bound="<<contact.stable_dt

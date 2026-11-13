@@ -12,12 +12,14 @@
 #include "pd_energy_crack_band.h"
 #include "pd_layered_correspondence.h"
 #include "pd_layered_surface.h"
+#include "solid_residual_integration.h"
 #include <sstream>
 #include <map>
 #include <tbb/task_arena.h>
 
 struct HybridOptions : PDSolidCapsuleOptions
 {
+    std::string solid_stabilization="none";
     bool preflight_only=false;
     size_t postfracture_checkpoint_steps=0;
     bool quadratic_kinematics=false,layered_kinematics=false;
@@ -53,6 +55,7 @@ struct HybridOptions : PDSolidCapsuleOptions
             if(key=="interface-core-order")
             {if(value=="inherit")interface_core_order=0;else if(value=="1"||value=="2")interface_core_order=unsigned(value[0]-'0');
              else throw std::invalid_argument("interface-core-order must be inherit, 1 or 2");return;}
+            if(key=="solid-stabilization"){if(value!="none"&&value!="quadratic_residual")throw std::invalid_argument("solid-stabilization must be none or quadratic_residual");solid_stabilization=value;return;}
             if(key=="core-backend"){if(value!="solid_sph")throw std::invalid_argument("Core requires solid_sph,not a WCSPH fluid");return;}
             if(key=="shell-backend"){if(value!="nosb_pd")throw std::invalid_argument("Shell requires nosb_pd");return;}
             if(key=="shell-material"){shell_material=value;return;}
@@ -190,6 +193,11 @@ int runHybrid(const HybridOptions &o)
     InnerRelation core_inner(core);
     InteractionWithUpdate<LinearGradientCorrectionMatrixInner> core_correction(core_inner);
     Dynamics1Level<solid_dynamics::Integration1stHalfPK2RightCauchy> core_first(core_inner);
+    UniquePtr<solid_dynamics::SolidQuadraticReference> core_residual_reference;
+    UniquePtr<solid_dynamics::SolidResidualIntegration1stHalf> core_residual_first;
+    if(o.solid_stabilization=="quadratic_residual")
+    {core_residual_reference=makeUnique<solid_dynamics::SolidQuadraticReference>(core_inner,o.core_E/(2*(1+o.core_nu)),o.core_E/(1-2*o.core_nu));core_residual_first=makeUnique<solid_dynamics::SolidResidualIntegration1stHalf>(core_inner,*core_residual_reference);
+     auto&p=core.getBaseParticles();p.addVariableToWrite<Real>("SolidResidualEnergyDensity");p.addVariableToWrite<Vecd>("SolidResidualForce");}
     Dynamics1Level<solid_dynamics::Integration2ndHalf> core_second(core_inner);
     ReduceDynamics<solid_dynamics::AcousticTimeStep> core_dt(core,o.cfl);
 
@@ -243,7 +251,7 @@ int runHybrid(const HybridOptions &o)
         shell.getSPHAdaptation().getKernel()->CutOffRadius());
     auto pd_auxiliary=[&](Real dt){if(!energy_model){pd_stabilize.exec(dt);pd_pair_damping.exec(dt);}};
     State c(core),s(shell);
-    system.initializeSystemCellLinkedLists();system.initializeSystemConfigurations();core_correction.exec();pd_shape.exec();
+    system.initializeSystemCellLinkedLists();system.initializeSystemConfigurations();core_correction.exec();if(core_residual_reference)core_residual_reference->build();pd_shape.exec();
     if(growth)fracture_reference->initialize();else if(o.quadratic_kinematics)quadratic_reference.build();
     if(energy_model)energy_model->initialize();
     pd_second(0);
@@ -289,6 +297,8 @@ int runHybrid(const HybridOptions &o)
         fragment_contact=makeUnique<PDFragmentContact>(pd_port,*fracture_reference,core_surface,tie.x_b,metric,o.contact_factor*Eref/o.spacing,o.core_contact_mesh);
     }
     auto &cp=core.getBaseParticles();auto &sp=shell.getBaseParticles();
+    std::ofstream residual_history;
+    if(core_residual_reference){residual_history.open(out/"solid_stabilization.csv");residual_history<<std::setprecision(17)<<"load_step,strain,residual_energy_J,core_elastic_energy_J,core_plastic_work_J,residual_fraction_of_material_energy\n";}
     auto *pd_acc=sp.getVariableDataByName<Vecd>("PDAcceleration");
     auto *pd_internal=sp.getVariableDataByName<Vecd>("PDInternalForce");
     auto *pd_K=sp.getVariableDataByName<Matd>("ShapeTensorK");
@@ -324,6 +334,7 @@ int runHybrid(const HybridOptions &o)
         <<"\npostfracture_checkpoint_steps="<<o.postfracture_checkpoint_steps
         <<"\nshell_yield_stress="<<o.shell_yield<<"\nshell_hardening_modulus="<<o.shell_hardening<<"\ncore_material=DPC\n"
         <<"shell_E="<<o.shell_E<<"\nshell_nu="<<o.shell_nu<<"\nshell_reference_density="<<o.shell_rho
+        <<"\nsolid_stabilization="<<o.solid_stabilization<<"\nsolid_residual_reference_dt_bound="<<(core_residual_reference?core_residual_reference->stable_dt:0)
         <<"\ninterface_law=perfect_bond_vector_penalty\n"
         <<"core_particles="<<c.n<<"\nshell_particles="<<s.n<<"\nshell_layers="<<o.shell_layers
         <<"\ncore_diameter="<<2*rc<<"\nouter_diameter="<<2*R<<"\nshell_thickness="<<o.thickness
@@ -579,7 +590,7 @@ int runHybrid(const HybridOptions &o)
         Real quadratic_dt=o.quadratic_kinematics?(energy_model?energy_model->finiteStrainTimeStep(quadratic_reference.elastic_dt_bound):quadratic_reference.elastic_dt_bound):std::numeric_limits<Real>::infinity();
         Real fragment_dt=growth?fragment_contact->stable_dt:std::numeric_limits<Real>::infinity();
         Real energy_dt=energy_model?energy_model->stabilizer_dt:std::numeric_limits<Real>::infinity();
-        Real dt=std::min({o.max_dt,core_dt.exec(),pd_dt.exec(),constraint_dt,radial_dt,dpc_dt,quadratic_dt,fragment_dt,energy_dt})*o.dt_scale;
+        Real dt=std::min({o.max_dt,core_dt.exec(),pd_dt.exec(),constraint_dt,radial_dt,dpc_dt,quadratic_dt,fragment_dt,energy_dt,core_residual_reference?core_residual_reference->stable_dt:std::numeric_limits<Real>::infinity()})*o.dt_scale;
         if(!std::isfinite(dt) || dt<1e-15 || step>=o.max_steps)throw std::runtime_error("Time step/count guard");
         if(step==0)write_fields(0);
         if(step%1000==0)
@@ -609,6 +620,8 @@ int runHybrid(const HybridOptions &o)
                     <<fracture_reference->ballistic_particles<<','<<fracture_reference->resolution_removed_bonds<<','<<fracture_reference->affine_rows<<','<<fracture_inner->inactive_points<<','<<fracture_outer->inactive_points<<','
                     <<fragment_contact->self_contacts<<','<<fragment_contact->core_contacts<<','<<fragment_contact->plane_contacts<<','<<fragment_contact->force_residual<<','<<fragment_contact->torque_residual<<','<<fragment_contact->power_residual<<'\n';fracture_history.flush();}
                 if(energy_model)write_energy(energy_history,delta);
+                if(core_residual_reference)
+                {Real U=0,W=0;auto*p=cp.getVariableDataByName<Real>("DPCElasticEnergyDensity");for(size_t i=0;i<c.n;++i){U+=c.measure[i]*p[i];W+=c.measure[i]*dpc_work[i];}Real S=core_residual_reference->totalEnergy();residual_history<<stage<<','<<delta/o.diameter<<','<<S<<','<<U<<','<<W<<','<<S/std::max(U+W,Real(1e-30))<<'\n';residual_history.flush();}
                 write_friction("equilibrium",delta);
                 write_fields(stage);
                 std::cout<<"ACCEPTED load="<<stage<<'/'<<o.load_steps<<" strain="<<delta/o.diameter<<" force="<<mean<<" residual="<<residual<<" imbalance="<<imbalance<<std::endl;
@@ -617,7 +630,7 @@ int runHybrid(const HybridOptions &o)
             }
         }
         if(stage_time>o.max_stage_duration)throw std::runtime_error("Hybrid load step did not reach equilibrium;no complete result written");
-        particle_for(execution::ParallelPolicy(),core.LoopRange(),[&](size_t i){core_first.initialization(i,dt);});
+        particle_for(execution::ParallelPolicy(),core.LoopRange(),[&](size_t i){if(core_residual_first)core_residual_first->initialization(i,dt);else core_first.initialization(i,dt);});
         pd_first.exec(dt);
         apply(delta_at(stage_time+.5*dt),plate_speed(stage_time+.5*dt),true);
         // PD first-half copied old prior acceleration before drifting. Replace
@@ -625,8 +638,8 @@ int runHybrid(const HybridOptions &o)
         for(size_t i=0;i<s.n;++i)pd_acc[i]=pd_port.external[i];
         try{pd_second(dt);pd_third(dt);pd_auxiliary(dt);}
         catch(const std::exception&e){if(energy_model)dump_energy_failure(e.what());throw;}
-        particle_for(execution::ParallelPolicy(),core.LoopRange(),[&](size_t i){core_first.interaction(i,dt);});
-        particle_for(execution::ParallelPolicy(),core.LoopRange(),[&](size_t i){core_first.update(i,dt);});
+        particle_for(execution::ParallelPolicy(),core.LoopRange(),[&](size_t i){if(core_residual_first)core_residual_first->interaction(i,dt);else core_first.interaction(i,dt);});
+        particle_for(execution::ParallelPolicy(),core.LoopRange(),[&](size_t i){if(core_residual_first)core_residual_first->update(i,dt);else core_first.update(i,dt);});
         Real factor=std::exp(-o.damping_rate*dt);
         for(size_t i=0;i<c.n;++i){Real before=.5*c.mass[i]*c.v[i].squaredNorm();c.v[i]*=factor;core_relax_loss+=before*(1-factor*factor);}
         work+=.5*(contact.upper+contact.lower)*(delta_at(stage_time+dt)-delta);

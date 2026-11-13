@@ -5,6 +5,7 @@
  */
 #include "sphinxsys.h"
 #include "drucker_prager_cap_solid.h"
+#include "solid_residual_integration.h"
 #include <Eigen/Cholesky>
 #include <Eigen/Geometry>
 #include <chrono>
@@ -33,10 +34,11 @@ struct Options
     Real drag = 0, yield_stress = 2e4, hardening = 0;
     Real relaxation_damping = 0.002, force_tolerance = 0.05, balance_tolerance = 0.02, kinetic_tolerance = 1e-4;
     size_t load_steps = 20, ramp_steps = 1000, max_stage_steps = 200000, threads = 1;
+    std::string solid_stabilization = "none";
     std::string material = "elastic", output = "run", input_file, plate_contact = "legacy", interface_surface = "legacy_mid";
     size_t max_steps = 2000000;
     std::string dpc_table;
-    Real dpc_r0 = 0, dpc_solid_density = 0, constraint_E = 0, dpc_shear_dilation = 1;
+    Real dpc_r0 = 0, dpc_solid_density = 0, constraint_E = 0, dpc_shear_dilation = 1, dpc_shear_hardening = 0;
 
     void parse(int ac, char **av)
     {
@@ -74,6 +76,8 @@ struct Options
                 if (val != "bare" && val != "coated") throw std::invalid_argument("case must be bare or coated");
                 coated = val == "coated";
             }
+            else if (key == "solid-stabilization")
+            {if(val!="none"&&val!="quadratic_residual")throw std::invalid_argument("solid-stabilization must be none or quadratic_residual");solid_stabilization=val;}
             else if (key == "material") material = val;
             else if (key == "dpc-table") dpc_table = fs::absolute(val).string();
             else if (key == "plate-contact") plate_contact = val;
@@ -87,6 +91,7 @@ struct Options
                 if (key == "dpc-r0") dpc_r0 = x;
                 else if (key == "dpc-solid-density") dpc_solid_density = x;
                 else if (key == "dpc-shear-dilation") dpc_shear_dilation = x;
+                else if (key == "dpc-shear-hardening") dpc_shear_hardening = x;
                 else if (key == "constraint-E") constraint_E = x;
                 else if (key == "diameter") diameter = x;
                 else if (key == "thickness") thickness = x;
@@ -141,9 +146,10 @@ struct Options
             throw std::invalid_argument("parameters outside supported positive/pre-fracture ranges (strain <= 0.15)");
         if (material != "elastic" && material != "j2" && material != "dpc") throw std::invalid_argument("material must be elastic, j2 or dpc");
         if (constraint_E < 0) throw std::invalid_argument("constraint-E must be zero (use core E) or positive");
+        if(dpc_shear_hardening<0 || (dpc_shear_hardening>0 && material!="dpc"))throw std::invalid_argument("dpc-shear-hardening requires nonnegative DPC input");
         if (material == "dpc")
         {
-            auto model=dpc::Model::fromCSV(dpc_table,dpc_r0,dpc_shear_dilation);auto p=model.parameters(dpc_r0);
+            auto model=dpc::Model::fromCSV(dpc_table,dpc_r0,dpc_shear_dilation,dpc_shear_hardening);auto p=model.parameters(dpc_r0);
             auto close=[](Real a,Real b){return std::abs(a-b)<=1e-9*std::max(Real(1),std::abs(b));};
             if(dpc_solid_density<=0 || !close(core_rho,dpc_solid_density*dpc_r0) || !close(core_E,p.E) || !close(core_nu,p.nu))
                 throw std::invalid_argument("DPC initial E, nu and mass density must match table/r0/solid-density; no silent substitution");
@@ -677,7 +683,7 @@ int run(const Options &o)
     DruckerPragerCapSolid *dpc_material=nullptr;
     if (o.material == "dpc")
     {
-        core.defineMatterMaterial<DruckerPragerCapSolid>(o.core_rho,dpc::Model::fromCSV(o.dpc_table,o.dpc_r0,o.dpc_shear_dilation));
+        core.defineMatterMaterial<DruckerPragerCapSolid>(o.core_rho,dpc::Model::fromCSV(o.dpc_table,o.dpc_r0,o.dpc_shear_dilation,o.dpc_shear_hardening));
         dpc_material=&DynamicCast<DruckerPragerCapSolid>(&core,core.getMatterMaterial());
     }
     else if (o.material == "j2") core.defineMatterMaterial<HardeningPlasticSolid>(o.core_rho, o.core_E, o.core_nu, o.yield_stress, o.hardening);
@@ -686,6 +692,15 @@ int run(const Options &o)
     InnerRelation core_inner(core);
     InteractionWithUpdate<LinearGradientCorrectionMatrixInner> correction(core_inner);
     Dynamics1Level<solid_dynamics::Integration1stHalfPK2RightCauchy> elastic_first(core_inner);
+    std::unique_ptr<solid_dynamics::SolidQuadraticReference> residual_reference;
+    std::unique_ptr<solid_dynamics::SolidResidualIntegration1stHalf> residual_first;
+    if(o.solid_stabilization=="quadratic_residual")
+    {
+        if(o.material!="dpc")throw std::invalid_argument("This example qualifies residual control with its DPC core only; the reusable operator remains material independent");
+        residual_reference=std::make_unique<solid_dynamics::SolidQuadraticReference>(core_inner,o.core_E/(2*(1+o.core_nu)),o.core_E/(1-2*o.core_nu));
+        residual_first=std::make_unique<solid_dynamics::SolidResidualIntegration1stHalf>(core_inner,*residual_reference);
+        auto&p=core.getBaseParticles();p.addVariableToWrite<Real>("SolidResidualEnergyDensity");p.addVariableToWrite<Vecd>("SolidResidualForce");
+    }
     std::unique_ptr<Dynamics1Level<solid_dynamics::DecomposedPlasticIntegration1stHalf>> plastic_first;
     if (o.material == "j2") plastic_first = std::make_unique<Dynamics1Level<solid_dynamics::DecomposedPlasticIntegration1stHalf>>(core_inner);
     Dynamics1Level<solid_dynamics::Integration2ndHalf> core_second(core_inner);
@@ -714,7 +729,7 @@ int run(const Options &o)
     }
     system.initializeSystemCellLinkedLists();
     system.initializeSystemConfigurations();
-    correction.exec();
+    correction.exec();if(residual_reference)residual_reference->build();
     if (shell_correction) shell_correction->exec();
     std::unique_ptr<BondedInterface> tie;
     if (s) tie = std::make_unique<BondedInterface>(c, *s, o.spacing, o.tie_factor * (o.constraint_E > 0 ? o.constraint_E : o.core_E) / o.spacing,
@@ -753,8 +768,10 @@ int run(const Options &o)
         plastic_alpha = core.getBaseParticles().getVariableDataByName<Real>("HardeningParameter");
         core.getBaseParticles().addVariableToWrite<Real>("HardeningParameter");
     }
+    std::ofstream residual_history;
+    if(residual_reference){residual_history.open(output_root/"solid_stabilization.csv");residual_history<<std::setprecision(17)<<"load_step,strain,residual_energy_J,core_elastic_energy_J,core_plastic_work_J,residual_fraction_of_material_energy\n";}
     std::ofstream material_history;
-    Real *dpc_r=nullptr,*dpc_kappa=nullptr,*dpc_work=nullptr,*dpc_residual=nullptr,*dpc_surface=nullptr;
+    Real *dpc_r=nullptr,*dpc_kappa=nullptr,*dpc_work=nullptr,*dpc_residual=nullptr,*dpc_surface=nullptr,*dpc_alpha=nullptr,*dpc_effective_d=nullptr;
     std::vector<bool> ever_cap(c.n,false);
     if(dpc_material)
     {
@@ -762,11 +779,12 @@ int run(const Options &o)
         dpc_r=p.getVariableDataByName<Real>("DPCRelativeDensity");dpc_kappa=p.getVariableDataByName<Real>("DPCPlasticCompaction");
         dpc_work=p.getVariableDataByName<Real>("DPCPlasticStressWork");dpc_residual=p.getVariableDataByName<Real>("DPCYieldResidual");
         dpc_surface=p.getVariableDataByName<Real>("DPCActiveSurface");
-        for(const std::string name:{"DPCRelativeDensity","DPCPlasticCompaction","DPCPlasticStressWork","DPCYieldResidual","DPCActiveSurface"})p.addVariableToWrite<Real>(name);
+        dpc_alpha=p.getVariableDataByName<Real>("DPCAccumulatedPlasticShear");dpc_effective_d=p.getVariableDataByName<Real>("DPCEffectiveCohesion");
+        for(const std::string name:{"DPCRelativeDensity","DPCPlasticCompaction","DPCPlasticStressWork","DPCYieldResidual","DPCActiveSurface","DPCAccumulatedPlasticShear","DPCEffectiveCohesion"})p.addVariableToWrite<Real>(name);
         p.addVariableToWrite<Matd>("DPCCauchyStress");p.addVariableToWrite<Matd>("DPCInversePlasticMetric");
         fs::copy_file(o.dpc_table,output_root/"dpc_density_table.csv");
         material_history.open(output_root/"material_history.csv");
-        material_history<<std::setprecision(17)<<"load_step,strain,volume_ratio,min_relative_density,max_relative_density,min_kappa,max_kappa,ever_cap_particle_fraction,plastic_stress_work_J,max_yield_residual\n";
+        material_history<<std::setprecision(17)<<"load_step,strain,volume_ratio,min_relative_density,max_relative_density,min_kappa,max_kappa,ever_cap_particle_fraction,plastic_stress_work_J,max_yield_residual,min_accumulated_shear,max_accumulated_shear,mean_accumulated_shear,min_effective_d_Pa,max_effective_d_Pa\n";
     }
     std::ofstream cfg(output_root / "parameters.txt");
     if (!cfg) throw std::runtime_error("cannot write parameters");
@@ -777,7 +795,10 @@ int run(const Options &o)
         << "\ndpc_material_sha256=" << DPC_MATERIAL_SHA256
         << "\ndpc_r0=" << o.dpc_r0 << "\ndpc_solid_density=" << o.dpc_solid_density
         << "\ndpc_flow=eta_scaled_shifted_ellipse_c_equals_b_pa\ndpc_shear_dilation=" << o.dpc_shear_dilation
+        << "\ndpc_shear_hardening_Pa=" << o.dpc_shear_hardening
+        << "\ndpc_shear_hardening_actual_Pa=" << (dpc_material?dpc_material->ShearHardeningModulus():0)
         << "\ndpc_reference_is_batch_calibrated=false"
+        << "\nsolid_stabilization="<<o.solid_stabilization<<"\nsolid_residual_reference_dt_bound="<<(residual_reference?residual_reference->stable_dt:0)
         << "\ncore_material=" << o.material << "\nshell_material=" << (s ? "elastic_plane_stress" : "none")
         << "\ninterface=" << (s ? "affine_penalty_tie" : "none") << '\n'
         << "interface_surface=" << (s ? o.interface_surface : "none")
@@ -883,7 +904,7 @@ int run(const Options &o)
         largest_penetration = std::max(largest_penetration, contact.penetration);
         worst_J = std::min(worst_J, minJ); max_force = std::max(max_force, contact.upper);
         if (!o.quasistatic && time < end && end - time < 1e-12 * end) { time = end; continue; }
-        Real dt = std::min({core_dt.exec(), contact.stable_dt,dpc_dt_bound});
+        Real dt = std::min({core_dt.exec(), contact.stable_dt,dpc_dt_bound,residual_reference?residual_reference->stable_dt:std::numeric_limits<Real>::infinity()});
         if (s) dt = std::min({dt, shell_dt->exec(), tie->stable_dt});
         if (o.drag > 0) dt = std::min(dt, Real(0.2) / o.drag);
         dt = std::min(dt, o.max_dt);
@@ -951,8 +972,12 @@ int run(const Options &o)
                     material_history<<stage<<','<<delta/o.diameter<<','<<V/V0<<','
                         <<*std::min_element(dpc_r,dpc_r+c.n)<<','<<*std::max_element(dpc_r,dpc_r+c.n)<<','
                         <<*std::min_element(dpc_kappa,dpc_kappa+c.n)<<','<<*std::max_element(dpc_kappa,dpc_kappa+c.n)<<','
-                        <<Real(caps)/c.n<<','<<W<<','<<yr<<'\n';material_history.flush();
+                        <<Real(caps)/c.n<<','<<W<<','<<yr<<','<<*std::min_element(dpc_alpha,dpc_alpha+c.n)<<','
+                        <<*std::max_element(dpc_alpha,dpc_alpha+c.n)<<','<<std::accumulate(dpc_alpha,dpc_alpha+c.n,Real(0))/c.n<<','
+                        <<*std::min_element(dpc_effective_d,dpc_effective_d+c.n)<<','<<*std::max_element(dpc_effective_d,dpc_effective_d+c.n)<<'\n';material_history.flush();
                 }
+                if(residual_reference)
+                {Real U=0,W=0;auto*p=core.getBaseParticles().getVariableDataByName<Real>("DPCElasticEnergyDensity");for(size_t i=0;i<c.n;++i){U+=c.measure[i]*p[i];if(dpc_work)W+=c.measure[i]*dpc_work[i];}Real S=residual_reference->totalEnergy();residual_history<<stage<<','<<delta/o.diameter<<','<<S<<','<<U<<','<<W<<','<<S/std::max(U+W,Real(1e-30))<<'\n';residual_history.flush();}
                 contact.writeSurface(output_root / "contact_surface", frame);
                 if (tie) tie->writeSurface(output_root / "interface_surface", frame);
                 vtp.writeToFile(frame++);
@@ -973,7 +998,7 @@ int run(const Options &o)
         { particle_for(execution::ParallelPolicy(), a.body.LoopRange(), [&](size_t i) { method.interaction(i, dt); }); };
         auto update = [&](auto &method, State &a)
         { particle_for(execution::ParallelPolicy(), a.body.LoopRange(), [&](size_t i) { method.update(i, dt); }); };
-        if (plastic_first) initialize(*plastic_first, c); else initialize(elastic_first, c);
+        if(residual_first)initialize(*residual_first,c);else if (plastic_first) initialize(*plastic_first, c); else initialize(elastic_first, c);
         // Native shell initialization writes a shared numerical damping matrix.
         // Keep this portion serial; core and shell interactions remain parallel.
         if (shell_first)
@@ -989,9 +1014,9 @@ int run(const Options &o)
         }
         work += (o.quasistatic ? 0.5 * (contact.upper + contact.lower) : contact.upper) *
                 (step_compression(o.quasistatic ? Real(1) : dt) - delta);
-        if (plastic_first) interact(*plastic_first, c); else interact(elastic_first, c);
+        if(residual_first)interact(*residual_first,c);else if (plastic_first) interact(*plastic_first, c); else interact(elastic_first, c);
         if (shell_first) interact(*shell_first, *s);
-        if (plastic_first) update(*plastic_first, c); else update(elastic_first, c);
+        if(residual_first)update(*residual_first,c);else if (plastic_first) update(*plastic_first, c); else update(elastic_first, c);
         if (shell_first) update(*shell_first, *s);
         if (o.quasistatic)
         {

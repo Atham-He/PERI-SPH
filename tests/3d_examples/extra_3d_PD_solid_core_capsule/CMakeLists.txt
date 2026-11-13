@@ -41,3 +41,7 @@ target_compile_definitions(pd_solid_capsule PRIVATE
 add_executable(pd_coulomb_law_check test_coulomb_friction.cpp)
 target_link_libraries(pd_coulomb_law_check sphinxsys_3d)
 target_compile_features(pd_coulomb_law_check PRIVATE cxx_std_17)
+
+add_executable(dpc_moving_junction_check test_dpc_moving_junction.cpp)
+target_link_libraries(dpc_moving_junction_check sphinxsys_3d)
+target_compile_features(dpc_moving_junction_check PRIVATE cxx_std_17)

@@ -163,9 +163,13 @@ class Model
         {
             // A two-variable backward-Euler invariant return. The potential
             // scale cancels in the flow ratio, avoiding an extra multiplier.
+            // A converged root on the continuation of one branch is a
+            // predictor for the other branch when hardening moves the junction.
+            // Reuse only that converged root; all branch/yield guards remain.
+            Eigen::Vector2d branch_seed(old.kappa,0);
             auto attempt=[&](int branch)->bool
             {
-                Eigen::Vector2d x(old.kappa,0);
+                Eigen::Vector2d x=branch_seed;
                 auto residual=[&](const Eigen::Vector2d &v)->Eigen::Vector2d
                 {
                     double pp,qq; Parameters z; stress(v[0],v[1],pp,qq,z);
@@ -187,6 +191,7 @@ class Model
                     const Eigen::Vector2d f=residual(x);
                     if(f.lpNorm<Eigen::Infinity>()<1e-9)
                     {
+                        if(shear_hardening_>0)branch_seed=x;
                         double pp,qq; Parameters z; stress(x[0],x[1],pp,qq,z);
                         if((branch==1 && pp>z.pa+1e-7*scale) || (branch==2 && pp<z.pa-1e-7*scale) ||
                            qq < -1e-7*scale || (branch==1 && x[0]>old.kappa+1e-10) || (branch==2 && x[0]<old.kappa-1e-10)) return false;

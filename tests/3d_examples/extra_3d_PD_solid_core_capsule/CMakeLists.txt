@@ -45,3 +45,8 @@ target_compile_features(pd_coulomb_law_check PRIVATE cxx_std_17)
 add_executable(dpc_moving_junction_check test_dpc_moving_junction.cpp)
 target_link_libraries(dpc_moving_junction_check sphinxsys_3d)
 target_compile_features(dpc_moving_junction_check PRIVATE cxx_std_17)
+
+# Optional S-NSNI-based bare-solid entry; default PD/SPH entry is unchanged.
+add_executable(snsni_bare snsni_bare.cpp)
+target_link_libraries(snsni_bare sphinxsys_3d)
+target_compile_features(snsni_bare PRIVATE cxx_std_17)

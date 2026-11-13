@@ -23,7 +23,7 @@ class SolidQuadraticReference : public LocalDynamics, public DataDelegateInner
     struct Edge {size_t j,reverse;Vecd gradient;V9 basis,coefficient;Real weight;Vecd residual,stabilizing_force;};
     std::vector<std::vector<Edge>> rows;
     StdVec<Real> length2,energy,scale;
-    Real max_condition=0,max_reproduction_error=0,stable_dt=0;
+    Real max_condition=0,max_reproduction_error=0,stable_dt=0,native_dt_bound=0;
     Real *volume,*mass;Vecd *position;
     Real shear,elastic_norm;
     SolidQuadraticReference(BaseInnerRelation &relation,Real shear_modulus,Real elastic_operator_norm)
@@ -73,6 +73,18 @@ class SolidQuadraticReference : public LocalDynamics, public DataDelegateInner
             norms+=self.norm();Real factor=volume[i]*elastic_norm*norms;bound[i]+=factor*self.norm();for(const auto&e:rows[i])bound[e.j]+=factor*e.gradient.norm();
         }
         Real maximum=0;for(size_t i=0;i<count;++i)maximum=std::max(maximum,(bound[i]+hg_bound[i])/mass[i]);stable_dt=.2/std::sqrt(maximum);
+        // The optional native-gradient wrapper needs its OWN elastic bound;
+        // the quadratic-gradient bound is not silently reused as a proof.
+        const auto *B=particles_->getVariableDataByName<Matd>("LinearGradientCorrectionMatrix");
+        std::fill(bound.begin(),bound.end(),Real(0));
+        for(size_t i=0;i<count;++i)
+        {
+            const auto&nb=inner_configuration_[i];Vecd self=Vecd::Zero();Real norms=0;
+            for(size_t k=0;k<nb.current_size_;++k){Vecd g=B[i].transpose()*(nb.dW_ij_[k]*volume[nb.j_[k]]*nb.e_ij_[k]);self-=g;norms+=g.norm();}
+            norms+=self.norm();Real factor=volume[i]*elastic_norm*norms;bound[i]+=factor*self.norm();
+            for(size_t k=0;k<nb.current_size_;++k){Vecd g=B[i].transpose()*(nb.dW_ij_[k]*volume[nb.j_[k]]*nb.e_ij_[k]);bound[nb.j_[k]]+=factor*g.norm();}
+        }
+        maximum=0;for(size_t i=0;i<count;++i)maximum=std::max(maximum,(bound[i]+hg_bound[i])/mass[i]);native_dt_bound=.2/std::sqrt(maximum);
     }
     Matd gradient(size_t i,const Vecd*field)const
     {Matd g=Matd::Zero();for(const auto&e:rows[i])g+=(field[e.j]-field[i])*e.gradient.transpose();return g;}

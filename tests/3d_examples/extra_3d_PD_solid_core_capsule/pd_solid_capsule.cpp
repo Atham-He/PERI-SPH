@@ -334,7 +334,7 @@ int runHybrid(const HybridOptions &o)
         <<"\npostfracture_checkpoint_steps="<<o.postfracture_checkpoint_steps
         <<"\nshell_yield_stress="<<o.shell_yield<<"\nshell_hardening_modulus="<<o.shell_hardening<<"\ncore_material=DPC\n"
         <<"shell_E="<<o.shell_E<<"\nshell_nu="<<o.shell_nu<<"\nshell_reference_density="<<o.shell_rho
-        <<"\nsolid_stabilization="<<o.solid_stabilization<<"\nsolid_residual_reference_dt_bound="<<(core_residual_reference?core_residual_reference->stable_dt:0)
+        <<"\nsolid_stabilization="<<o.solid_stabilization<<"\nsolid_residual_reference_dt_bound="<<(core_residual_reference?core_residual_reference->native_dt_bound:0)
         <<"\ninterface_law=perfect_bond_vector_penalty\n"
         <<"core_particles="<<c.n<<"\nshell_particles="<<s.n<<"\nshell_layers="<<o.shell_layers
         <<"\ncore_diameter="<<2*rc<<"\nouter_diameter="<<2*R<<"\nshell_thickness="<<o.thickness
@@ -590,7 +590,7 @@ int runHybrid(const HybridOptions &o)
         Real quadratic_dt=o.quadratic_kinematics?(energy_model?energy_model->finiteStrainTimeStep(quadratic_reference.elastic_dt_bound):quadratic_reference.elastic_dt_bound):std::numeric_limits<Real>::infinity();
         Real fragment_dt=growth?fragment_contact->stable_dt:std::numeric_limits<Real>::infinity();
         Real energy_dt=energy_model?energy_model->stabilizer_dt:std::numeric_limits<Real>::infinity();
-        Real dt=std::min({o.max_dt,core_dt.exec(),pd_dt.exec(),constraint_dt,radial_dt,dpc_dt,quadratic_dt,fragment_dt,energy_dt,core_residual_reference?core_residual_reference->stable_dt:std::numeric_limits<Real>::infinity()})*o.dt_scale;
+        Real dt=std::min({o.max_dt,core_dt.exec(),pd_dt.exec(),constraint_dt,radial_dt,dpc_dt,quadratic_dt,fragment_dt,energy_dt,core_residual_reference?core_residual_reference->native_dt_bound:std::numeric_limits<Real>::infinity()})*o.dt_scale;
         if(!std::isfinite(dt) || dt<1e-15 || step>=o.max_steps)throw std::runtime_error("Time step/count guard");
         if(step==0)write_fields(0);
         if(step%1000==0)

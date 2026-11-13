@@ -798,7 +798,7 @@ int run(const Options &o)
         << "\ndpc_shear_hardening_Pa=" << o.dpc_shear_hardening
         << "\ndpc_shear_hardening_actual_Pa=" << (dpc_material?dpc_material->ShearHardeningModulus():0)
         << "\ndpc_reference_is_batch_calibrated=false"
-        << "\nsolid_stabilization="<<o.solid_stabilization<<"\nsolid_residual_reference_dt_bound="<<(residual_reference?residual_reference->stable_dt:0)
+        << "\nsolid_stabilization="<<o.solid_stabilization<<"\nsolid_residual_reference_dt_bound="<<(residual_reference?residual_reference->native_dt_bound:0)
         << "\ncore_material=" << o.material << "\nshell_material=" << (s ? "elastic_plane_stress" : "none")
         << "\ninterface=" << (s ? "affine_penalty_tie" : "none") << '\n'
         << "interface_surface=" << (s ? o.interface_surface : "none")
@@ -904,7 +904,7 @@ int run(const Options &o)
         largest_penetration = std::max(largest_penetration, contact.penetration);
         worst_J = std::min(worst_J, minJ); max_force = std::max(max_force, contact.upper);
         if (!o.quasistatic && time < end && end - time < 1e-12 * end) { time = end; continue; }
-        Real dt = std::min({core_dt.exec(), contact.stable_dt,dpc_dt_bound,residual_reference?residual_reference->stable_dt:std::numeric_limits<Real>::infinity()});
+        Real dt = std::min({core_dt.exec(), contact.stable_dt,dpc_dt_bound,residual_reference?residual_reference->native_dt_bound:std::numeric_limits<Real>::infinity()});
         if (s) dt = std::min({dt, shell_dt->exec(), tie->stable_dt});
         if (o.drag > 0) dt = std::min(dt, Real(0.2) / o.drag);
         dt = std::min(dt, o.max_dt);

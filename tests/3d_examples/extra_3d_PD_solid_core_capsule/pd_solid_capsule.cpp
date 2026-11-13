@@ -418,6 +418,9 @@ int runHybrid(const HybridOptions &o)
     if(energy_model){for(const auto&name:{"FractureDissipationDensity","ShellStoredEnergyDensity","ShellStabilizationEnergyDensity","FractureHistoryKappa","ShellTangentModulusBound"})sp.addVariableToWrite<Real>(name);
         sp.addVariableToWrite<int>("MaterialTensileFailure");sp.addVariableToWrite<Vecd>("CrackNormalReference");}
     cp.addVariableToWrite<Matd>("DPCCauchyStress");
+    // Keep material histories available for auditing coupled load paths.
+    for(const auto &name:{"DPCRelativeDensity","DPCPlasticCompaction","DPCAccumulatedPlasticShear","DPCEffectiveCohesion","DPCPlasticStressWork","DPCElasticEnergyDensity","DPCYieldResidual","DPCActiveSurface"})cp.addVariableToWrite<Real>(name);
+    cp.addVariableToWrite<Matd>("DPCInversePlasticMetric");
     BodyStatesRecordingToVtp vtp(system);
     std::ofstream eq(out/"equilibria.csv"),history(out/"material_history.csv"),progress(out/"progress.csv");
     std::ofstream fracture_events(out/"fracture_events.csv"),fracture_history(out/"fracture_history.csv");

@@ -1,6 +1,7 @@
 #include "capsule_core_fixture.h"
 #include "pd_solid_reference_coupling.h"
 #include "solid_snsni_plastic.h"
+#include "solid_snsni_diagnostics.h"
 #include <tbb/task_arena.h>
 using namespace SPH::solid_dynamics;
 using Field=StdVec<Vecd>;
@@ -34,7 +35,18 @@ int qualify(SnsniReference&r,SnsniPlasticSolid&body,Real rho,Real cfl,const fs::
     Field diff(n);for(size_t j=0;j<n;++j)diff[j]=nonlinear[j]-linear[j];Real limit=std::sqrt(dot(diff,diff)/dot(linear,linear));
     // Nonuniform finite deformation, including plastic correction, then rotate.
     for(auto&v:d)v*=50000;
-    body.evaluate(d,rho,cfl);nonlinear=body.internal;body.discard();
+    body.evaluate(d,rho,cfl);nonlinear=body.internal;
+    auto audit_history=body.history;
+    auto audit_work=SnsniDiagnostics::instantVirtualWork(r,body,d);
+    Real audit_state_difference=0,audit_force_difference=0;
+    for(size_t l=0;l<body.history.size();++l)audit_state_difference+=
+        (body.history[l].inverse_Cp-audit_history[l].inverse_Cp).squaredNorm()+std::abs(body.history[l].kappa-audit_history[l].kappa)+std::abs(body.history[l].alpha-audit_history[l].alpha);
+    for(size_t j=0;j<nonlinear.size();++j)audit_force_difference+=(nonlinear[j]-body.internal[j]).squaredNorm();
+    bool audit_pass=audit_work.error()<1e-10&&audit_state_difference==0&&audit_force_difference==0;
+    std::ofstream audit_result(out/"audit_qualification.json");audit_result<<std::setprecision(17)
+        <<R"({"status":")"<<(audit_pass?"PASSED":"FAILED")<<R"(","weak_form_split_relative_error":)"<<audit_work.error()
+        <<R"(,"history_mutation_norm":)"<<audit_state_difference<<R"(,"internal_force_mutation_norm":)"<<audit_force_difference<<"}"<<std::endl;audit_result.close();
+    body.discard();
     Matd Q=Eigen::AngleAxisd(.73,Vecd(1,2,3).normalized()).toRotationMatrix();Field rotated(n);
     for(size_t j=0;j<n;++j)rotated[j]=Q*(r.X[j]+d[j])-r.X[j];
     body.evaluate(rotated,rho,cfl);Vecd net=Vecd::Zero(),torque=Vecd::Zero();Real force_sum=0;
@@ -54,11 +66,11 @@ int qualify(SnsniReference&r,SnsniPlasticSolid&body,Real rho,Real cfl,const fs::
     auto hamilton=[&](){r.apply(time.displacement,f);Real e=time.kinetic()+.5*dot(time.displacement,f);for(size_t j=0;j<n;++j)e-=.125*dt*dt*r.mass[j]*time.acceleration[j].squaredNorm();return e;};
     Real initial=hamilton(),energy_error=0;
     for(size_t s=0;s<128;++s){time.step(dt,0,[&](const Field&u,const Field&,Field&force){r.apply(u,force);for(auto&v:force)v=-v;});energy_error=std::max(energy_error,std::abs(hamilton()/initial-1));}
-    bool pass=limit<2e-5&&objective<1e-7&&net_error<1e-10&&torque_error<1e-9&&native_error==0&&shear&&cap&&double_rejected&&body.commits-commit_start==2&&energy_error<1e-9;
+    bool pass=audit_pass&&limit<2e-5&&objective<1e-7&&net_error<1e-10&&torque_error<1e-9&&native_error==0&&shear&&cap&&double_rejected&&body.commits-commit_start==2&&energy_error<1e-9;
     std::ofstream result(out/"qualification.json");result<<std::setprecision(17)<<"{\n\"status\":\""<<(pass?"PASSED":"FAILED")<<"\",\n\"elastic_limit_relative_force_error\":"<<limit<<",\n\"finite_rotation_force_objectivity_error\":"<<objective<<",\n\"net_internal_force_error\":"<<net_error<<",\n\"internal_torque_error\":"<<torque_error<<",\n\"native_DPC_stress_difference\":"<<native_error<<",\n\"shear_and_cap_exercised\":"<<(shear&&cap?"true":"false")<<",\n\"double_commit_rejected\":"<<(double_rejected?"true":"false")<<",\n\"central_difference_invariant_error\":"<<energy_error<<",\n\"linear_frequency_bound_squared\":"<<body.linear_frequency_bound_squared<<",\n\"linear_dt_s\":"<<dt<<",\n\"physical_compression_histories\":0\n}\n";result.close();
     std::cout<<"QUALIFICATION "<<(pass?"PASSED":"FAILED")<<" elastic="<<limit<<" objective="<<objective<<" energy="<<energy_error<<std::endl;return pass?0:2;
 }
-int run(const PDSolidCapsuleOptions&o,const std::string&geometry,bool gate)
+int run(const PDSolidCapsuleOptions&o,const std::string&geometry,bool gate,const std::string&audit_baseline)
 {
     if(o.coated||o.material!="dpc")throw std::invalid_argument("This qualified entry is frozen-input bare DPC; capsule remains gated");
     fs::path out=fs::absolute(o.output);if(fs::exists(out)&&!fs::is_empty(out))throw std::runtime_error("Output must be new or empty");fs::create_directories(out/"vtp");
@@ -77,6 +89,7 @@ int run(const PDSolidCapsuleOptions&o,const std::string&geometry,bool gate)
     RKSurface surface(port,points,reference);Real K=o.contact_factor*o.constraint_E/o.spacing;
     peridynamics::SolidSurfacePlaneContact contact(surface,areas,K,R);
     SnsniCentralDifference time(reference.mass);Field total(n,Vecd::Zero());
+    SnsniDiagnostics audit(out,reference,o.diameter,audit_baseline);
     const Real ramp=o.ramp_steps*o.max_dt,max_duration=o.max_stage_steps*o.max_dt,damping=o.relaxation_damping/o.max_dt;
     const Real linear_dt=o.cfl/std::sqrt(body.linear_frequency_bound_squared);
     const Real constant_bound=1/std::sqrt(1/(linear_dt*linear_dt)+1/(contact.stable_dt*contact.stable_dt));
@@ -93,20 +106,23 @@ int run(const PDSolidCapsuleOptions&o,const std::string&geometry,bool gate)
     std::ofstream config(out/"numerics.json");config<<std::setprecision(17)<<"{\"linear_dt_bound_s\":"<<linear_dt<<",\"contact_dt_bound_s\":"<<contact.stable_dt<<",\"combined_bound_s\":"<<constant_bound<<",\"contact_K_Pa_per_m\":"<<K<<",\"ramp_duration_s\":"<<ramp<<",\"relaxation_rate_s_inverse\":"<<damping<<",\"coefficient_dofs\":"<<n<<",\"material_sites\":"<<body.history.size()<<",\"mass_kg\":"<<std::accumulate(m,m+n,Real(0))<<"}\n";config.close();
     while(stage<=o.load_steps){Real dt=std::min({o.max_dt,constant_bound,body.acoustic_dt});if(stage_time<ramp)dt=std::min(dt,ramp-stage_time);
         if(!std::isfinite(dt)||dt<1e-15||time.steps>=o.max_steps)throw std::runtime_error("Explicit time/count bound exhausted");
-        time.step(dt,damping,[&](const Field&d,const Field&vel,Field&force){evaluate(d,vel,stage_time+dt,force);total=force;});stage_time+=dt;++stage_steps;last_dt=dt;
+        audit.before(time,body,contact,total,stage,delta(stage_time));
+        time.step(dt,damping,[&](const Field&d,const Field&vel,Field&force){evaluate(d,vel,stage_time+dt,force);total=force;});
+        audit.after(time,body,contact,total,dt,damping,stage,delta(stage_time+dt));
+        stage_time+=dt;++stage_steps;last_dt=dt;
         if(time.steps%200==0){Real mean=.5*(contact.upper+contact.lower),residual=std::sqrt(dot(total,total))/std::max(mean,Real(1e-20)),imbalance=std::abs(contact.upper-contact.lower)/std::max(mean,Real(1e-20));
             Real kr=time.kinetic()/std::max(mean*delta(stage_time),Real(1e-30)),minJ=1,vol=0,V0=0,rmin=1,rmax=0,alpha=0,kappa=0,work=0,yr=0;
             for(size_t l=0;l<body.history.size();++l){Real J=body.F[l].determinant(),V=reference.cells[l].volume;minJ=std::min(minJ,J);vol+=V*J;V0+=V;rmin=std::min(rmin,body.pending[l].material.relative_density);rmax=std::max(rmax,body.pending[l].material.relative_density);alpha=std::max(alpha,body.history[l].alpha);kappa=std::max(kappa,body.history[l].kappa);work+=V*body.accumulated_plastic_work[l];yr=std::max(yr,body.pending[l].material.yield_residual);}
             progress<<time.steps<<','<<stage<<','<<stage_time<<','<<dt<<','<<delta(stage_time)/o.diameter<<','<<contact.upper<<','<<contact.lower<<','<<time.kinetic()<<','<<residual<<','<<minJ<<','<<body.commits<<'\n';progress.flush();
             if(time.steps%1000==0)std::cout<<"PROGRESS step="<<time.steps<<" stage="<<stage<<" strain="<<delta(stage_time)/o.diameter<<" force="<<mean<<" residual="<<residual<<" kinetic="<<kr<<std::endl;
             bool good=stage_time>=ramp&&mean>1e-10&&residual<=o.force_tolerance&&imbalance<=o.balance_tolerance&&kr<=o.kinetic_tolerance;checks=good?checks+1:0;
-            if(checks>=3){eq<<stage<<','<<stage_steps<<','<<delta(stage_time)<<','<<delta(stage_time)/o.diameter<<','<<contact.upper<<','<<contact.lower<<','<<residual<<','<<imbalance<<','<<kr<<','<<minJ<<'\n';eq.flush();history<<stage<<','<<delta(stage_time)/o.diameter<<','<<vol/V0<<','<<rmin<<','<<rmax<<','<<alpha<<','<<kappa<<','<<work<<','<<yr<<'\n';history.flush();writeFields(out/"vtp"/("core_"+std::to_string(stage)+".vtp"),reference,body,time.displacement);std::cout<<"ACCEPTED stage="<<stage<<" force="<<mean<<std::endl;++stage;stage_time=0;stage_steps=0;checks=0;}
+            if(checks>=3){audit.equilibrium(stage,time,body,contact,stage_time,delta(stage_time));eq<<stage<<','<<stage_steps<<','<<delta(stage_time)<<','<<delta(stage_time)/o.diameter<<','<<contact.upper<<','<<contact.lower<<','<<residual<<','<<imbalance<<','<<kr<<','<<minJ<<'\n';eq.flush();history<<stage<<','<<delta(stage_time)/o.diameter<<','<<vol/V0<<','<<rmin<<','<<rmax<<','<<alpha<<','<<kappa<<','<<work<<','<<yr<<'\n';history.flush();writeFields(out/"vtp"/("core_"+std::to_string(stage)+".vtp"),reference,body,time.displacement);std::cout<<"ACCEPTED stage="<<stage<<" force="<<mean<<std::endl;++stage;stage_time=0;stage_steps=0;checks=0;}
         }
         if(stage_time>max_duration)throw std::runtime_error("Stage did not equilibrate; no completed curve claimed");
     }
     std::ofstream summary(out/"summary.json");summary<<"{\"status\":\"COMPLETE_FROZEN_INPUT_BARE_SNSNI_CURVE\",\"accepted_points\":"<<o.load_steps<<",\"steps\":"<<time.steps<<",\"material_evaluations\":"<<body.evaluations<<",\"history_commits\":"<<body.commits<<",\"material_parameters_changed\":false}\n";return 0;
 }
 int main(int argc,char**argv)
-{try{std::string cells;bool gate=false;std::vector<char*>args{argv[0]};for(int i=1;i<argc;++i){std::string a=argv[i];if(a=="--qualify-snsni")gate=true;else if(a.rfind("--snsni-cells=",0)==0)cells=a.substr(14);else args.push_back(argv[i]);}
-    PDSolidCapsuleOptions o;o.parse(int(args.size()),args.data());if(cells.empty())throw std::invalid_argument("--snsni-cells required");tbb::task_arena arena(int(o.threads));return arena.execute([&]{return run(o,cells,gate);});
+{try{std::string cells,audit_baseline;bool gate=false;std::vector<char*>args{argv[0]};for(int i=1;i<argc;++i){std::string a=argv[i];if(a=="--qualify-snsni")gate=true;else if(a.rfind("--snsni-cells=",0)==0)cells=a.substr(14);else if(a.rfind("--audit-baseline=",0)==0)audit_baseline=a.substr(17);else args.push_back(argv[i]);}
+    PDSolidCapsuleOptions o;o.parse(int(args.size()),args.data());if(cells.empty())throw std::invalid_argument("--snsni-cells required");tbb::task_arena arena(int(o.threads));return arena.execute([&]{return run(o,cells,gate,audit_baseline);});
  }catch(const std::exception&e){std::cerr<<"SNSNI_ERROR "<<e.what()<<std::endl;return 1;}}

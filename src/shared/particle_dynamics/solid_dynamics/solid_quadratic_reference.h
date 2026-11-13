@@ -86,6 +86,8 @@ class SolidQuadraticReference : public LocalDynamics, public DataDelegateInner
     }
     Vecd force(size_t i,const Matd*P)const
     {Vecd f=Vecd::Zero();for(const auto&e:rows[i]){const auto&r=rows[e.j][e.reverse];f+=volume[i]*P[i]*e.gradient-volume[e.j]*P[e.j]*r.gradient+e.stabilizing_force-r.stabilizing_force;}return f;}
+    Vecd stabilizingForce(size_t i)const
+    {Vecd f=Vecd::Zero();for(const auto&e:rows[i])f+=e.stabilizing_force-rows[e.j][e.reverse].stabilizing_force;return f;}
     Real totalEnergy()const {Real sum=0;for(Real e:energy)sum+=e;return sum;}
 };
 } // namespace SPH::solid_dynamics

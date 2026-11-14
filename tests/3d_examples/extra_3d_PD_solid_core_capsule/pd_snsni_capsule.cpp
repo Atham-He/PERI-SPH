@@ -1,4 +1,4 @@
-/** Frozen S-NSNI/RKPM DPC core + existing layered NOSB-PD energy-damage shell.
+/** S-NSNI/RKPM DPC core + layered NOSB-PD shell with optional transport exports.
  * One common explicit displacement/velocity state, physical lumped masses,
  * common-trace vector penalty and frictionless reconstructed outer contact.
  * No WCSPH fluid, material retuning, particle erosion or force rescaling.
@@ -7,6 +7,7 @@
 #include "solid_snsni_plastic.h"
 #include "pd_radial_layered_surface.h"
 #include "recovery_checkpoint.h"
+#include "diffuse_crack_release.h"
 using namespace SPH::solid_dynamics;
 using namespace SPH::peridynamics;
 using Field=StdVec<Vecd>;
@@ -120,7 +121,7 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells)
         for(size_t j=0;j<cn;++j){internal[j]=cb.internal[j];f[j]=core_port.external[j]-internal[j];}
         for(size_t j=0;j<sn;++j){internal[cn+j]=-sinternal[j]-shg[j];f[cn+j]=sm[j]*pd_port.external[j]-internal[cn+j];}};
     std::ofstream parameters(out/"parameters.json");parameters<<std::setprecision(17)
-      <<"{\"core_backend\":\"frozen_SNSNI_RKPM_DPC\",\"shell_backend\":\"NOSB_PD_layered_volume\",\"fluid_backend\":\"none\",\"shell_constitutive\":\"finite_volume_Biot_energy_damage\",\"fracture_representation\":\"diffuse_crack_band_not_sharp_crack\",\"interface\":\"bonded_vector_penalty_common_facet_trace\",\"plate_friction\":0,\"core_particles\":"<<cn<<",\"shell_particles\":"<<sn<<",\"material_sites\":"<<cr.cells.size()
+      <<"{\"core_backend\":\"SNSNI_RKPM_DPC_with_transport_export\",\"shell_backend\":\"NOSB_PD_layered_volume\",\"fluid_backend\":\"none\",\"shell_constitutive\":\"finite_volume_Biot_energy_damage\",\"fracture_representation\":\"diffuse_crack_band_not_sharp_crack\",\"interface\":\"bonded_vector_penalty_common_facet_trace\",\"plate_friction\":0,\"core_particles\":"<<cn<<",\"shell_particles\":"<<sn<<",\"material_sites\":"<<cr.cells.size()
       <<",\"core_diameter_m\":"<<2*rc<<",\"outer_diameter_m\":"<<2*R<<",\"shell_thickness_m\":"<<o.thickness<<",\"core_spacing_m\":"<<o.spacing<<",\"pd_spacing_m\":"<<o.pd_spacing
       <<",\"core_mass_kg\":"<<core_mass<<",\"shell_mass_kg\":"<<shell_mass<<",\"interface_K_Pa_per_m\":"<<Ktie<<",\"contact_K_Pa_per_m\":"<<Kcontact
       <<",\"shell_E_Pa\":"<<o.shell_E<<",\"shell_nu\":"<<o.shell_nu<<",\"ft_Pa\":"<<o.fracture_stress<<",\"Gc_J_m2\":"<<o.fracture_energy<<",\"crack_band_width_m\":"<<sb.fracture.width<<",\"kappa0\":"<<sb.fracture.k0<<",\"kappaf\":"<<sb.fracture.kf
@@ -152,16 +153,25 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells)
     std::ofstream progress(out/"progress.csv"),eq(out/"equilibria.csv"),events(out/"fracture_events.csv");
     const char*header="step,stage,elapsed_s,strain,compression_m,dt_s,upper_N,lower_N,force_residual,plate_imbalance,kinetic_ratio,core_min_J,shell_min_J,max_damage,initiated_sites,failed_sites,fracture_dissipation_J,shell_stored_J,interface_energy_J,interface_gap_m,contact_energy_J,max_penetration_m,platen_work_J,internal_work_J,damping_loss_J,budget_residual_J\n";
     progress<<std::setprecision(17)<<header;eq<<std::setprecision(17)<<header;events<<std::setprecision(17)<<"event,step,stage,strain,compression_m,mean_reaction_N,max_damage,initiated_sites,failed_sites\n";
-    bool onset_saved=false,failure_saved=false;Real Wp=0,Wi=0,Wd=0,W0constraint=tie.energy+contact.energy,K0=time.kinetic();
+    bool onset_saved=false,failure_saved=false,hydraulic_access_saved=false;Real Wp=0,Wi=0,Wd=0,W0constraint=tie.energy+contact.energy,K0=time.kinetic();
+    auto exportRelease=[&](const std::string&tag){
+        writeLayeredReleaseBarrier((out/("release_barrier_"+tag+".csv")).string(),geometry,sb,sF,directors,rule.weight);
+        std::ofstream f(out/("transport_cells_"+tag+".csv"));f<<std::setprecision(17)<<"cell,J,relative_density,F00,F01,F02,F10,F11,F12,F20,F21,F22\n";
+        for(size_t l=0;l<cr.cells.size();++l){f<<l<<','<<cb.F[l].determinant()<<','<<cb.pending[l].material.relative_density;for(int a=0;a<3;++a)for(int b=0;b<3;++b)f<<','<<cb.F[l](a,b);f<<'\n';}
+        if(!f)throw std::runtime_error("Transport state output failed");
+    };
     auto snapshot=[&](const std::string&tag,Real u){Field cpos(cr.cells.size()),cvelocity;StdVec<Real>p(cr.cells.size()),J(cr.cells.size()),alpha(cr.cells.size());Field cd(time.displacement.begin(),time.displacement.begin()+cn);
         for(size_t l=0;l<cr.cells.size();++l){cpos[l]=cr.cells[l].center+cr.value(l,cd);p[l]=cb.pending[l].material.p;J[l]=cb.F[l].determinant();alpha[l]=cb.history[l].alpha;}
         vtkPoints(out/"vtp"/("core_"+tag+".vtp"),cpos,{}, {},p,J,alpha,{},{});
         Field spts(sx,sx+sn),svel(time.velocity.begin()+cn,time.velocity.end()),normal(sb.crack_normal,sb.crack_normal+sn);StdVec<Real>sd(sb.damage,sb.damage+sn),spressure(sn),sJ(sn),loss(sb.dissipation_density,sb.dissipation_density+sn);
         for(size_t j=0;j<sn;++j){spressure[j]=-sstress[j].trace()/3;sJ[j]=sF[j].determinant();}
-        vtkPoints(out/"vtp"/("shell_"+tag+".vtp"),spts,svel,sd,spressure,sJ,{},loss,normal);vtkPlates(out/"vtp"/("platens_"+tag+".vtp"),R,u);};
+        vtkPoints(out/"vtp"/("shell_"+tag+".vtp"),spts,svel,sd,spressure,sJ,{},loss,normal);vtkPlates(out/"vtp"/("platens_"+tag+".vtp"),R,u);exportRelease(tag);};
     if(recovery::checkpoint.resume.empty())snapshot("0",0);
+    // The chemical process uses a separate physical clock, never explicit dt.
+    // Every export is an actual computed mechanics state, not prescribed damage.
+
     auto transfer=[&](recovery::Archive&a){
-        a.fields(stage,stage_time,elapsed,checks,onset_saved,failure_saved,Wp,Wi,Wd,W0constraint,K0,total,internal);
+        a.fields(stage,stage_time,elapsed,checks,onset_saved,failure_saved,hydraulic_access_saved,Wp,Wi,Wd,W0constraint,K0,total,internal);
         recovery::integrator(a,time);recovery::solid(a,cb);recovery::contact(a,contact);
         a.fields(tie.energy,tie.max_gap,tie.force_residual,tie.torque_residual,tie.power_residual,tie.worst_force,tie.worst_torque,tie.worst_power);
         a.value(sb.history);a.span(sb.damage,sn);a.span(sb.dissipation_density,sn);a.span(sb.stored_density,sn);
@@ -193,6 +203,20 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells)
         auto stat=sb.statistics();
         if((!onset_saved&&stat.initiated)||(!failure_saved&&stat.failed))
         {std::string event=!onset_saved?"first_damage":"first_complete_tensile_failure";events<<event<<','<<time.steps<<','<<stage<<','<<u/o.diameter<<','<<u<<','<<mean<<','<<stat.max_damage<<','<<stat.initiated<<','<<stat.failed<<'\n';events.flush();snapshot(event,u);if(!onset_saved)onset_saved=true;else failure_saved=true;}
+        if(time.steps%200==0 && !hydraulic_access_saved && stat.initiated)
+        {
+            bool connected=false;
+            for(size_t c=0;c<geometry.columns.size()&&!connected;++c)
+            {
+                bool all=true;for(size_t j:geometry.columns[c])all=all&&sb.damage[j]>0;
+                if(!all)continue;
+                StdVec<Matd> state;StdVec<Real>d;StdVec<Vecd>n;
+                for(size_t j:geometry.columns[c]){state.push_back(sF[j]);d.push_back(sb.damage[j]);n.push_back(sb.crack_normal[j]);}
+                connected=diffuseLayerBarrier(state,d,n,rule.weight,directors[c],geometry.thickness[c],sb.fracture.width).open_fraction>0;
+            }
+            if(connected){hydraulic_access_saved=true;snapshot("first_hydraulic_access",u);
+                events<<"first_hydraulic_access"<<','<<time.steps<<','<<stage<<','<<u/o.diameter<<','<<u<<','<<mean<<','<<stat.max_damage<<','<<stat.initiated<<','<<stat.failed<<'\n';events.flush();}
+        }
         if(time.steps%200==0)
         {
             Real residual=0,minc=1,mins=1;for(const auto&f:total)residual+=f.squaredNorm();residual=std::sqrt(residual)/std::max(mean,Real(1e-20));
@@ -208,7 +232,7 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells)
         if(time.steps%200==0 && recovery::checkpoint.due(time.steps,stage!=prior_stage))save();
         if(recovery::checkpoint.stop_step && time.steps>=recovery::checkpoint.stop_step){save();return 86;}
     }
-    std::ofstream summary(out/"summary.json");summary<<"{\"status\":\"COMPLETE_FROZEN_CORE_NOSB_SNSNI_CAPSULE\",\"accepted_points\":"<<o.load_steps<<",\"steps\":"<<time.steps<<",\"core_material_changed\":false,\"parameters_fitted\":false,\"observed_damage_onset\":"<<(onset_saved?"true":"false")<<",\"observed_complete_tensile_failure\":"<<(failure_saved?"true":"false")<<"}\n";
+    std::ofstream summary(out/"summary.json");summary<<"{\"status\":\"COMPLETE_MECHANICAL_HISTORY_WITH_RELEASE_EXPORT\",\"accepted_points\":"<<o.load_steps<<",\"steps\":"<<time.steps<<",\"core_material_changed\":false,\"parameters_fitted\":false,\"observed_damage_onset\":"<<(onset_saved?"true":"false")<<",\"observed_complete_tensile_failure\":"<<(failure_saved?"true":"false")<<"}\n";
     return 0;
 }
 

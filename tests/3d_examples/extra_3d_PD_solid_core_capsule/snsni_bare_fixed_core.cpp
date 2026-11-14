@@ -2,6 +2,7 @@
 #include "pd_solid_reference_coupling.h"
 #include "solid_snsni_plastic.h"
 #include <tbb/task_arena.h>
+#include "recovery_checkpoint.h"
 using namespace SPH::solid_dynamics;
 using Field=StdVec<Vecd>;
 Real dot(const Field&a,const Field&b){Real x=0;for(size_t j=0;j<a.size();++j)x+=a[j].dot(b[j]);return x;}
@@ -91,7 +92,21 @@ int run(const PDSolidCapsuleOptions&o,const std::string&geometry,bool gate)
         force.resize(n);for(size_t j=0;j<n;++j)force[j]=port.external[j]-body.internal[j];body.commit();};
     evaluate(time.displacement,time.velocity,0,total);for(size_t j=0;j<n;++j)time.acceleration[j]=total[j]/m[j];writeFields(out/"vtp/core_0.vtp",reference,body,time.displacement);
     std::ofstream config(out/"numerics.json");config<<std::setprecision(17)<<"{\"linear_dt_bound_s\":"<<linear_dt<<",\"contact_dt_bound_s\":"<<contact.stable_dt<<",\"combined_bound_s\":"<<constant_bound<<",\"contact_K_Pa_per_m\":"<<K<<",\"ramp_duration_s\":"<<ramp<<",\"relaxation_rate_s_inverse\":"<<damping<<",\"coefficient_dofs\":"<<n<<",\"material_sites\":"<<body.history.size()<<",\"mass_kg\":"<<std::accumulate(m,m+n,Real(0))<<"}\n";config.close();
-    while(stage<=o.load_steps){Real dt=std::min({o.max_dt,constant_bound,body.acoustic_dt});if(stage_time<ramp)dt=std::min(dt,ramp-stage_time);
+    auto transfer=[&](recovery::Archive&a){
+        a.fields(stage_time,stage,stage_steps,checks,last_dt,total);
+        recovery::integrator(a,time);recovery::solid(a,body);recovery::contact(a,contact);
+        a.span(x,n);a.span(v,n);
+        if(time.displacement.size()!=n||body.history.size()!=reference.cells.size())throw std::runtime_error("Checkpoint geometry size mismatch");
+    };
+    auto save=[&](){eq.flush();progress.flush();history.flush();recovery::checkpoint.save(out,{"equilibria.csv","progress.csv","material_history.csv"},time.steps,transfer);};
+    if(!recovery::checkpoint.resume.empty()){
+        eq.close();progress.close();history.close();
+        recovery::checkpoint.load(out,{"equilibria.csv","progress.csv","material_history.csv"},transfer);
+        eq.open(out/"equilibria.csv",std::ios::app);progress.open(out/"progress.csv",std::ios::app);history.open(out/"material_history.csv",std::ios::app);
+        eq<<std::setprecision(17);progress<<std::setprecision(17);history<<std::setprecision(17);
+    }
+    save();
+    while(stage<=o.load_steps){size_t prior_stage=stage;Real dt=std::min({o.max_dt,constant_bound,body.acoustic_dt});if(stage_time<ramp)dt=std::min(dt,ramp-stage_time);
         if(!std::isfinite(dt)||dt<1e-15||time.steps>=o.max_steps)throw std::runtime_error("Explicit time/count bound exhausted");
         time.step(dt,damping,[&](const Field&d,const Field&vel,Field&force){evaluate(d,vel,stage_time+dt,force);total=force;});stage_time+=dt;++stage_steps;last_dt=dt;
         if(time.steps%200==0){Real mean=.5*(contact.upper+contact.lower),residual=std::sqrt(dot(total,total))/std::max(mean,Real(1e-20)),imbalance=std::abs(contact.upper-contact.lower)/std::max(mean,Real(1e-20));
@@ -103,10 +118,12 @@ int run(const PDSolidCapsuleOptions&o,const std::string&geometry,bool gate)
             if(checks>=3){eq<<stage<<','<<stage_steps<<','<<delta(stage_time)<<','<<delta(stage_time)/o.diameter<<','<<contact.upper<<','<<contact.lower<<','<<residual<<','<<imbalance<<','<<kr<<','<<minJ<<'\n';eq.flush();history<<stage<<','<<delta(stage_time)/o.diameter<<','<<vol/V0<<','<<rmin<<','<<rmax<<','<<alpha<<','<<kappa<<','<<work<<','<<yr<<'\n';history.flush();writeFields(out/"vtp"/("core_"+std::to_string(stage)+".vtp"),reference,body,time.displacement);std::cout<<"ACCEPTED stage="<<stage<<" force="<<mean<<std::endl;++stage;stage_time=0;stage_steps=0;checks=0;}
         }
         if(stage_time>max_duration)throw std::runtime_error("Stage did not equilibrate; no completed curve claimed");
+        if(time.steps%200==0 && recovery::checkpoint.due(time.steps,stage!=prior_stage))save();
+        if(recovery::checkpoint.stop_step && time.steps>=recovery::checkpoint.stop_step){save();return 86;}
     }
     std::ofstream summary(out/"summary.json");summary<<"{\"status\":\"COMPLETE_FROZEN_INPUT_BARE_SNSNI_CURVE\",\"accepted_points\":"<<o.load_steps<<",\"steps\":"<<time.steps<<",\"material_evaluations\":"<<body.evaluations<<",\"history_commits\":"<<body.commits<<",\"material_parameters_changed\":false}\n";return 0;
 }
 int main(int argc,char**argv)
-{try{std::string cells;bool gate=false;std::vector<char*>args{argv[0]};for(int i=1;i<argc;++i){std::string a=argv[i];if(a=="--qualify-snsni")gate=true;else if(a.rfind("--snsni-cells=",0)==0)cells=a.substr(14);else args.push_back(argv[i]);}
+{try{std::string cells;bool gate=false;std::vector<char*>args{argv[0]};for(int i=1;i<argc;++i){std::string a=argv[i];if(a=="--qualify-snsni")gate=true;else if(a.rfind("--snsni-cells=",0)==0)cells=a.substr(14);else if(recovery::checkpoint.take(a)){}else args.push_back(argv[i]);}
     PDSolidCapsuleOptions o;o.parse(int(args.size()),args.data());if(cells.empty())throw std::invalid_argument("--snsni-cells required");tbb::task_arena arena(int(o.threads));return arena.execute([&]{return run(o,cells,gate);});
  }catch(const std::exception&e){std::cerr<<"SNSNI_ERROR "<<e.what()<<std::endl;return 1;}}

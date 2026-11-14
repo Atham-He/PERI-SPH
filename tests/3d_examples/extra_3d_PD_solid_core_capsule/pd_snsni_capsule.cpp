@@ -6,6 +6,7 @@
 #include "pd_snsni_capsule_fixture.h"
 #include "solid_snsni_plastic.h"
 #include "pd_radial_layered_surface.h"
+#include "recovery_checkpoint.h"
 using namespace SPH::solid_dynamics;
 using namespace SPH::peridynamics;
 using Field=StdVec<Vecd>;
@@ -158,10 +159,29 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells)
         Field spts(sx,sx+sn),svel(time.velocity.begin()+cn,time.velocity.end()),normal(sb.crack_normal,sb.crack_normal+sn);StdVec<Real>sd(sb.damage,sb.damage+sn),spressure(sn),sJ(sn),loss(sb.dissipation_density,sb.dissipation_density+sn);
         for(size_t j=0;j<sn;++j){spressure[j]=-sstress[j].trace()/3;sJ[j]=sF[j].determinant();}
         vtkPoints(out/"vtp"/("shell_"+tag+".vtp"),spts,svel,sd,spressure,sJ,{},loss,normal);vtkPlates(out/"vtp"/("platens_"+tag+".vtp"),R,u);};
-    snapshot("0",0);
+    if(recovery::checkpoint.resume.empty())snapshot("0",0);
+    auto transfer=[&](recovery::Archive&a){
+        a.fields(stage,stage_time,elapsed,checks,onset_saved,failure_saved,Wp,Wi,Wd,W0constraint,K0,total,internal);
+        recovery::integrator(a,time);recovery::solid(a,cb);recovery::contact(a,contact);
+        a.fields(tie.energy,tie.max_gap,tie.force_residual,tie.torque_residual,tie.power_residual,tie.worst_force,tie.worst_torque,tie.worst_power);
+        a.value(sb.history);a.span(sb.damage,sn);a.span(sb.dissipation_density,sn);a.span(sb.stored_density,sn);
+        a.span(sb.hg_density,sn);a.span(sb.kappa_field,sn);a.span(sb.tangent_bound,sn);a.span(sb.material_failed,sn);a.span(sb.crack_normal,sn);
+        a.span(sF,sn);a.span(sstress,sn);a.span(sa,sn);a.span(sinternal,sn);a.span(shg,sn);
+        a.span(sp.getVariableDataByName<Matd>("PDPK1"),sn);
+        a.span(cx,cn);a.span(cv,cn);a.span(sx,sn);a.span(sv,sn);
+        if(time.displacement.size()!=count||cb.history.size()!=cr.cells.size()||sb.history.size()!=sn)throw std::runtime_error("Checkpoint geometry size mismatch");
+    };
+    auto save=[&](){progress.flush();eq.flush();events.flush();recovery::checkpoint.save(out,{"progress.csv","equilibria.csv","fracture_events.csv"},time.steps,transfer);};
+    if(!recovery::checkpoint.resume.empty()){
+        progress.close();eq.close();events.close();
+        recovery::checkpoint.load(out,{"progress.csv","equilibria.csv","fracture_events.csv"},transfer);
+        progress.open(out/"progress.csv",std::ios::app);eq.open(out/"equilibria.csv",std::ios::app);events.open(out/"fracture_events.csv",std::ios::app);
+        progress<<std::setprecision(17);eq<<std::setprecision(17);events<<std::setprecision(17);
+    }
+    save();
     while(stage<=o.load_steps)
     {
-        Real shell_dt=sb.finiteStrainTimeStep(sr.elastic_dt_bound);
+        size_t prior_stage=stage;Real shell_dt=sb.finiteStrainTimeStep(sr.elastic_dt_bound);
         Real bound=1/std::sqrt(1/(core_dt*core_dt)+1/(shell_dt*shell_dt)+1/(sb.stabilizer_dt*sb.stabilizer_dt)+1/(tie.stable_dt*tie.stable_dt)+1/(contact.stable_dt*contact.stable_dt));
         Real dt=std::min({o.max_dt,bound,cb.acoustic_dt,radial_dt});if(stage_time<o.ramp_duration)dt=std::min(dt,o.ramp_duration-stage_time);
         if(!std::isfinite(dt)||dt<1e-15||time.steps>=o.max_steps)throw std::runtime_error("Coupled time/count bound exhausted; no retry or force correction");
@@ -185,6 +205,8 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells)
             if(checks>=3){row(eq);snapshot(std::to_string(stage),u);std::cout<<"ACCEPTED stage="<<stage<<" force="<<mean<<" damage="<<stat.max_damage<<std::endl;++stage;stage_time=0;checks=0;}
         }
         if(stage_time>o.max_stage_duration)throw std::runtime_error("Coupled stage did not equilibrate; no completed curve claimed");
+        if(time.steps%200==0 && recovery::checkpoint.due(time.steps,stage!=prior_stage))save();
+        if(recovery::checkpoint.stop_step && time.steps>=recovery::checkpoint.stop_step){save();return 86;}
     }
     std::ofstream summary(out/"summary.json");summary<<"{\"status\":\"COMPLETE_FROZEN_CORE_NOSB_SNSNI_CAPSULE\",\"accepted_points\":"<<o.load_steps<<",\"steps\":"<<time.steps<<",\"core_material_changed\":false,\"parameters_fitted\":false,\"observed_damage_onset\":"<<(onset_saved?"true":"false")<<",\"observed_complete_tensile_failure\":"<<(failure_saved?"true":"false")<<"}\n";
     return 0;
@@ -192,7 +214,7 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells)
 
 int main(int argc,char**argv)
 {
-    try{std::string cells;std::vector<char*>args{argv[0]};for(int i=1;i<argc;++i){std::string a=argv[i];if(a.rfind("--snsni-cells=",0)==0)cells=a.substr(14);else args.push_back(argv[i]);}
+    try{std::string cells;std::vector<char*>args{argv[0]};for(int i=1;i<argc;++i){std::string a=argv[i];if(a.rfind("--snsni-cells=",0)==0)cells=a.substr(14);else if(recovery::checkpoint.take(a)){}else args.push_back(argv[i]);}
         if(cells.empty())throw std::invalid_argument("--snsni-cells is required");HybridOptions options;options.parseHybrid(int(args.size()),args.data());
         tbb::task_arena arena(int(options.threads));return arena.execute([&]{return runSnsniCapsule(options,cells);});
     }catch(const std::exception&e){std::cerr<<"COUPLED_ERROR "<<e.what()<<std::endl;return 1;}

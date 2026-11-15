@@ -10,6 +10,8 @@
 #include <fstream>
 #include <sstream>
 #include <map>
+#include <unordered_map>
+#include <array>
 
 namespace SPH::peridynamics
 {
@@ -66,6 +68,34 @@ struct RigidGrain
     Real radius,mass,inertia;
 };
 
+/** Current-configuration spatial search. Each grain occupies one bin.
+ * width=max(radius); one-cell reach covers every point/sphere overlap, and
+ * two-cell reach every sphere/sphere overlap. IDs are sorted to preserve the
+ * original accumulation order. No cutoff, radius or contact law is changed. */
+class CurrentSphereBins
+{
+    using Cell=std::array<long long,3>;
+    struct Hash{size_t operator()(const Cell&a)const{size_t h=0;for(auto v:a)h^=std::hash<long long>{}(v)+0x9e3779b9+(h<<6)+(h>>2);return h;}};
+    std::unordered_map<Cell,StdVec<size_t>,Hash>bins,one,two;
+    Real width=0;
+    Cell cell(const Vecd&x)const
+    {if(!x.allFinite())throw std::runtime_error("Nonfinite spatial-search point");return Cell{(long long)std::floor(x[0]/width),(long long)std::floor(x[1]/width),(long long)std::floor(x[2]/width)};}
+  public:
+    explicit CurrentSphereBins(const StdVec<RigidGrain>&grains)
+    {
+        for(const auto&g:grains)width=std::max(width,g.radius);
+        if(width<=0)throw std::runtime_error("Invalid sphere-search width");
+        for(size_t i=0;i<grains.size();++i)bins[cell(grains[i].x)].push_back(i);
+    }
+    const StdVec<size_t>&candidates(const Vecd&x,int reach)
+    {
+        auto key=cell(x);auto&cache=reach==1?one:two;auto found=cache.find(key);if(found!=cache.end())return found->second;
+        StdVec<size_t>ids;
+        for(int a=-reach;a<=reach;++a)for(int b=-reach;b<=reach;++b)for(int c=-reach;c<=reach;++c){auto q=bins.find(Cell{key[0]+a,key[1]+b,key[2]+c});if(q!=bins.end())ids.insert(ids.end(),q->second.begin(),q->second.end());}
+        std::sort(ids.begin(),ids.end());return cache.emplace(key,std::move(ids)).first->second;
+    }
+};
+
 class RigidGrainShearBox
 {
   public:
@@ -76,6 +106,14 @@ class RigidGrainShearBox
     StdVec<RigidGrain> grains;
     StdVec<ObjectiveLinearFriction>pairs,walls;
     StdVec<Vecd>trace_position,core_position;
+    const StdVec<Vecd>*cached_core_positions=nullptr;
+    Real maximum_trace_z=std::numeric_limits<Real>::infinity(),maximum_core_z=std::numeric_limits<Real>::infinity();
+    bool active_pairs_cache_valid=false;
+    StdVec<size_t>active_pair_indices;
+    size_t pair_candidate_checks=0,surface_candidate_checks=0;
+    void cacheCorePositions(const StdVec<Vecd>&x){cached_core_positions=&x;}
+    const StdVec<Vecd>&corePositions()const{return cached_core_positions?*cached_core_positions:core_position;}
+    void invalidateNeighborCache(){active_pairs_cache_valid=false;active_pair_indices.clear();}
     Real Ksurface,top=0,normal_load=0,elastic_energy=0,tangent_energy=0,friction_dissipation=0;
     Real max_sphere_penetration=0,max_capsule_penetration=0,max_overlap_ratio=0,stable_dt=1;
     Real force_mapping_residual=0,torque_mapping_residual=0,normal_control_residual=0;
@@ -99,8 +137,8 @@ class RigidGrainShearBox
     Real pressureAt(Real height)const
     {
         Real f=0;for(const auto&g:grains)f+=hertz(std::max(g.x[2]+g.radius-height,Real(0)),g.radius,true);
-        for(size_t q=0;q<areas.size();++q)f+=Ksurface*areas[q]*std::max(trace_position[q][2]-height,Real(0));
-        for(size_t q=0;q<core_areas.size();++q)f+=Ksurface*core_areas[q]*std::max(core_position[q][2]-height,Real(0));return f;
+        if(height<maximum_trace_z)for(size_t q=0;q<areas.size();++q)f+=Ksurface*areas[q]*std::max(trace_position[q][2]-height,Real(0));
+        if(height<maximum_core_z)for(size_t q=0;q<core_areas.size();++q)f+=Ksurface*core_areas[q]*std::max(corePositions()[q][2]-height,Real(0));return f;
     }
     void evaluate(Real shear,Real shear_velocity,Real target_load,Real dt,bool commit)
     {
@@ -110,17 +148,25 @@ class RigidGrainShearBox
         lower_reaction.setZero();upper_reaction.setZero();boundary_force.setZero();boundary_torque.setZero();
         for(auto&g:grains){g.force.setZero();g.torque.setZero();}
         for(size_t q=0;q<areas.size();++q)trace_position[q]=capsule.position(q);
-        for(size_t q=0;q<core_areas.size();++q)core_position[q]=core_surface->position(q);
+        if(!cached_core_positions)for(size_t q=0;q<core_areas.size();++q)core_position[q]=core_surface->position(q);
+        if(corePositions().size()!=core_areas.size())throw std::runtime_error("Cached core trace dimensions disagree");
+        maximum_trace_z=maximum_core_z=-std::numeric_limits<Real>::infinity();
+        for(const auto&x:trace_position)maximum_trace_z=std::max(maximum_trace_z,x[2]);
+        for(const auto&x:corePositions())maximum_core_z=std::max(maximum_core_z,x[2]);
+        CurrentSphereBins spatial(grains);pair_candidate_checks=surface_candidate_checks=0;
+        if(!active_pairs_cache_valid){active_pair_indices.clear();for(size_t k=0;k<pairs.size();++k)if(pairs[k].active)active_pair_indices.push_back(k);active_pairs_cache_valid=true;}
+        StdVec<size_t>next_active_pairs;
         // Exact quasi-static force-controlled top platen. It carries no invented
         // mass and does not overwrite particle forces, velocities or positions.
-        Real hi=-1e10;for(const auto&g:grains)hi=std::max(hi,g.x[2]+g.radius);for(const auto&x:trace_position)hi=std::max(hi,x[2]);for(const auto&x:core_position)hi=std::max(hi,x[2]);
+        Real hi=-1e10;for(const auto&g:grains)hi=std::max(hi,g.x[2]+g.radius);hi=std::max({hi,maximum_trace_z,maximum_core_z});
         Real lo=-options.initial_height_m/2;
         if(target_load<0||pressureAt(lo)<target_load)throw std::runtime_error("Normal piston load cannot be bracketed");
         if(target_load==0)top=hi;else{for(int k=0;k<60;++k){Real mid=.5*(lo+hi);if(pressureAt(mid)>target_load)lo=mid;else hi=mid;}top=.5*(lo+hi);}
         normal_load=pressureAt(top);normal_control_residual=std::abs(normal_load-target_load)/std::max(target_load,Real(1e-20));
         auto grainRate=[&](size_t i,Real lever,Real stiffness,Real sum){rate[base+2*i]+=stiffness/std::sqrt(grains[i].mass)*sum;rate[base+2*i+1]+=stiffness*lever/std::sqrt(grains[i].inertia)*sum;};
-        for(size_t i=0;i<n;++i)for(size_t j=i+1;j<n;++j)
+        for(size_t i=0;i<n;++i)for(size_t j:spatial.candidates(grains[i].x,2))
         {
+            if(j<=i)continue;++pair_candidate_checks;
             auto&a=grains[i];auto&b=grains[j];auto&history=pairs[i*n+j];Vecd d=a.x-b.x;Real length=d.norm(),pen=a.radius+b.radius-length;
             if(pen<=0){if(commit)history.clear();continue;}if(length<=0)throw std::runtime_error("Coincident grains");
             Vecd normal=d/length;Real li=(length*length+a.radius*a.radius-b.radius*b.radius)/(2*length);
@@ -128,12 +174,14 @@ class RigidGrainShearBox
             Real reff=a.radius*b.radius/(a.radius+b.radius),fn=hertz(pen,reff),kn=1.5*fn/pen;
             Vecd relative=a.v+a.omega.cross(ra)-b.v-b.omega.cross(rb);
             Vecd tangential=history.force(normal,relative,.5*(a.omega+b.omega).dot(normal),fn,options.grain_tangent_stiffness_N_m,options.grain_mu,dt,commit),f=fn*normal+tangential;
+            if(commit&&history.active)next_active_pairs.push_back(i*n+j);
             a.force+=f;b.force-=f;a.torque+=ra.cross(f);b.torque-=rb.cross(f);elastic_energy+=.4*fn*pen;
             ++grain_contacts;max_sphere_penetration=std::max(max_sphere_penetration,pen);max_overlap_ratio=std::max(max_overlap_ratio,pen/std::min(a.radius,b.radius));
             Real stiffness=kn+2*options.grain_tangent_stiffness_N_m;
             Real sum=1/std::sqrt(a.mass)+ra.norm()/std::sqrt(a.inertia)+1/std::sqrt(b.mass)+rb.norm()/std::sqrt(b.inertia);
             grainRate(i,ra.norm(),stiffness,sum);grainRate(j,rb.norm(),stiffness,sum);
         }
+        if(commit){for(size_t k:active_pair_indices)if(!std::binary_search(next_active_pairs.begin(),next_active_pairs.end(),k))pairs[k].clear();active_pair_indices.swap(next_active_pairs);}
         auto wall=[&](size_t i,size_t id,const Vecd&normal,Real pen,const Vecd&velocity,bool lower,Real mu){
             auto&g=grains[i];auto&history=walls[6*i+id];if(pen<=0){if(commit)history.clear();return;}
             Real fn=hertz(pen,g.radius,true),kn=1.5*fn/pen;Vecd lever=-(g.radius-pen)*normal;
@@ -162,7 +210,7 @@ class RigidGrainShearBox
         for(size_t q=0;q<measure.size();++q)
         {
             Vecd x=positions[q];Real stiffness=Ksurface*measure[q];
-            for(size_t i=0;i<n;++i){auto&g=grains[i];Vecd delta=x-g.x;Real r2=delta.squaredNorm();if(r2>=g.radius*g.radius)continue;Real distance=std::sqrt(r2);if(distance<=0)throw std::runtime_error("Surface at grain center");Real pen=g.radius-distance;Vecd f=stiffness*pen/distance*delta;
+            for(size_t i:spatial.candidates(x,1)){++surface_candidate_checks;auto&g=grains[i];Vecd delta=x-g.x;Real r2=delta.squaredNorm();if(r2>=g.radius*g.radius)continue;Real distance=std::sqrt(r2);if(distance<=0)throw std::runtime_error("Surface at grain center");Real pen=g.radius-distance;Vecd f=stiffness*pen/distance*delta;
               surface.scatter(q,f);g.force-=f;g.torque+=(x-g.x).cross(-f);elastic_energy+=.5*stiffness*pen*pen;++capsule_contacts;max_capsule_penetration=std::max(max_capsule_penetration,pen);max_overlap_ratio=std::max(max_overlap_ratio,pen/g.radius);traceRate(q,stiffness*(1+pen/distance),i,true);}
             auto plane=[&](const Vecd&normal,Real pen,bool lower){if(pen<=0)return;Vecd f=stiffness*pen*normal;surface.scatter(q,f);(lower?lower_reaction:upper_reaction)-=f;boundary_force+=f;boundary_torque+=x.cross(f);elastic_energy+=.5*stiffness*pen*pen;max_capsule_penetration=std::max(max_capsule_penetration,pen);traceRate(q,stiffness,0,false);};
             bool lower=x[2]<0;Real offset=lower?shear:0;
@@ -174,7 +222,7 @@ class RigidGrainShearBox
         // Apply physical nonpenetration to BOTH nested material boundaries.
         // The core contact is geometric, never activated by an arbitrary damage
         // threshold; it prevents sand passing through exposed core material.
-        if(core_surface)surfaceForces(*core_surface,core_areas,core_position,np);
+        if(core_surface)surfaceForces(*core_surface,core_areas,corePositions(),np);
         Real largest=0;for(Real value:rate)largest=std::max(largest,value);stable_dt=largest>0?.2/std::sqrt(largest):1;
         for(const auto&h:pairs){tangent_energy+=h.stored;friction_dissipation+=h.dissipated+h.released;}
         for(const auto&h:walls){tangent_energy+=h.stored;friction_dissipation+=h.dissipated+h.released;}

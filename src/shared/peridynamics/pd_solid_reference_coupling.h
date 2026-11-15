@@ -155,6 +155,11 @@ class ReferenceSolidSurface
         for(size_t a=0;a<r.index.size();++a)x+=r.weight[a]*port.position[r.index[a]];return x;}
     Vecd velocity(size_t i) const {Vecd v=Vecd::Zero();const auto &r=rows[i];
         for(size_t a=0;a<r.index.size();++a)v+=r.weight[a]*port.velocity[r.index[a]];return v;}
+    void kinematics(size_t i,Vecd&x,Vecd&v) const
+    {
+        x.setZero();v.setZero();const auto&r=rows[i];
+        for(size_t a=0;a<r.index.size();++a){x+=r.weight[a]*port.position[r.index[a]];v+=r.weight[a]*port.velocity[r.index[a]];}
+    }
     void scatter(size_t i,const Vecd &f) {const auto &r=rows[i];
         for(size_t a=0;a<r.index.size();++a)port.addForce(r.index[a],r.weight[a]*f);}
 
@@ -215,10 +220,9 @@ class BondedSolidInterface
         {
             if(a.rows[i].index.empty()||b.rows[i].index.empty())
             {x_b[i]=b.rows[i].index.empty()?Vecd::Zero():b.position(i);x_a[i]=x_b[i];force_a[i].setZero();continue;}
-            Vecd xa=a.position(i),xb=b.position(i),va=a.velocity(i),vb=b.velocity(i);
+            Vecd xa,xb,va,vb;a.kinematics(i,xa,va);b.kinematics(i,xb,vb);
             Vecd gap=xa-xb,f=-stiffness[i]*gap;
             x_a[i]=xa;x_b[i]=xb;force_a[i]=f;
-            a.scatter(i,f);b.scatter(i,-f);
             energy+=.5*stiffness[i]*gap.squaredNorm();max_gap=std::max(max_gap,gap.norm());
             for(int side=0;side<2;++side)
             {
@@ -226,6 +230,7 @@ class BondedSolidInterface
                 for(size_t j=0;j<row.index.size();++j)
                 {
                     Vecd fj=sign*row.weight[j]*f;size_t id=row.index[j];
+                    map.port.addForce(id,fj);
                     sum+=fj;torque+=map.port.position[id].cross(fj);
                     Real p=fj.dot(map.port.velocity[id]);power+=p;fs+=fj.norm();ps+=std::abs(p);
                 }

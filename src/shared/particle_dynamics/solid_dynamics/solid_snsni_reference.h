@@ -63,6 +63,15 @@ struct SnsniReference
         if(minimum_mass<=0||patch_error>1e-8)throw std::runtime_error("RK mass positivity or affine/rigid patch failed");
         std::cout<<"SNSNI cells="<<cells.size()<<" faces="<<faces.size()<<" patch="<<patch_error<<" min_mass="<<minimum_mass<<std::endl;
     }
+    /** Explicitly end the construction-cache lifetime after the cell rows have
+     * been assembled. Boundary geometry/quadrature and all force rows remain.
+     * Callers that need face integrals for diagnostics can retain the cache. */
+    size_t releasePreprocessingCache()
+    {
+        size_t released=0;
+        for(auto&face:faces){released+=face.integral.capacity()*sizeof(RKEntry);std::vector<RKEntry>().swap(face.integral);}
+        return released;
+    }
     std::vector<RKEntry> shape(const Vecd&x)const{return cloud.shape(x);}
     Matd elastic(const Matd&gradient)const
     {Matd strain=.5*(gradient+gradient.transpose());return lambda*strain.trace()*Matd::Identity()+2*mu*strain;}

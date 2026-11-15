@@ -9,6 +9,9 @@
 #include "recovery_checkpoint.h"
 #include "diffuse_crack_release.h"
 #include "rigid_grain_shear.h"
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 using namespace SPH::solid_dynamics;
 using namespace SPH::peridynamics;
 using Field=StdVec<Vecd>;
@@ -128,6 +131,13 @@ int runDirectShear(const HybridOptions&o,const std::string&cells,const std::stri
     BondedSolidInterface tie(si,cs,areas,Ktie,R);
     StdVec<Real>outer_areas(outer_points.size(),4*Pi*R*R/outer_points.size());
     RigidGrainShearBox world(so,outer_areas,Kcontact,sand,box,&cs,areas);
+    const size_t released_preprocessing_bytes=cr.releasePreprocessingCache();
+#if defined(__GLIBC__)
+    // Return the one-time construction buffers to the OS, outside time stepping.
+    malloc_trim(0);
+#endif
+    world.cacheCorePositions(tie.x_b);
+    std::cout<<"OPTIMIZED released_preprocessing_bytes="<<released_preprocessing_bytes<<std::endl;
     const size_t ncaps=cn+sn,ng=world.grains.size(),count=ncaps+2*ng;
     StdVec<Real>mass(count);Field X(count,Vecd::Zero());
     for(size_t j=0;j<cn;++j){mass[j]=cm[j];X[j]=cX[j];}
@@ -228,6 +238,7 @@ int runDirectShear(const HybridOptions&o,const std::string&cells,const std::stri
         for(auto&g:world.grains)a.fields(g.x,g.v,g.omega,g.force,g.torque);
         for(auto&h:world.pairs)a.fields(h.slip,h.normal,h.active,h.stored,h.dissipated,h.released);
         for(auto&h:world.walls)a.fields(h.slip,h.normal,h.active,h.stored,h.dissipated,h.released);
+        if(a.reading)world.invalidateNeighborCache();
     };
     auto save=[&](){progress.flush();eq.flush();events.flush();recovery::checkpoint.save(out,{"progress.csv","equilibria.csv","fracture_events.csv"},time.steps,transfer);};
     if(!recovery::checkpoint.resume.empty()){

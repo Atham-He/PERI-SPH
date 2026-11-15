@@ -14,7 +14,7 @@ namespace SPH::solid_dynamics
 struct CorotatedBiotEnergy
 {
     Real E,nu,K,mu;
-    struct Result {Matd positive_P,negative_P;Real positive,negative,max_effective_tension,J;Vecd normal;};
+    struct Result {Matd positive_P,negative_P;Real positive,negative,max_effective_tension,J;Vecd normal,principal_stretches;};
     CorotatedBiotEnergy(Real young,Real poisson):E(young),nu(poisson),K(E/(3*(1-2*nu))),mu(E/(2*(1+nu)))
     {if(E<=0||nu<=-1||nu>=.5)throw std::invalid_argument("Invalid Biot elastic constants");}
     Result evaluate(const Matd&F)const
@@ -27,7 +27,7 @@ struct CorotatedBiotEnergy
         Result a;a.positive=.5*K*std::pow(std::max(tr,Real(0)),2)+mu*dev.squaredNorm();a.negative=.5*K*std::pow(std::min(tr,Real(0)),2);
         a.positive_P=R*(K*std::max(tr,Real(0))*Matd::Identity()+2*mu*dev);a.negative_P=R*(K*std::min(tr,Real(0))*Matd::Identity());
         Eigen::Index direction;e.maxCoeff(&direction);a.normal=svd.matrixV().col(direction);
-        a.max_effective_tension=K*tr+2*mu*(e[direction]-tr/3);a.J=J;return a;
+        a.max_effective_tension=K*tr+2*mu*(e[direction]-tr/3);a.J=J;a.principal_stretches=svd.singularValues();return a;
     }
 };
 
@@ -60,11 +60,16 @@ struct FiniteVolumeBiotEnergy
         a.positive_P=R*(2*mu*dev);a.negative_P=Matd::Zero();
         if(J>=1)a.positive_P+=pv;else a.negative_P=pv;
         Vecd principal_cauchy=(.5*K*j2m1*Vecd::Ones()+2*mu*e.cwiseProduct(l))/J;
-        Eigen::Index direction;a.max_effective_tension=principal_cauchy.maxCoeff(&direction);a.normal=svd.matrixV().col(direction);a.J=J;return a;
+        Eigen::Index direction;a.max_effective_tension=principal_cauchy.maxCoeff(&direction);a.normal=svd.matrixV().col(direction);a.J=J;a.principal_stretches=svd.singularValues();return a;
     }
     Real tangentBound(const Matd&F,Real damage)const
     {
-        Eigen::JacobiSVD<Matd> svd(F);Vecd l=svd.singularValues();Real a=l.minCoeff(),J=F.determinant(),g=1-damage;
+        Eigen::JacobiSVD<Matd> svd(F);return tangentBound(svd.singularValues(),F.determinant(),damage);
+    }
+    /** Reuse singular values already obtained by the energy evaluation. */
+    Real tangentBound(const Vecd&l,Real J,Real damage)const
+    {
+        Real a=l.minCoeff(),g=1-damage;
         if(a<=0||J<=0)throw std::runtime_error("Invalid tangent-bound deformation");
         Real vol=K*J*J*l.cwiseInverse().squaredNorm()+.5*K*std::abs(J*J-1)/(a*a);
         Real dev=2*mu*(l.maxCoeff()+(l.array()-l.mean()).abs().maxCoeff())/a;
@@ -182,7 +187,7 @@ class PDEnergyCrackBand : public LocalDynamics,public DataDelegateInner
         Real old=history[i].damage;
         if(advance)fracture.advance(history[i],trial.positive+hg,trial.max_effective_tension>1e-12*elastic.E);
         if(old==0&&history[i].damage>0)crack_normal[i]=trial.normal;
-        tangent_bound[i]=elastic.tangentBound(f,history[i].damage);
+        tangent_bound[i]=elastic.tangentBound(trial.principal_stretches,trial.J,history[i].damage);
         Real g=1-history[i].damage;P[i]=g*trial.positive_P+trial.negative_P;stress[i]=P[i]*f.transpose()/trial.J;
         damage[i]=history[i].damage;dissipation_density[i]=history[i].dissipation;kappa_field[i]=history[i].kappa;material_failed[i]=damage[i]==1;
         stored_density[i]=g*(trial.positive+hg)+trial.negative;hg_density[i]=g*hg;

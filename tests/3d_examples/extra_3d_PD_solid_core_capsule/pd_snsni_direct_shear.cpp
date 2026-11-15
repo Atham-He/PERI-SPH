@@ -170,6 +170,11 @@ int runDirectShear(const HybridOptions&o,const std::string&cells,const std::stri
 
     if(o.preflight_only){
         Field d(count,Vecd::Zero()),v(count,Vecd::Zero()),f;
+        // Exercise an ACTIVE sphere/capsule contact, rather than accepting a
+        // vacuous zero-force transpose check on the barely touching packing.
+        size_t nearest=0;Real smallest=1e10;
+        for(size_t i=0;i<ng;++i){const auto&g=world.grains[i];Real gap=g.reference.norm()-g.radius-R;if(gap<smallest){smallest=gap;nearest=i;}}
+        d[ncaps+2*nearest]=-(smallest+1e-6)*world.grains[nearest].reference.normalized();
         for(size_t i=0;i<count;++i)v[i]=Vecd(std::sin(Real(i+1)),.3*std::cos(Real(2*i+1)),.1);
         auto potential=[&](const Field&u){setPositions(u,v);constraints(f,0,0,box.normal_pressure_Pa*box.length_x_m*box.length_y_m,0,false);
             return tie.energy+world.elastic_energy+world.normal_load*(world.top-box.initial_height_m/2);};
@@ -183,8 +188,8 @@ int runDirectShear(const HybridOptions&o,const std::string&cells,const std::stri
         Real friction_error=std::abs(ft.norm()-5),before=history.stored;
         Vecd rotated=history.force(Vecd::UnitX(),Vecd::Zero(),0,10,1000,.5,0,true);
         Real rotation_error=std::abs(history.stored-before);
-        bool pass=error<1e-5&&std::abs(fn/expected-1)<1e-12&&friction_error<1e-12&&rotation_error<1e-12&&history.dissipated>=0&&world.normal_control_residual<1e-10&&std::max(world.force_mapping_residual,world.torque_mapping_residual)<1e-10;
-        std::ofstream gate(out/"preflight.json");gate<<std::setprecision(17)<<"{\"status\":\""<<(pass?"PASSED":"FAILED")<<"\",\"constraint_potential_gradient_relative_error\":"<<error<<",\"Hertz_relative_error\":"<<std::abs(fn/expected-1)<<",\"Coulomb_force_error_N\":"<<friction_error<<",\"contact_frame_rotation_energy_error_J\":"<<rotation_error<<",\"normal_control_residual\":"<<world.normal_control_residual<<",\"force_mapping_residual\":"<<world.force_mapping_residual<<",\"torque_mapping_residual\":"<<world.torque_mapping_residual<<",\"core_histories_advanced\":0,\"shell_damage_advanced\":false,\"shear_curve_generated\":false}\n";
+        bool pass=world.capsule_contacts>0&&error<1e-5&&std::abs(fn/expected-1)<1e-12&&friction_error<1e-12&&rotation_error<1e-12&&history.dissipated>=0&&world.normal_control_residual<1e-10&&std::max(world.force_mapping_residual,world.torque_mapping_residual)<1e-10;
+        std::ofstream gate(out/"preflight.json");gate<<std::setprecision(17)<<"{\"status\":\""<<(pass?"PASSED":"FAILED")<<"\",\"active_capsule_contact_quadrature_points\":"<<world.capsule_contacts<<",\"constraint_potential_gradient_relative_error\":"<<error<<",\"Hertz_relative_error\":"<<std::abs(fn/expected-1)<<",\"Coulomb_force_error_N\":"<<friction_error<<",\"contact_frame_rotation_energy_error_J\":"<<rotation_error<<",\"normal_control_residual\":"<<world.normal_control_residual<<",\"force_mapping_residual\":"<<world.force_mapping_residual<<",\"torque_mapping_residual\":"<<world.torque_mapping_residual<<",\"core_histories_advanced\":0,\"shell_damage_advanced\":false,\"shear_curve_generated\":false}\n";
         return pass?0:2;
     }
     size_t stage=1,checks=0;Real stage_time=0,elapsed=0;bool damage_saved=false,failure_saved=false,access_saved=false;

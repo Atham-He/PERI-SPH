@@ -11,6 +11,7 @@
 using namespace SPH::solid_dynamics;
 using namespace SPH::peridynamics;
 using Field=StdVec<Vecd>;
+std::string snapshot_barrier_input;
 
 class SnsniCoupledSurface:public ReferenceSolidSurface
 {
@@ -89,6 +90,32 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells)
     InteractionDynamics<NosbPDQuadraticThirdStep> quadratic_third(relation,sr);
     PDEnergyCrackBand sb(relation,sr,o.shell_E,o.shell_nu,o.fracture_stress,o.fracture_energy,o.pd_hourglass,shell.getSPHAdaptation().getKernel()->CutOffRadius());
     system.initializeSystemCellLinkedLists();system.initializeSystemConfigurations();shape.exec();sr.build();sb.initialize();
+    if(!snapshot_barrier_input.empty())
+    {
+        // Kinematics-only reconstruction from an actual native VTP snapshot.
+        // No core or shell history update, force evaluation or time step.
+        std::ifstream stream(snapshot_barrier_input);if(!stream)throw std::runtime_error("Missing shell snapshot");
+        std::string xml((std::istreambuf_iterator<char>(stream)),{});
+        auto values=[&](const std::string&name,bool points=false){
+            auto start=xml.find(points?"<Points>":("Name=\""+name+"\""));
+            if(start==std::string::npos)throw std::runtime_error("Missing VTP field: "+name);
+            if(points)start=xml.find("<DataArray",start);
+            auto begin=xml.find('>',start),end=xml.find("</DataArray>",begin);
+            if(begin==std::string::npos||end==std::string::npos)throw std::runtime_error("Incomplete VTP field");
+            std::istringstream in(xml.substr(begin+1,end-begin-1));std::vector<Real>result;Real x;
+            while(in>>x)result.push_back(x);return result;};
+        auto pos=values("Position",true),d=values("Damage"),n=values("CrackNormalReference"),j=values("J");
+        if(pos.size()!=3*sn||d.size()!=sn||n.size()!=3*sn||j.size()!=sn)throw std::runtime_error("VTP shell count mismatch");
+        auto*f=sp.getVariableDataByName<Matd>("DeformationGradient");
+        for(size_t i=0;i<sn;++i){sx[i]=Vecd(pos[3*i],pos[3*i+1],pos[3*i+2]);sb.damage[i]=d[i];sb.crack_normal[i]=Vecd(n[3*i],n[3*i+1],n[3*i+2]);}
+        Real error=0;
+        for(size_t i=0;i<sn;++i){f[i].setZero();for(const auto&e:sr.rows[i])f[i]+=(sx[e.j]-sx[i])*e.gradient.transpose();error=std::max(error,std::abs(f[i].determinant()-j[i]));}
+        if(error>1e-8)throw std::runtime_error("Rebuilt snapshot F does not reproduce stored J");
+        writeLayeredReleaseBarrier((out/"release_barrier.csv").string(),geometry,sb,f,directors,rule.weight);
+        std::ofstream meta(out/"rebuild.json");meta<<std::setprecision(17)<<"{\"physical_histories_advanced\":0,\"stored_J_max_error\":"<<error<<",\"source\":"<<std::quoted(snapshot_barrier_input)<<"}\n";
+        return 0;
+    }
+
     SolidForcePort core_port(core,SolidForcePort::Storage::ForcePrior),pd_port(shell,SolidForcePort::Storage::PDAccelerationPrior);
     StdVec<Vecd>points,outer_points;StdVec<Real>areas;
     for(const auto&face:cr.faces)if(face.boundary)for(const auto&q:face.q){points.push_back(q.x);areas.push_back(q.w);}
@@ -238,7 +265,7 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells)
 
 int main(int argc,char**argv)
 {
-    try{std::string cells;std::vector<char*>args{argv[0]};for(int i=1;i<argc;++i){std::string a=argv[i];if(a.rfind("--snsni-cells=",0)==0)cells=a.substr(14);else if(recovery::checkpoint.take(a)){}else args.push_back(argv[i]);}
+    try{std::string cells;std::vector<char*>args{argv[0]};for(int i=1;i<argc;++i){std::string a=argv[i];if(a.rfind("--snsni-cells=",0)==0)cells=a.substr(14);else if(a.rfind("--snapshot-barrier-input=",0)==0)snapshot_barrier_input=a.substr(25);else if(recovery::checkpoint.take(a)){}else args.push_back(argv[i]);}
         if(cells.empty())throw std::invalid_argument("--snsni-cells is required");HybridOptions options;options.parseHybrid(int(args.size()),args.data());
         tbb::task_arena arena(int(options.threads));return arena.execute([&]{return runSnsniCapsule(options,cells);});
     }catch(const std::exception&e){std::cerr<<"COUPLED_ERROR "<<e.what()<<std::endl;return 1;}

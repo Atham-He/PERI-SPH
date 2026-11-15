@@ -6,7 +6,8 @@ namespace SPH::peridynamics
 {
 /** Transport through a damage-only crack band, not an explicit free surface.
  * Grassl, arXiv:0809.2758 Eq.7: w = band * d * strain (plastic strain is zero).
- * Adaptations: objective Biot normal strain and layers connected in SERIES.
+ * Adaptations: current normal plane spacing from F^-T and layers in SERIES.
+ * Open area is aperture/CURRENT band width, not aperture/reference width.
  * Fick conductance of the open area is D*A*open_fraction/current_thickness.
  * A closed/intact layer blocks the crack contribution exactly. Base EC
  * permeability is an independent physical input, not a numerical leak.
@@ -29,19 +30,24 @@ inline DiffuseBarrierResult diffuseLayerBarrier(const StdVec<Matd>&F,
     {
         if(!F[l].allFinite()||F[l].determinant()<=0||damage[l]<0||damage[l]>1)
             throw std::runtime_error("Invalid crack barrier material state");
-        Real length=thickness*weights[l]/sum*(F[l]*thickness_normal).norm();
+        Matd inverse_transpose=F[l].inverse().transpose();
+        // Current normal spacing of reference parallel planes (Nanson).
+        Real radial_stretch=1/(inverse_transpose*thickness_normal).norm();
+        Real length=thickness*weights[l]/sum*radial_stretch;
         r.transport_length+=length;r.min_damage=std::min(r.min_damage,damage[l]);
         Real fraction=0;
         if(damage[l]>0)
         {
             if(std::abs(normal[l].norm()-1)>1e-7)throw std::runtime_error("Missing crack normal for damaged shell");
-            Eigen::JacobiSVD<Matd> svd(F[l],Eigen::ComputeFullV);
-            Matd U=svd.matrixV()*svd.singularValues().asDiagonal()*svd.matrixV().transpose();
-            Real tensile=std::max(Real(0),normal[l].dot((U-Matd::Identity())*normal[l]));
+            // A reference slab of width h and normal N has current normal
+            // spacing h/|F^-T N|. Use that SAME current width in the open-area
+            // fraction; reference-width/current-area mixing is inconsistent.
+            Real normal_stretch=1/(inverse_transpose*normal[l]).norm();
+            Real tensile=std::max(Real(0),normal_stretch-1);
             Real aperture=band_width*damage[l]*tensile;
             r.max_equivalent_aperture=std::max(r.max_equivalent_aperture,aperture);
             // Area averaging of a slot across its represented crack-band width.
-            fraction=aperture/band_width;
+            fraction=aperture/(band_width*normal_stretch);
             if(fraction>1)throw std::runtime_error("Crack-band open area exceeds represented band; no clipping");
         }
         if(fraction==0)blocked=true;else resistance_length+=length/fraction;

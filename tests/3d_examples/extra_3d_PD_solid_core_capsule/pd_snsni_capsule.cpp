@@ -88,7 +88,7 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells)
     PDLayeredQuadraticReference sr(relation,geometry);
     InteractionWithUpdate<NosbPDQuadraticSecondStep> quadratic_second(relation,sr);
     InteractionDynamics<NosbPDQuadraticThirdStep> quadratic_third(relation,sr);
-    PDEnergyCrackBand sb(relation,sr,o.shell_E,o.shell_nu,o.fracture_stress,o.fracture_energy,o.pd_hourglass,shell.getSPHAdaptation().getKernel()->CutOffRadius());
+    PDEnergyCrackBand sb(relation,sr,o.shell_E,o.shell_nu,o.fracture_stress,o.fracture_energy,o.pd_hourglass,shell.getSPHAdaptation().getKernel()->CutOffRadius(),o.fracture_kinematics=="directional_contact");
     system.initializeSystemCellLinkedLists();system.initializeSystemConfigurations();shape.exec();sr.build();sb.initialize();
     if(!snapshot_barrier_input.empty())
     {
@@ -127,6 +127,7 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells)
     BondedSolidInterface tie(si,cs,areas,Ktie,R);
     StdVec<Real>outer_areas(outer_points.size(),4*Pi*R*R/outer_points.size());
     SolidSurfacePlaneContact contact(so,outer_areas,Kcontact,R);
+    cr.releasePreprocessingCache();
     size_t count=cn+sn;StdVec<Real>mass(count);Field X(count);
     for(size_t j=0;j<cn;++j){mass[j]=cm[j];X[j]=cX[j];}
     for(size_t j=0;j<sn;++j){mass[cn+j]=sm[j];X[cn+j]=sX[j];}
@@ -147,6 +148,7 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells)
     auto forceAt=[&](const Field&d,const Field&v,Field&f,Real compression,bool advance){setPositions(d,v);coreEvaluate(d,true);shellEvaluate(advance);constraints(compression);f.resize(count);
         for(size_t j=0;j<cn;++j){internal[j]=cb.internal[j];f[j]=core_port.external[j]-internal[j];}
         for(size_t j=0;j<sn;++j){internal[cn+j]=-sinternal[j]-shg[j];f[cn+j]=sm[j]*pd_port.external[j]-internal[cn+j];}};
+    std::ofstream directional_meta(out/"fracture_kinematics.json");directional_meta<<std::setprecision(17)<<"{\"mode\":"<<std::quoted(o.fracture_kinematics)<<",\"E_Pa\":"<<o.shell_E<<",\"nu\":"<<o.shell_nu<<",\"strength_Pa\":"<<o.fracture_stress<<",\"Gc_J_m2\":"<<o.fracture_energy<<",\"band_width_m\":"<<sb.fracture.width<<",\"derived_k0\":"<<sb.fracture.k0<<",\"derived_kf\":"<<sb.fracture.kf<<"}\n";directional_meta.close();
     std::ofstream parameters(out/"parameters.json");parameters<<std::setprecision(17)
       <<"{\"core_backend\":\"SNSNI_RKPM_DPC_with_transport_export\",\"shell_backend\":\"NOSB_PD_layered_volume\",\"fluid_backend\":\"none\",\"shell_constitutive\":\"finite_volume_Biot_energy_damage\",\"fracture_representation\":\"diffuse_crack_band_not_sharp_crack\",\"interface\":\"bonded_vector_penalty_common_facet_trace\",\"plate_friction\":0,\"core_particles\":"<<cn<<",\"shell_particles\":"<<sn<<",\"material_sites\":"<<cr.cells.size()
       <<",\"core_diameter_m\":"<<2*rc<<",\"outer_diameter_m\":"<<2*R<<",\"shell_thickness_m\":"<<o.thickness<<",\"core_spacing_m\":"<<o.spacing<<",\"pd_spacing_m\":"<<o.pd_spacing

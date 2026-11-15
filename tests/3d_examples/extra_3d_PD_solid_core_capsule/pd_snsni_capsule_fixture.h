@@ -27,7 +27,7 @@ struct HybridOptions : PDSolidCapsuleOptions
     unsigned interface_order=1,interface_core_order=0; // zero inherits the common order
     Real interface_core_support=2.5,interface_shell_support=2.5;
     std::string shell_material="elastic",fracture_model="none",fracture_scope="none";
-    std::string fragment_policy="error",core_contact_mesh;
+    std::string fragment_policy="error",core_contact_mesh,fracture_kinematics="volume_deviatoric";
     Real shell_yield=0,shell_hardening=0,fracture_stress=0,fracture_energy=0;
     Real pd_spacing=0,pd_cfl=.1,pd_hourglass=.5;
     Real ramp_duration=2.8132387884274494e-6,max_stage_duration=1.4066193942137247e-5;
@@ -58,6 +58,7 @@ struct HybridOptions : PDSolidCapsuleOptions
             if(key=="shell-backend"){if(value!="nosb_pd")throw std::invalid_argument("Shell requires nosb_pd");return;}
             if(key=="shell-material"){shell_material=value;return;}
             if(key=="fracture-model"){fracture_model=value;return;}
+            if(key=="fracture-kinematics"){fracture_kinematics=value;return;}
             if(key=="fracture-scope"){fracture_scope=value;return;}
             if(key=="fragment-policy"){fragment_policy=value;return;}
             if(key=="core-contact-mesh"){core_contact_mesh=value;return;}
@@ -101,6 +102,8 @@ struct HybridOptions : PDSolidCapsuleOptions
         else if(fracture_model!="principal_stress"||(fracture_scope!="first_crack"&&fracture_scope!="growth")||fracture_stress<=0||fracture_energy!=0)
             throw std::invalid_argument("principal_stress requires explicit threshold and first_crack or growth scope");
         if((shell_material=="corotated_biot"||shell_material=="finite_volume_biot")&&fracture_model!="crack_band_energy")throw std::invalid_argument("Biot energy material currently requires its verified crack-band assembly");
+        if(fracture_kinematics!="volume_deviatoric"&&fracture_kinematics!="directional_contact")throw std::invalid_argument("Unknown fracture kinematics");
+        if(fracture_kinematics=="directional_contact"&&(fracture_model!="crack_band_energy"||shell_material!="finite_volume_biot"))throw std::invalid_argument("Directional crack contact requires finite_volume_biot and energy crack-band damage");
         if(fragment_policy!="error")throw std::invalid_argument("Only fragment-policy=error is allowed: numerical erosion is not a physical fracture parameter");
         if(fracture_scope=="growth"&&fracture_model=="principal_stress"&&(!quadratic_kinematics||interface_order!=2||core_contact_mesh.empty()))
             throw std::invalid_argument("Fracture growth requires quadratic PD, quadratic interface and a core-contact triangulation");

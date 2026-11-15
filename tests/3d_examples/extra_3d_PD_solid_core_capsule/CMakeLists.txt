@@ -50,3 +50,17 @@ target_compile_features(dpc_moving_junction_check PRIVATE cxx_std_17)
 add_executable(snsni_bare snsni_bare.cpp)
 target_link_libraries(snsni_bare sphinxsys_3d)
 target_compile_features(snsni_bare PRIVATE cxx_std_17)
+
+# Resolved NOSB-PD/solid-SPH capsule inside an explicit rigid-grain shear box.
+file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/pd_snsni_direct_shear.cpp DIRECT_SHEAR_MAIN_HASH)
+file(SHA256 ${PERI_SHARED}/peridynamics/rigid_grain_shear.h DIRECT_SHEAR_CONTACT_HASH)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_SOURCE_DIR}/pd_snsni_direct_shear.cpp
+    ${PERI_SHARED}/peridynamics/rigid_grain_shear.h)
+string(SHA256 DIRECT_SHEAR_HASH "${ASSEMBLY_HASH};${DIRECT_SHEAR_MAIN_HASH};${DIRECT_SHEAR_CONTACT_HASH}")
+add_executable(pd_snsni_direct_shear pd_snsni_direct_shear.cpp)
+target_link_libraries(pd_snsni_direct_shear sphinxsys_3d)
+target_compile_features(pd_snsni_direct_shear PRIVATE cxx_std_17)
+target_compile_definitions(pd_snsni_direct_shear PRIVATE
+    CAPSULE_SOURCE_SHA256="${DIRECT_SHEAR_HASH}"
+    DPC_MATERIAL_SHA256="${MATERIAL_HASH}")

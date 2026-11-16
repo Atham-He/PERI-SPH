@@ -1,0 +1,21 @@
+PERI-SPH is a derived development snapshot, not the original Icebreaking_PD-SPH
+release and not an official SPHinXsys release.
+
+Icebreaking_PD-SPH
+Copyright (c) 2024 LWZhang Group.
+https://github.com/Luwen-Zhang/Icebreaking_PD-SPH
+Baseline: 34562a6c7ac11cb2816236f0249bfd8e6a202ac7.
+The original root license is retained in LICENSE and LICENSES/MIT-Icebreaking.txt.
+
+SPHinXsys
+Original file-level copyright, author and Apache License 2.0 notices are retained.
+The Apache License 2.0 text is supplied in LICENSES/Apache-2.0.txt.
+This repository does not replace those upstream notices or claim authorship of
+the original NOSB-PD, SPH, material or coupling algorithms.
+
+Local modifications dated 2026-11-16 are identified in CHANGELOG.md and the
+modified library files. The liquid capsule example, local material/contact
+adapters, portable launcher and packaging are downstream additions.
+
+No experimental paper PDFs, private experiment files, machine credentials,
+simulation trajectories or compiled binaries are included in this source tree.

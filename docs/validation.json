@@ -1,0 +1,34 @@
+{
+  "platform": "Ubuntu 24.04 / GCC 13 / C++17",
+  "checks": [
+    {
+      "command_kind": "cmake",
+      "returncode": 0,
+      "seconds": 19.295120805996703,
+      "check": "configure"
+    },
+    {
+      "command_kind": "cmake",
+      "returncode": 0,
+      "seconds": 964.380065845995,
+      "check": "full_3d_library_structural_module_and_liquid_example_build"
+    },
+    {
+      "command_kind": "ctest",
+      "returncode": 0,
+      "seconds": 0.056322743999771774,
+      "check": "strict_ideal_J2_CTest"
+    }
+  ],
+  "full_compression_completed": false,
+  "tests_passed": 1,
+  "tests_failed": 0,
+  "material_audit": {
+    "passed": true,
+    "max_postyield_equivalent_stress_error_GPa": 0,
+    "final_equivalent_stress_GPa": 0.04,
+    "target_GPa": 0.04,
+    "plastic_strain_norm": 0.2325382262482166
+  },
+  "portable_launcher_syntax_and_help_checked": true
+}

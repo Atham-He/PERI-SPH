@@ -1,0 +1,24 @@
+{
+  "snapshot_utc": "2026-11-16T06:06:38.022834+00:00",
+  "upstream_url": "https://github.com/Luwen-Zhang/Icebreaking_PD-SPH",
+  "upstream_commit": "34562a6c7ac11cb2816236f0249bfd8e6a202ac7",
+  "active_driver_sha256": "d16f46896becc05d9020ad40edca0f92a5733a61c639799e9d682d31ce3f5dd6",
+  "native_validation_scope": [
+    "strict ideal J2 material audit",
+    "zero initial platen reaction"
+  ],
+  "loaded_pressure_containment_verified": false,
+  "full_0_to_20_percent_curve_verified": false,
+  "solid_core_line_included": false,
+  "library_modifications": {
+    "SPHINXsys/src/shared/common/large_data_containers.h": "Use C++17 standard allocation for neighborhood containers to reduce per-allocation overhead.",
+    "SPHINXsys/src/for_3D_build/meshes/cell_linked_list_supplementary.cpp": "Allocate occupied cell contents lazily instead of reserving 36 entries in every empty cell.",
+    "SPHINXsys/src/shared/particle_dynamics/fluid_dynamics/fluid_dynamics_multi_phase.hpp": "Correct a CompressibleFluid pointer conversion required to compile the upstream template."
+  },
+  "packaging_only_changes": [
+    "CMake defaults and standalone target",
+    "modified-file notices",
+    "documentation and portable launcher"
+  ],
+  "physical_parameters_modified_during_packaging": false
+}

@@ -36,7 +36,9 @@ large weights without adding an energetic invariant. The resulting trace-velocit
 jump at birth is recorded, never removed by changing particle velocities. Full
 force-work and raw energy checks remain required.
 
-The transferred operator is frozen between topology events. These operator targets
+The transferred operator is frozen between topology events. Full capsule
+checkpoints retain its exact gradient rows and spectral bound, including the
+intact initial operator, so algebraic reassociation cannot alter restored forces. These operator targets
 are history and are included in checkpoints; they are not discarded as caches.
 An unresolved constraint is an error, not permission to erase material.
 
@@ -112,7 +114,8 @@ interactions. On crack cells, `FractureWorkFraction` is the area-weighted spent
 Gc fraction, `FullyFailedAreaFraction` is the fraction with zero remaining
 cohesive traction, and `MaximumNormalOpening_m` is the current positive gap at
 that facet's quadrature. A completely decohered face can close under contact;
-a colour alone is not an opening measurement. Geometry is not magnified.
+a colour alone is not an opening measurement. Geometry is not magnified. Same-time insertion cascades publish one final
+trajectory frame; every individual strength/energy event remains in the CSV.
 
 The formal runner `tools/verification/run_physical_fracture.py` executes one
 physical dynamic history, saves its complete state and resumes it in a fresh

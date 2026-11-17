@@ -177,21 +177,32 @@ std::vector<std::pair<Real,std::string>>frame_index;
         CrackArchive::Histories history;CrackArchive::IMEXBlock block;block.name="shell_extrinsic_equal_mode";block.ft=growth.ft;block.Gc=growth.Gc;size_t qindex=0;
         for(size_t k:order){if(k>=bank.size())throw std::runtime_error("Checkpoint candidate ID outside source bank");for(size_t q=0;q<bank[k].point.size();++q){block.history_ids.push_back(64*bank[k].id+q);block.history.push_back(a.reading?CohesiveInterfaceIMEX::History{}:growth.history.at(qindex));++qindex;}}history.imex.push_back(block);
         if(!a.reading)bytes=CrackArchive::encode(sr,recovery::checkpoint.fingerprint,point_ids,history);a.value(bytes);
+        // The frozen numerical operator is history too. Store its exact rows,
+        // including the intact initial operator, instead of relying on algebraic
+        // reassociation during reconstruction to reproduce zero forces.
+        StdVec<StdVec<Vecd>>saved_gradient;if(!a.reading){saved_gradient.resize(sn);for(size_t i=0;i<sn;++i)for(const auto&e:sr.rows[i])saved_gradient[i].push_back(e.gradient);}Real saved_elastic_dt=sr.elastic_dt_bound;a.fields(saved_gradient,saved_elastic_dt);
         a.span(cx,cn);a.span(cv,cn);a.span(sx,sn);a.span(sv,sn);
-        if(a.reading){CrackArchive::load(sr,bytes,recovery::checkpoint.fingerprint,point_ids,history);si.restoreTransferValues(inner_transfer,inner_velocity);so.restoreTransferValues(outer_transfer,outer_velocity);growth.restorePatches(order,history.imex[0].history,minus_transfer,plus_transfer,minus_velocity,plus_velocity);if(traction.size()!=growth.history.size())throw std::runtime_error("Checkpoint adhesion-traction dimensions");growth.last_traction=std::move(traction);if(candidate_flags.size()!=growth.active.size())throw std::runtime_error("Checkpoint candidate-state dimensions");for(size_t k=0;k<candidate_flags.size();++k){if(candidate_flags[k]>2||(candidate_flags[k]==1)!=(growth.active[k]==1))throw std::runtime_error("Checkpoint candidate-state mismatch");}growth.active=std::move(candidate_flags);sb.rebuild();refresh();}
+        if(a.reading){CrackArchive::load(sr,bytes,recovery::checkpoint.fingerprint,point_ids,history);
+            if(saved_gradient.size()!=sn||!std::isfinite(saved_elastic_dt)||saved_elastic_dt<=0)throw std::runtime_error("Checkpoint live-operator dimensions/bound");
+            for(size_t i=0;i<sn;++i){if(saved_gradient[i].size()!=sr.rows[i].size())throw std::runtime_error("Checkpoint live-operator row count");Matd affine=Matd::Zero();for(size_t k=0;k<sr.rows[i].size();++k){const auto&g=saved_gradient[i][k];if(!g.allFinite()||(!sr.live(i,k)&&g.squaredNorm()!=0))throw std::runtime_error("Invalid checkpoint live gradient");sr.rows[i][k].gradient=g;affine+=(sX[sr.rows[i][k].j]-sX[i])*g.transpose();}if((affine-Matd::Identity()).norm()>1e-8)throw std::runtime_error("Checkpoint live operator lost affine completeness");}sr.elastic_dt_bound=saved_elastic_dt;
+            si.restoreTransferValues(inner_transfer,inner_velocity);so.restoreTransferValues(outer_transfer,outer_velocity);growth.restorePatches(order,history.imex[0].history,minus_transfer,plus_transfer,minus_velocity,plus_velocity);if(traction.size()!=growth.history.size())throw std::runtime_error("Checkpoint adhesion-traction dimensions");growth.last_traction=std::move(traction);if(candidate_flags.size()!=growth.active.size())throw std::runtime_error("Checkpoint candidate-state dimensions");for(size_t k=0;k<candidate_flags.size();++k){if(candidate_flags[k]>2||(candidate_flags[k]==1)!=(growth.active[k]==1))throw std::runtime_error("Checkpoint candidate-state mismatch");}growth.active=std::move(candidate_flags);sb.rebuild();refresh();}
         if(time.displacement.size()!=count||cb.history.size()!=cr.cells.size())throw std::runtime_error("Checkpoint geometry mismatch");
     };
     auto save=[&](){progress.flush();eq.flush();events.flush();recovery::checkpoint.save(out,{"progress.csv","equilibria.csv","fracture_events.csv"},time.steps,transfer);};
     if(!recovery::checkpoint.resume.empty()){progress.close();eq.close();events.close();recovery::checkpoint.load(out,{"progress.csv","equilibria.csv","fracture_events.csv"},transfer);progress.open(out/"progress.csv",std::ios::app);eq.open(out/"equilibria.csv",std::ios::app);events.open(out/"fracture_events.csv",std::ios::app);progress<<std::setprecision(17);eq<<std::setprecision(17);events<<std::setprecision(17);
         Field expected=bulk_force;assembleShellAndConstraints(compression(stage_time));Real error=0,scale=0;for(size_t j=0;j<count;++j){error=std::max(error,(bulk_force[j]-expected[j]).norm());scale=std::max(scale,expected[j].norm());}if(error>1e-9*std::max(scale,Real(1e-20)))throw std::runtime_error("Resumed physical-fracture force does not reproduce committed checkpoint");cohesive_force=growth.cohesiveForces(growth.positions());snapshot("resumed",compression(stage_time));}
     save();
-    while(stage<=o.load_steps){size_t prior_stage=stage;
+    while(stage<=o.load_steps){size_t prior_stage=stage,prior_cracks=growth.insertion_events;
         if(time.steps%50==0){for(size_t event=0;event<bank.size();++event){size_t k=growth.select();if(k==bank.size())break;
             Real ratio=growth.strengthRatio(k);size_t prior_core_commits=cb.commits;bool inserted=growth.insert(k,false,refresh,eventEnergy,prepareTransfer,rollbackTransfer);if(cb.commits!=prior_core_commits)throw std::runtime_error("Topology event advanced frozen core material history");
-            if(!inserted&&!growth.last_candidate_unresolved){save();throw std::runtime_error("Capsule physical insertion rejected: "+growth.last_rejection);}
-            if(inserted){onset=true;cohesive_force=growth.cohesiveForces(growth.positions());events<<"new_cohesive_crack"<<','<<time.steps<<','<<stage<<','<<compression(stage_time)/o.diameter<<','<<bank[k].id<<','<<ratio<<','<<sr.physical_broken_bonds<<','<<growth.max_gap<<'\n';events.flush();snapshot("crack_"+std::to_string(growth.insertion_events),compression(stage_time));}
+            if(!inserted&&!growth.last_candidate_unresolved){snapshot("stopped_before_rejected_crack",compression(stage_time));save();throw std::runtime_error("Capsule physical insertion rejected: "+growth.last_rejection);}
+            if(inserted){onset=true;cohesive_force=growth.cohesiveForces(growth.positions());events<<"new_cohesive_crack"<<','<<time.steps<<','<<stage<<','<<compression(stage_time)/o.diameter<<','<<bank[k].id<<','<<ratio<<','<<sr.physical_broken_bonds<<','<<growth.max_gap<<'\n';events.flush();}
             else{events<<"unresolved_geometric_facet_no_material_cut"<<','<<time.steps<<','<<stage<<','<<compression(stage_time)/o.diameter<<','<<bank[k].id<<','<<ratio<<','<<sr.physical_broken_bonds<<','<<growth.max_gap<<'\n';events.flush();}
         }}
+        // A cascade changes topology at one fixed physical time. Preserve
+        // every event in CSV and publish its final state once, avoiding many
+        // redundant full-core/shell files at the same timestamp.
+        if(growth.insertion_events!=prior_cracks)snapshot("crack_"+std::to_string(growth.insertion_events),compression(stage_time));
         Real shell_dt=sb.finiteStrainTimeStep();Real rate=1/(core_dt*core_dt)+1/(shell_dt*shell_dt)+1/(sb.stabilizer_dt*sb.stabilizer_dt)+1/(tie.stable_dt*tie.stable_dt)+1/(contact.stable_dt*contact.stable_dt);
         if(std::isfinite(growth.contact_dt))rate+=1/(growth.contact_dt*growth.contact_dt);Real dt=std::min({o.max_dt,1/std::sqrt(rate),cb.acoustic_dt,radial_dt});if(stage_time<o.ramp_duration)dt=std::min(dt,o.ramp_duration-stage_time);
         if(!std::isfinite(dt)||dt<1e-15||time.steps>=o.max_steps)throw std::runtime_error("Coupled physical time/count bound exhausted");
@@ -215,7 +226,7 @@ std::vector<std::pair<Real,std::string>>frame_index;
 
 int main(int argc,char**argv)
 {
-    try{recovery::checkpoint.schema_version=3;std::string cells;std::vector<char*>args{argv[0]};for(int i=1;i<argc;++i){std::string a=argv[i];if(a.rfind("--snsni-cells=",0)==0)cells=a.substr(14);else if(a.rfind("--fracture-facets=",0)==0)fracture_bank_input=a.substr(18);else if(recovery::checkpoint.take(a)){}else args.push_back(argv[i]);}
+    try{recovery::checkpoint.schema_version=4;std::string cells;std::vector<char*>args{argv[0]};for(int i=1;i<argc;++i){std::string a=argv[i];if(a.rfind("--snsni-cells=",0)==0)cells=a.substr(14);else if(a.rfind("--fracture-facets=",0)==0)fracture_bank_input=a.substr(18);else if(recovery::checkpoint.take(a)){}else args.push_back(argv[i]);}
         if(cells.empty())throw std::invalid_argument("--snsni-cells is required");HybridOptions options;options.parseHybrid(int(args.size()),args.data());
         tbb::task_arena arena(int(options.threads));return arena.execute([&]{return runSnsniCapsule(options,cells);});
     }catch(const std::exception&e){std::cerr<<"COUPLED_ERROR "<<e.what()<<std::endl;return 1;}

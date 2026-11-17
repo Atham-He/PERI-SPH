@@ -53,7 +53,7 @@ def run(a):
     if benchmark_manifest.get('exit_code')!=0 or benchmark_manifest.get('diagnostic_replay') is not False:raise RuntimeError('Formal benchmark did not exit successfully or was a diagnostic replay')
     if subprocess.check_output(['git','status','--porcelain'],cwd=source,text=True).strip():raise RuntimeError('Pin a clean canonical source before the production history')
     values=dict(line.split('=',1) for line in cfg.read_text().splitlines() if line.strip() and not line.lstrip().startswith('#'))
-    material=Path(values['dpc-table'].strip());identity={'source_commit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=source,text=True).strip(),'binary_sha256':sha(binary),'config_sha256':sha(cfg),'DPC_table_sha256':sha(material),'core_cache_sha256':sha(cache),'crack_bank_sha256':sha(bank),'checkpoint_schema':3}
+    material=Path(values['dpc-table'].strip());identity={'source_commit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=source,text=True).strip(),'binary_sha256':sha(binary),'config_sha256':sha(cfg),'DPC_table_sha256':sha(material),'core_cache_sha256':sha(cache),'crack_bank_sha256':sha(bank),'checkpoint_schema':4}
     # A PASSED file from an earlier executable/input cannot authorize a new run.
     for name,path in [('binary_sha256',binary),('config_sha256',cfg),('DPC_table_sha256',material),('core_cache_sha256',cache),('crack_bank_sha256',bank)]:
         if preflight_manifest.get(name)!=sha(path):raise RuntimeError('Coupled preflight identity mismatch: '+name)
@@ -98,7 +98,7 @@ def run(a):
             code=process.wait();entry.update(exit_code=code,ended_UTC=utc());put(root/'production_manifest.json',manifest);index(root,segments)
         if segment==0 and code==86:
             latest=json.loads((output/'checkpoint.latest.json').read_text());checkpoint=Path(latest['file']);accepted=row(output/'equilibria.csv')
-            if latest['version']!=3 or latest['fingerprint']!=fingerprint or not accepted:raise RuntimeError('First equilibrium did not publish its compatible complete physical checkpoint')
+            if latest['version']!=4 or latest['fingerprint']!=fingerprint or not accepted:raise RuntimeError('First equilibrium did not publish its compatible complete physical checkpoint')
             receipt={'recorded_UTC':utc(),'checkpoint':str(checkpoint),'checkpoint_sha256':sha(checkpoint),'accepted_equilibrium':accepted,'fingerprint':fingerprint,'native_FNV_verification_required_on_load':True,'no_loading_or_material_history_reset':True}
             put(root/'checkpoint_handoff.json',receipt);print('CONTINUING_COMPLETE_STATE',checkpoint,flush=True);continue
         if code!=0:raise RuntimeError('Physical capsule native exit '+str(code)+'; see '+str(log_path))

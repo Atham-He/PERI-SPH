@@ -26,7 +26,16 @@ surface geometry. Forces use the exact transpose of the current reconstruction.
 
 Particle positions, velocities and masses do not change during insertion.
 Constrained GMLS transfers the current deformation gradient and the current
-interface position/velocity functionals while preserving polynomial moments.
+interface position functionals while preserving polynomial moments.
+Particle velocities themselves are unchanged, so physical kinetic energy and
+linear/angular momentum are preserved. Trace velocities are derived observations,
+not independent massive degrees of freedom. The physical route therefore does
+not impose their independent equality as an extra reconstruction constraint:
+near-dependent position and velocity fields can otherwise produce extremely
+large weights without adding an energetic invariant. The resulting trace-velocity
+jump at birth is recorded, never removed by changing particle velocities. Full
+force-work and raw energy checks remain required.
+
 The transferred operator is frozen between topology events. These operator targets
 are history and are included in checkpoints; they are not discarded as caches.
 An unresolved constraint is an error, not permission to erase material.

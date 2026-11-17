@@ -50,7 +50,7 @@ class ExtrinsicCrackGrowth {
     Real max_gap=0,max_penetration=0,contact_dt=std::numeric_limits<Real>::infinity();
     size_t insertion_events=0,rejected_events=0,failed_quadrature=0,unresolved_candidates=0;bool last_candidate_unresolved=false;
     std::string last_rejection;
-    struct InsertionAudit {size_t candidate=0;Real area=0,old_energy=0,new_energy=0,old_bulk=0,new_bulk=0,old_cohesive=0,new_cohesive=0,old_contact=0,new_contact=0,new_dissipation=0,maximum_birth_gap=0,defect=0,fraction=0,old_stabilizer=0,new_stabilizer=0,total_defect=0;} last_insertion;
+    struct InsertionAudit {size_t candidate=0;Real area=0,old_energy=0,new_energy=0,old_bulk=0,new_bulk=0,old_cohesive=0,new_cohesive=0,old_contact=0,new_contact=0,new_dissipation=0,maximum_birth_gap=0,maximum_birth_velocity_jump=0,defect=0,fraction=0,old_stabilizer=0,new_stabilizer=0,total_defect=0;} last_insertion;
     ExtrinsicCrackGrowth(Reference&r,Bulk&b,SolidForcePort&p,Real strength,Real energy,Real dp,Real K,const std::vector<Candidate>&bank)
       :reference(r),bulk(b),port(p),ft(strength),Gc(energy),delta_f(2*energy/strength),spacing(dp),contact_K(K),candidates(bank),active(bank.size(),0){
         if(std::min({ft,Gc,spacing,contact_K})<=0)throw std::invalid_argument("Invalid extrinsic fracture inputs");
@@ -114,15 +114,15 @@ class ExtrinsicCrackGrowth {
         try{
             StdVec<Vecd>target(c.vertex.begin(),c.vertex.end());StdVec<size_t>owner;
             for(const auto&x:target){size_t nearest=port.count;Real best=std::numeric_limits<Real>::infinity();for(size_t j=0;j<port.count;++j){Real d=(reference.X[j]-x).squaredNorm();if(d<best){best=d;nearest=j;}}owner.push_back(nearest);}
-            VisibleCrackSurface continuous(port,target,owner,reference,spacing,3.5,2);StdVec<Vecd>common(target.size()),common_velocity(target.size());for(size_t q=0;q<common.size();++q){common[q]=continuous.position(q);common_velocity[q]=continuous.velocity(q);}
+            VisibleCrackSurface continuous(port,target,owner,reference,spacing,3.5,2);StdVec<Vecd>common(target.size());for(size_t q=0;q<common.size();++q)common[q]=continuous.position(q);
             auto q=positions();StdVec<Matd>F(bulk.F,bulk.F+port.count);
             for(auto&p:patches){p.minus->captureTransferValues();p.plus->captureTransferValues();}
             if(prepare)prepare();reference.setTransferState(q,F,StdVec<Vecd>(port.velocity,port.velocity+port.count));
             size_t cut=0;for(const auto&t:c.barrier)cut+=reference.cutTriangle(t[0],t[1],t[2],false);
             if(cut==0){last_candidate_unresolved=true;throw std::runtime_error("Geometric facet has no remaining material interactions at this resolution");}
             reference.updateAfterFailure();bulk.rebuild();rebuildTraces();
-            patches.push_back(makePatch(k,common,common,common_velocity,common_velocity));for(size_t i=0;i<c.point.size();++i){history.push_back({precrack?delta_f:0});last_traction.push_back(Vecd::Zero());}
-            refresh();CohesiveSurfaceEvolution model(ft,Gc,quadrature());
+            patches.push_back(makePatch(k,common,common));for(size_t i=0;i<c.point.size();++i){history.push_back({precrack?delta_f:0});last_traction.push_back(Vecd::Zero());}
+            refresh();for(size_t q=0;q<4;++q)last_insertion.maximum_birth_velocity_jump=std::max(last_insertion.maximum_birth_velocity_jump,(patches.back().plus->velocity(q)-patches.back().minus->velocity(q)).norm());CohesiveSurfaceEvolution model(ft,Gc,quadrature());
             for(size_t j=0;j<history.size();++j){Real r=model.geometry(j,q).jump.norm();if(history[j].kappa<delta_f&&r>history[j].kappa+4e-14)throw std::runtime_error("New/reconstructed cohesive surface has an artificial birth opening");}
             statistics(q);Real after=totalEnergy(),newD=dissipated-oldD,newHG=bulk.stabilizationEnergy();
             Real total_defect=after-oldEnergy+(precrack?0:newD),defect=total_defect-(newHG-oldHG),fraction=std::abs(defect)/(Gc*A);

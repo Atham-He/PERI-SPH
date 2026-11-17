@@ -67,7 +67,7 @@ class VisibleCrackSurface : public ReferenceSolidSurface
     {if(!isCurrent())throw std::runtime_error("One-sided crack surface was not rebuilt after topology change");}
     const StdVec<Vecd>&transferValues()const{return transfer_values_;}
     const StdVec<Vecd>&transferVelocities()const{return transfer_velocity_values_;}
-    void captureTransferValues(){ensureCurrent();StdVec<Vecd>next(points.size()),vel(points.size());for(size_t q=0;q<points.size();++q){next[q]=position(q);vel[q]=velocity(q);}transfer_values_=std::move(next);transfer_velocity_values_=std::move(vel);transfer_pending_=true;}
+    void captureTransferValues(bool include_velocity=false){ensureCurrent();StdVec<Vecd>next(points.size()),vel;if(include_velocity)vel.resize(points.size());for(size_t q=0;q<points.size();++q){next[q]=position(q);if(include_velocity)vel[q]=velocity(q);}transfer_values_=std::move(next);transfer_velocity_values_=std::move(vel);transfer_pending_=true;}
     void restoreTransferValues(const StdVec<Vecd>&values,const StdVec<Vecd>&velocities={}){if((!values.empty()&&values.size()!=points.size())||(!velocities.empty()&&velocities.size()!=points.size()))throw std::invalid_argument("Restored trace transfer dimensions");transfer_values_=values;transfer_velocity_values_=velocities;transfer_pending_=true;}
     void rebuildAll()
     {

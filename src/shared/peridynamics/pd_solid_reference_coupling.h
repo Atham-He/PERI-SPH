@@ -59,6 +59,8 @@ class ReferenceSolidSurface
     StdVec<Row> rows;
     Real affine_error=0, polynomial_error=0, largest_condition_number=0;
     virtual ~ReferenceSolidSurface()=default;
+    virtual void ensureCurrent()const{}
+    virtual size_t mappingVersion()const{return 0;}
     const unsigned reproduction_order;
   protected:
     struct DeferredBuildTag {};
@@ -151,22 +153,23 @@ class ReferenceSolidSurface
             rows.push_back(std::move(row));
         }
     }
-    Vecd position(size_t i) const {Vecd x=Vecd::Zero();const auto &r=rows[i];
+    Vecd position(size_t i) const {ensureCurrent();Vecd x=Vecd::Zero();const auto &r=rows[i];
         for(size_t a=0;a<r.index.size();++a)x+=r.weight[a]*port.position[r.index[a]];return x;}
-    Vecd velocity(size_t i) const {Vecd v=Vecd::Zero();const auto &r=rows[i];
+    Vecd velocity(size_t i) const {ensureCurrent();Vecd v=Vecd::Zero();const auto &r=rows[i];
         for(size_t a=0;a<r.index.size();++a)v+=r.weight[a]*port.velocity[r.index[a]];return v;}
     void kinematics(size_t i,Vecd&x,Vecd&v) const
     {
-        x.setZero();v.setZero();const auto&r=rows[i];
+        ensureCurrent();x.setZero();v.setZero();const auto&r=rows[i];
         for(size_t a=0;a<r.index.size();++a){x+=r.weight[a]*port.position[r.index[a]];v+=r.weight[a]*port.velocity[r.index[a]];}
     }
-    void scatter(size_t i,const Vecd &f) {const auto &r=rows[i];
+    void scatter(size_t i,const Vecd &f) {ensureCurrent();const auto &r=rows[i];
         for(size_t a=0;a<r.index.size();++a)port.addForce(r.index[a],r.weight[a]*f);}
 
     /** Absolute row-sum bound of sqrt(K) B M^-1 B^T sqrt(K). */
     static Real stableBound(const ReferenceSolidSurface &a,const ReferenceSolidSurface *b,
                             const StdVec<Real> &stiffness,Real safety=.2)
     {
+        a.ensureCurrent();if(b)b->ensureCurrent();
         if(stiffness.size()!=a.rows.size() || (b && b->rows.size()!=a.rows.size()))
             throw std::invalid_argument("Surface constraint dimensions disagree");
         StdVec<Real> sa(a.port.count,0),sb(b ? b->port.count:0,0);
@@ -199,7 +202,7 @@ class BondedSolidInterface
     StdVec<Real> stiffness;
     StdVec<Vecd> x_a,x_b,force_a;
     Real stable_dt,energy=0,max_gap=0,force_residual=0,torque_residual=0,power_residual=0;
-    Real worst_force=0,worst_torque=0,worst_power=0,length_scale;
+    Real worst_force=0,worst_torque=0,worst_power=0,length_scale;size_t a_mapping_version=~size_t(0),b_mapping_version=~size_t(0);
     BondedSolidInterface(ReferenceSolidSurface &first,ReferenceSolidSurface &second,
                          const StdVec<Real> &areas,Real stiffness_per_area,Real length)
         : a(first),b(second),length_scale(length)
@@ -211,10 +214,12 @@ class BondedSolidInterface
             throw std::invalid_argument("Bonded-solid reference surfaces do not coincide");
          stiffness.push_back(areas[i]*stiffness_per_area);}
         x_a.resize(areas.size());x_b.resize(areas.size());force_a.resize(areas.size());
-        stable_dt=ReferenceSolidSurface::stableBound(a,&b,stiffness);
+        refreshTimeStepBound();
     }
+    void refreshTimeStepBound(){a.ensureCurrent();b.ensureCurrent();stable_dt=ReferenceSolidSurface::stableBound(a,&b,stiffness);a_mapping_version=a.mappingVersion();b_mapping_version=b.mappingVersion();}
     void apply()
     {
+        a.ensureCurrent();b.ensureCurrent();if(a_mapping_version!=a.mappingVersion()||b_mapping_version!=b.mappingVersion())refreshTimeStepBound();
         energy=max_gap=0;Vecd sum=Vecd::Zero(),torque=Vecd::Zero();Real power=0,fs=0,ps=0;
         for(size_t i=0;i<stiffness.size();++i)
         {
@@ -259,7 +264,7 @@ class SolidSurfacePlaneContact
     Real stable_dt,upper=0,lower=0,energy=0,max_penetration=0;
     Real tangent_energy=0,slip_dissipation=0,release_energy=0,max_cone_ratio=0;
     Real tangential_force_sum=0;
-    size_t active_friction_points=0,sliding_points=0,history_commits=0;
+    size_t active_friction_points=0,sliding_points=0,history_commits=0;size_t surface_mapping_version=~size_t(0);
     Real worst_force=0,worst_torque=0,worst_power=0,length_scale;
     SolidSurfacePlaneContact(ReferenceSolidSurface &s,const StdVec<Real> &area,
                              Real stiffness_per_area,Real length,Real mu=0,Real kt_over_kn=1)
@@ -275,15 +280,17 @@ class SolidSurfacePlaneContact
     }
     void refreshTimeStepBound()
     {
+        surface.ensureCurrent();
         // Stick: Kt P_t + Kn n*n^T. Sliding also couples Ft to Fn with
         // derivative bounded by mu*Kn. The sum of these operator norms is
         // a conservative bound; mu=0 preserves the original bound exactly.
-        if(friction==0){stable_dt=ReferenceSolidSurface::stableBound(surface,nullptr,stiffness);return;}
+        if(friction==0){Real next=ReferenceSolidSurface::stableBound(surface,nullptr,stiffness);stable_dt=next;surface_mapping_version=surface.mappingVersion();return;}
         StdVec<Real> bound=stiffness;for(auto &k:bound)k*=1+tangent_factor+friction;
-        stable_dt=ReferenceSolidSurface::stableBound(surface,nullptr,bound);
+        Real next=ReferenceSolidSurface::stableBound(surface,nullptr,bound);stable_dt=next;surface_mapping_version=surface.mappingVersion();
     }
     void apply(Real bottom,Real top,bool commit_history=false)
     {
+        surface.ensureCurrent();if(surface_mapping_version!=surface.mappingVersion())refreshTimeStepBound();
         upper=lower=energy=max_penetration=tangent_energy=max_cone_ratio=tangential_force_sum=0;
         active_friction_points=sliding_points=0;
         Vecd ferr=Vecd::Zero(),terr=Vecd::Zero();Real perr=0,fs=0,ps=0;

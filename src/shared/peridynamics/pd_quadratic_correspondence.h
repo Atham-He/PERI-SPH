@@ -99,6 +99,7 @@ class PDQuadraticReference : public LocalDynamics, public DataDelegateInner
         elastic_dt_bound=.2/std::sqrt(bound);
     }
 
+    virtual size_t topologyVersion()const{return 0;}
     virtual void checkIntact(size_t i) const
     {
         const auto &nb=inner_configuration_[i];

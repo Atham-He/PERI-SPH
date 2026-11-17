@@ -106,6 +106,7 @@ class PDFractureReference : public PDQuadraticReference
         }
         updateBound();++topology_version;
     }
+    size_t topologyVersion()const override{return topology_version;}
     void checkIntact(size_t i)const override
     {
         const auto &nb=inner_configuration_[i];if(nb.current_size_!=rows[i].size())throw std::runtime_error("Fracture reference neighbors changed");

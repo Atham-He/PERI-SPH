@@ -51,6 +51,29 @@ add_executable(snsni_bare snsni_bare.cpp)
 target_link_libraries(snsni_bare sphinxsys_3d)
 target_compile_features(snsni_bare PRIVATE cxx_std_17)
 
+# Build the existing S-NSNI capsule entry from the canonical repository.
+# Its current model remains continuous damage; this target is not a restart
+# authorization for the unfinished physical-fracture path.
+set(SNSNI_CAPSULE_HASHES "${ASSEMBLY_HASH};${MATERIAL_HASH}")
+foreach(SNSNI_FILE
+        ${CMAKE_CURRENT_SOURCE_DIR}/pd_snsni_capsule.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/pd_snsni_capsule_fixture.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/recovery_checkpoint.h
+        ${PERI_SHARED}/particle_dynamics/solid_dynamics/solid_snsni_plastic.h
+        ${PERI_SHARED}/peridynamics/pd_radial_layered_surface.h
+        ${PERI_SHARED}/peridynamics/diffuse_crack_release.h)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${SNSNI_FILE})
+    file(SHA256 ${SNSNI_FILE} SNSNI_FILE_HASH)
+    string(APPEND SNSNI_CAPSULE_HASHES ";${SNSNI_FILE_HASH}")
+endforeach()
+string(SHA256 SNSNI_CAPSULE_HASH "${SNSNI_CAPSULE_HASHES}")
+add_executable(pd_snsni_capsule pd_snsni_capsule.cpp)
+target_link_libraries(pd_snsni_capsule sphinxsys_3d)
+target_compile_features(pd_snsni_capsule PRIVATE cxx_std_17)
+target_compile_definitions(pd_snsni_capsule PRIVATE
+    CAPSULE_SOURCE_SHA256="${SNSNI_CAPSULE_HASH}"
+    DPC_MATERIAL_SHA256="${MATERIAL_HASH}")
+
 # Resolved NOSB-PD/solid-SPH capsule inside an explicit rigid-grain shear box.
 file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/pd_snsni_direct_shear.cpp DIRECT_SHEAR_MAIN_HASH)
 file(SHA256 ${PERI_SHARED}/peridynamics/rigid_grain_shear.h DIRECT_SHEAR_CONTACT_HASH)
@@ -75,4 +98,13 @@ if(BUILD_TESTING)
     add_test(NAME pd_directional_crack_open_close_slip
         COMMAND pd_directional_crack_benchmark ${CMAKE_CURRENT_BINARY_DIR}/directional_crack_acceptance)
     set_tests_properties(pd_directional_crack_open_close_slip PROPERTIES RUN_SERIAL TRUE)
+endif()
+
+# Actual disconnected precrack with one-sided reconstruction and face contact.
+add_executable(pd_physical_crack_benchmark pd_physical_crack_benchmark.cpp)
+target_link_libraries(pd_physical_crack_benchmark sphinxsys_3d)
+target_compile_features(pd_physical_crack_benchmark PRIVATE cxx_std_17)
+if(BUILD_TESTING)
+    add_test(NAME pd_physical_precrack_open_close_slip COMMAND pd_physical_crack_benchmark ${CMAKE_CURRENT_BINARY_DIR}/physical_precrack_acceptance)
+    set_tests_properties(pd_physical_precrack_open_close_slip PROPERTIES RUN_SERIAL TRUE)
 endif()

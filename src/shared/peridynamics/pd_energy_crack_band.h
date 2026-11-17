@@ -9,6 +9,7 @@
 #include "pd_quadratic_correspondence.h"
 #include <Eigen/SVD>
 #include "pd_directional_crack_energy.h"
+#include "pd_layered_geometry.h"
 
 namespace SPH::solid_dynamics
 {
@@ -138,12 +139,12 @@ class PDEnergyCrackBand : public LocalDynamics,public DataDelegateInner
     StdVec<StdVec<Entry>> projection;
     StdVec<LinearEnergyCrackBand::History> history;
     PDQuadraticReference &reference;FiniteVolumeBiotEnergy elastic;DirectionalCrackEnergy<FiniteVolumeBiotEnergy> crack_energy;LinearEnergyCrackBand fracture;
-    bool directional_contact;StdVec<Real>crack_projection_norm;StdVec<int>crack_projection_ready;
-    Real stabilizer,horizon,stabilizer_dt=0;
+    bool directional_contact,live_fracture_support;StdVec<Vecd>reference_positions;StdVec<int>projection_degree;StdVec<Real>crack_projection_norm;StdVec<int>crack_projection_ready;
+    Real stabilizer,horizon,stabilizer_dt=0;size_t projection_topology_version=~size_t(0);
     Real *damage,*dissipation_density,*stored_density,*hg_density,*kappa_field,*tangent_bound;int *material_failed;
     Vecd *crack_normal;
-    PDEnergyCrackBand(BaseInnerRelation&r,PDQuadraticReference&ref,Real E,Real nu,Real ft,Real Gc,Real hg,Real delta,bool directional=false)
-      :LocalDynamics(r.getSPHBody()),DataDelegateInner(r),reference(ref),elastic(E,nu),crack_energy(elastic),fracture(E,ft,Gc,2*delta,directional?crack_energy.initiationEnergy(ft):elastic.initiationEnergy(ft)),directional_contact(directional),horizon(delta),
+    PDEnergyCrackBand(BaseInnerRelation&r,PDQuadraticReference&ref,Real E,Real nu,Real ft,Real Gc,Real hg,Real delta,bool directional=false,bool live_support=false)
+      :LocalDynamics(r.getSPHBody()),DataDelegateInner(r),reference(ref),elastic(E,nu),crack_energy(elastic),fracture(E,ft,Gc,2*delta,directional?crack_energy.initiationEnergy(ft):elastic.initiationEnergy(ft)),directional_contact(directional),live_fracture_support(live_support),horizon(delta),
        x(particles_->getVariableDataByName<Vecd>("Position")),volume(particles_->getVariableDataByName<Real>("VolumetricMeasure")),
        mass(particles_->getVariableDataByName<Real>("Mass")),F(particles_->getVariableDataByName<Matd>("DeformationGradient")),
        P(particles_->getVariableDataByName<Matd>("PDPK1")),stress(particles_->getVariableDataByName<Matd>("PDStress")),
@@ -159,26 +160,32 @@ class PDEnergyCrackBand : public LocalDynamics,public DataDelegateInner
     }
     void initialize()
     {
-        size_t count=particles_->TotalRealParticles();history.resize(count);projection.resize(count);crack_projection_norm.assign(count,0);crack_projection_ready.assign(count,0);Real max_rate=0;
+        size_t count=particles_->TotalRealParticles();
+        if(reference_positions.empty())reference_positions.assign(x,x+count);
+        if(reference_positions.size()!=count)throw std::runtime_error("Energetic reference particle count changed");
+        history.resize(count);projection.resize(count);projection_degree.resize(count);crack_projection_norm.assign(count,0);crack_projection_ready.assign(count,0);Real max_rate=0;
         for(size_t i=0;i<count;++i)
         {
+            reference.checkIntact(i); // Reject new masks with stale gradients.
             const auto&nb=inner_configuration_[i];Real sum=0;Matd cov=Matd::Zero();
-            for(size_t n=0;n<nb.current_size_;++n){Real a=nb.W_ij_[n]*volume[nb.j_[n]];Vecd z=x[nb.j_[n]]-x[i];sum+=a;cov+=a*z*z.transpose();}
-            cov/=sum;Eigen::SelfAdjointEigenSolver<Matd> ce(cov);if(ce.info()!=Eigen::Success||ce.eigenvalues().minCoeff()<=0)throw std::runtime_error("Invalid energetic projection covariance");
+            for(size_t n=0;n<nb.current_size_;++n){if(!nb.bondLive_[n]){if(!live_fracture_support)throw std::runtime_error("Continuous damage requires intact reference bonds; enable the qualified live-support path");continue;}Real a=nb.W_ij_[n]*volume[nb.j_[n]];Vecd z=reference_positions[nb.j_[n]]-reference_positions[i];sum+=a;cov+=a*z*z.transpose();}
+            if(sum<=0)throw std::runtime_error("No energetic live support; no particle was erased");cov/=sum;Eigen::SelfAdjointEigenSolver<Matd> ce(cov);if(ce.info()!=Eigen::Success||ce.eigenvalues().minCoeff()<=0)throw std::runtime_error("Invalid energetic projection covariance");
             Matd L=ce.eigenvectors()*ce.eigenvalues().cwiseSqrt().cwiseInverse().asDiagonal()*ce.eigenvectors().transpose();
             M9 moment=M9::Zero();projection[i].resize(nb.current_size_);
-            for(size_t n=0;n<nb.current_size_;++n){auto&e=projection[i][n];e.reference_difference=x[nb.j_[n]]-x[i];Vecd z=L*e.reference_difference;e.basis<<z[0],z[1],z[2],z[0]*z[0],z[1]*z[1],z[2]*z[2],z[0]*z[1],z[0]*z[2],z[1]*z[2];
+            for(size_t n=0;n<nb.current_size_;++n){auto&e=projection[i][n];e.reference_difference=reference_positions[nb.j_[n]]-reference_positions[i];e.basis.setZero();e.coefficient.setZero();e.weight=0;e.crack_mode=0;e.stabilizing_force.setZero();if(!nb.bondLive_[n])continue;Vecd z=L*e.reference_difference;e.basis<<z[0],z[1],z[2],z[0]*z[0],z[1]*z[1],z[2]*z[2],z[0]*z[1],z[0]*z[2],z[1]*z[2];
                 e.weight=nb.W_ij_[n]*volume[nb.j_[n]]/sum;moment+=e.weight*e.basis*e.basis.transpose();}
-            Eigen::LDLT<M9> solve(moment);Eigen::Matrix<Real,9,9> check=M9::Zero();
-            for(auto&e:projection[i]){e.coefficient=e.weight*solve.solve(e.basis);check+=e.basis*e.coefficient.transpose();}
-            if((check-M9::Identity()).norm()>1e-8)throw std::runtime_error("Energetic quadratic projection failed");
+            peridynamics::layered_detail::MomentInverse<9> inverse(moment);bool quadratic=inverse.rank==9;projection_degree[i]=quadratic?2:1;
+            if(!quadratic&&!live_fracture_support)throw std::runtime_error("Intact energetic quadratic projection lost rank");
+            Eigen::LDLT<M9> solve(moment);Matd affine_moment=moment.topLeftCorner<3,3>();Eigen::LDLT<Matd> affine(affine_moment);M9 check=M9::Zero(),expected=M9::Zero();if(quadratic)expected.setIdentity();else expected.topLeftCorner<3,3>().setIdentity();
+            for(size_t n=0;n<projection[i].size();++n){auto&e=projection[i][n];if(!nb.bondLive_[n])continue;if(quadratic)e.coefficient=e.weight*solve.solve(e.basis);else{e.basis.tail<6>().setZero();e.coefficient.head<3>()=e.weight*affine.solve(e.basis.head<3>());}check+=e.basis*e.coefficient.transpose();}
+            if((check-expected).norm()>1e-8)throw std::runtime_error("Energetic live polynomial projection failed");
         }
         // The least-squares residual Hessian is bounded above by the unprojected
         // weighted graph Laplacian, giving a conservative positive spectral bound.
         StdVec<Real> rate(count,0);
         for(size_t i=0;i<count;++i)for(size_t n=0;n<reference.rows[i].size();++n)
         {auto&e=reference.rows[i][n];Real k=volume[i]*stabilizer*projection[i][n].weight;rate[i]+=2*k/mass[i];rate[e.j]+=2*k/mass[e.j];}
-        for(Real a:rate)max_rate=std::max(max_rate,a);stabilizer_dt=max_rate>0?.2/std::sqrt(max_rate):std::numeric_limits<Real>::infinity();
+        for(Real a:rate)max_rate=std::max(max_rate,a);stabilizer_dt=max_rate>0?.2/std::sqrt(max_rate):std::numeric_limits<Real>::infinity();projection_topology_version=reference.topologyVersion();
     }
     /** Condense a centered Heaviside jump from the existing polynomial
      * least-squares residual. This preserves stabilization of non-crack modes
@@ -192,8 +199,10 @@ class PDEnergyCrackBand : public LocalDynamics,public DataDelegateInner
         if(norm<=64*std::numeric_limits<Real>::epsilon()){norm=0;for(auto&e:projection[i])e.crack_mode=0;}
         crack_projection_norm[i]=norm;crack_projection_ready[i]=1;
     }
+    void validateProjectionTopology()const{if(projection_topology_version!=reference.topologyVersion())throw std::runtime_error("Energetic projection is stale after a fracture event; rebuild while preserving material history");}
     void evaluateDirectional(size_t i,bool advance)
     {
+        validateProjectionTopology();
         reference.checkIntact(i);A39 A=A39::Zero();Matd f=Matd::Zero();
         for(size_t n=0;n<reference.rows[i].size();++n){auto&e=reference.rows[i][n];Vecd y=x[e.j]-x[i];A+=y*projection[i][n].coefficient.transpose();f+=y*e.gradient.transpose();}
         F[i]=f;auto trial=elastic.evaluate(f);Real intact=trial.positive+trial.negative,hg=0,old=history[i].damage;
@@ -217,6 +226,7 @@ class PDEnergyCrackBand : public LocalDynamics,public DataDelegateInner
     }
     void evaluate(size_t i,bool advance=true)
     {
+        validateProjectionTopology();
         if(directional_contact){evaluateDirectional(i,advance);return;}
         reference.checkIntact(i);A39 A=A39::Zero();Matd f=Matd::Zero();
         for(size_t n=0;n<reference.rows[i].size();++n){auto&e=reference.rows[i][n];Vecd y=x[e.j]-x[i];A+=y*projection[i][n].coefficient.transpose();f+=y*e.gradient.transpose();}
@@ -233,6 +243,7 @@ class PDEnergyCrackBand : public LocalDynamics,public DataDelegateInner
     }
     void forces(size_t i)
     {
+        validateProjectionTopology();reference.checkIntact(i);
         Vecd f=Vecd::Zero(),h=Vecd::Zero();for(size_t n=0;n<reference.rows[i].size();++n)
         {auto&e=reference.rows[i][n];f+=volume[i]*P[i]*e.gradient-volume[e.j]*P[e.j]*reference.rows[e.j][e.reverse].gradient;
          h+=projection[i][n].stabilizing_force-projection[e.j][e.reverse].stabilizing_force;}

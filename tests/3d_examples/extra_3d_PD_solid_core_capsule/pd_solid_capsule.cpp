@@ -674,7 +674,7 @@ int runHybrid(const HybridOptions &o)
 
 int main(int argc,char **argv)
 {
-    try{HybridOptions options;options.parseHybrid(argc,argv);
+    try{HybridOptions options;options.parseHybrid(argc,argv);if(options.fracture_model=="extrinsic_cohesive")throw std::invalid_argument("Extrinsic cohesive growth is qualified through the pd_snsni_capsule entry");
         // Match the arena concurrency to the configured worker limit. The
         // implicit hardware-sized arena can retain affinity proxy tasks when
         // oneTBB global_control limits the workers (upstream issue #1403).

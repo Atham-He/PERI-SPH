@@ -14,7 +14,7 @@
 
 namespace SPH::peridynamics
 {
-/** Independent persistent physical-crack state. Version 1 has NO conversion
+/** Independent persistent physical-crack state. Version 2 includes the conservative GMLS transfer state and has NO conversion
  * from a legacy point-damage field or cached reconstructed/visible stencils.
  * The byte codec can be included as a named attachment in DiskCheckpoint's
  * generation-atomic publication. It deliberately does not create another file
@@ -82,7 +82,7 @@ class FractureTopologyCheckpoint
         uint64_t maximum_facets=10000000;
         uint64_t maximum_history_entries=100000000;
     };
-    static constexpr uint64_t schema_version=1;
+    static constexpr uint64_t schema_version=2;
 
     static Identity makeIdentity(const Reference&ref,const std::string&source_tag,
                                  const std::vector<uint64_t>&source_point_ids)
@@ -133,7 +133,9 @@ class FractureTopologyCheckpoint
         for(auto id:state.identity.source_point_ids)w.u64(id);w.u64(state.identity.reference_geometry_hash);
         w.label("RECIPROCAL-LIVE-MASKS");w.u64(state.topology.live.size());
         for(const auto&row:state.topology.live){w.u64(row.size());for(auto live:row)w.byte(live);}
-        w.u64(state.topology.physical_broken_bonds);w.label("REFERENCE-CRACK-FACETS");w.u64(state.topology.facets.size());
+        w.u64(state.topology.physical_broken_bonds);w.label("CONSERVATIVE-GMLS-TRANSFER-STATE");w.u64(state.topology.transfer_positions.size());
+        for(size_t i=0;i<state.topology.transfer_positions.size();++i){w.vec(state.topology.transfer_positions[i]);w.vec(state.topology.transfer_velocity[i]);for(size_t a=0;a<3;++a)for(size_t b=0;b<3;++b)w.real(state.topology.transfer_gradient[i](a,b));}
+        w.label("REFERENCE-CRACK-FACETS");w.u64(state.topology.facets.size());
         for(const auto&f:state.topology.facets)
         {w.u64(f.kind==Reference::CrackFacet::Kind::PlaneDisk?0:1);w.u64(f.id);w.vec(f.origin);w.vec(f.normal);for(const auto&v:f.vertex)w.vec(v);w.u64(std::isinf(f.radius)?1:0);if(std::isfinite(f.radius))w.real(f.radius);}
         w.label("IMEX-INITIALLY-RIGID-KAPPA-BLOCKS");w.u64(state.histories.imex.size());
@@ -160,7 +162,11 @@ class FractureTopologyCheckpoint
         state.topology.live.resize(expected.neighbor_counts.size());
         for(size_t i=0;i<state.topology.live.size();++i)
         {r.expect(expected.neighbor_counts[i]);r.need(expected.neighbor_counts[i]);auto&row=state.topology.live[i];row.resize(expected.neighbor_counts[i]);for(auto&live:row){live=r.byte();if(live>1)throw std::invalid_argument("crack checkpoint: invalid live mask byte");}}
-        state.topology.physical_broken_bonds=r.index();r.expectLabel("REFERENCE-CRACK-FACETS");
+        state.topology.physical_broken_bonds=r.index();r.expectLabel("CONSERVATIVE-GMLS-TRANSFER-STATE");size_t transferred=r.index();
+        if(transferred!=0&&transferred!=expected.source_point_ids.size())throw std::invalid_argument("crack checkpoint: conservative transfer-state point count");
+        r.need(transferred*15*8);state.topology.transfer_positions.resize(transferred);state.topology.transfer_velocity.resize(transferred);state.topology.transfer_gradient.resize(transferred);
+        for(size_t i=0;i<transferred;++i){state.topology.transfer_positions[i]=r.vec();state.topology.transfer_velocity[i]=r.vec();for(size_t a=0;a<3;++a)for(size_t b=0;b<3;++b)state.topology.transfer_gradient[i](a,b)=r.real();}
+        r.expectLabel("REFERENCE-CRACK-FACETS");
         size_t facet_count=r.count(limits.maximum_facets,144);state.topology.facets.resize(facet_count);
         for(auto&f:state.topology.facets)
         {uint64_t kind=r.u64();if(kind>1)throw std::invalid_argument("crack checkpoint: unknown facet kind");f.kind=kind==0?Reference::CrackFacet::Kind::PlaneDisk:Reference::CrackFacet::Kind::Triangle;f.id=r.u64();f.origin=r.vec();f.normal=r.vec();for(auto&v:f.vertex)v=r.vec();uint64_t infinite=r.u64();if(infinite>1)throw std::invalid_argument("crack checkpoint: invalid radius tag");f.radius=infinite?std::numeric_limits<Real>::infinity():r.real();}
@@ -248,6 +254,9 @@ class FractureTopologyCheckpoint
     {
         validateIdentity(state.identity);validateHistories(state.histories);
         if(state.topology.live.size()!=state.identity.neighbor_counts.size())throw std::invalid_argument("crack checkpoint: live-mask point count mismatch");
+        const auto&q=state.topology.transfer_positions;const auto&F=state.topology.transfer_gradient;const auto&v=state.topology.transfer_velocity;
+        if((!q.empty()||!F.empty()||!v.empty())&&(q.size()!=state.topology.live.size()||F.size()!=q.size()||v.size()!=q.size()))throw std::invalid_argument("crack checkpoint: inconsistent conservative transfer state");
+        for(size_t i=0;i<q.size();++i)if(!q[i].allFinite()||!v[i].allFinite()||!F[i].allFinite()||F[i].determinant()<=0)throw std::invalid_argument("crack checkpoint: invalid conservative transfer state");
         size_t broken_directed=0;
         for(size_t i=0;i<state.topology.live.size();++i)
         {const auto&row=state.topology.live[i];if(row.size()!=state.identity.neighbor_counts[i])throw std::invalid_argument("crack checkpoint: live-mask neighbor count mismatch");for(auto live:row){if(live>1)throw std::invalid_argument("crack checkpoint: invalid live mask");if(!live){if(broken_directed==std::numeric_limits<size_t>::max())throw std::invalid_argument("crack checkpoint: broken count overflow");++broken_directed;}}}

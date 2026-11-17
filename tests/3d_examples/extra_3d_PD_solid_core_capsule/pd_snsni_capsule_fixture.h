@@ -85,7 +85,7 @@ struct HybridOptions : PDSolidCapsuleOptions
         };
         for(int i=1;i<argc;++i)consume(argv[i]);
         std::vector<char*> ptr;for(auto &a:base)ptr.push_back(a.data());
-        if(fracture_model=="crack_band_energy"&&fracture_scope=="growth")maximum_supported_strain=.5;
+        if((fracture_model=="crack_band_energy"||fracture_model=="extrinsic_cohesive")&&fracture_scope=="growth")maximum_supported_strain=.5;
         else if(fracture_model=="principal_stress"&&fracture_scope=="growth")maximum_supported_strain=.25;
         PDSolidCapsuleOptions::parse(int(ptr.size()),ptr.data());
         if(pd_spacing==0)pd_spacing=spacing;
@@ -96,14 +96,15 @@ struct HybridOptions : PDSolidCapsuleOptions
             throw std::invalid_argument("J2 requires an explicit positive shell-yield-stress; elastic forbids plastic parameters");
         if(fracture_model=="none")
         {if(fracture_scope!="none"||fracture_stress!=0||fracture_energy!=0)throw std::invalid_argument("No-fracture mode forbids active fracture parameters");}
-        else if(fracture_model=="crack_band_energy")
+        else if(fracture_model=="crack_band_energy"||fracture_model=="extrinsic_cohesive")
         {if(fracture_scope!="growth"||(shell_material!="corotated_biot"&&shell_material!="finite_volume_biot")||fracture_stress<=0||fracture_energy<=0||!quadratic_kinematics||interface_order!=2)
             throw std::invalid_argument("crack_band_energy requires corotated_biot, positive strength/Gc, quadratic PD and interface, growth scope");}
         else if(fracture_model!="principal_stress"||(fracture_scope!="first_crack"&&fracture_scope!="growth")||fracture_stress<=0||fracture_energy!=0)
             throw std::invalid_argument("principal_stress requires explicit threshold and first_crack or growth scope");
-        if((shell_material=="corotated_biot"||shell_material=="finite_volume_biot")&&fracture_model!="crack_band_energy")throw std::invalid_argument("Biot energy material currently requires its verified crack-band assembly");
-        if(fracture_kinematics!="volume_deviatoric"&&fracture_kinematics!="directional_contact")throw std::invalid_argument("Unknown fracture kinematics");
+        if((shell_material=="corotated_biot"||shell_material=="finite_volume_biot")&&fracture_model!="crack_band_energy"&&fracture_model!="extrinsic_cohesive")throw std::invalid_argument("Biot energy material currently requires its verified crack-band assembly");
+        if(fracture_kinematics!="volume_deviatoric"&&fracture_kinematics!="directional_contact"&&fracture_kinematics!="physical_cohesive")throw std::invalid_argument("Unknown fracture kinematics");
         if(fracture_kinematics=="directional_contact"&&(fracture_model!="crack_band_energy"||shell_material!="finite_volume_biot"))throw std::invalid_argument("Directional crack contact requires finite_volume_biot and energy crack-band damage");
+        if((fracture_model=="extrinsic_cohesive")!=(fracture_kinematics=="physical_cohesive")||(fracture_model=="extrinsic_cohesive"&&shell_material!="finite_volume_biot"))throw std::invalid_argument("Extrinsic cohesive growth requires physical_cohesive kinematics and finite_volume_biot");
         if(fragment_policy!="error")throw std::invalid_argument("Only fragment-policy=error is allowed: numerical erosion is not a physical fracture parameter");
         if(fracture_scope=="growth"&&fracture_model=="principal_stress"&&(!quadratic_kinematics||interface_order!=2||core_contact_mesh.empty()))
             throw std::invalid_argument("Fracture growth requires quadratic PD, quadratic interface and a core-contact triangulation");
@@ -111,7 +112,7 @@ struct HybridOptions : PDSolidCapsuleOptions
             throw std::invalid_argument("Mixed core/PD reconstruction orders are not qualified for sharp-fracture growth");
         if(postfracture_checkpoint_steps&&(fracture_scope!="growth"||preflight_only||postfracture_checkpoint_steps>max_steps))throw std::invalid_argument("Invalid fracture-growth diagnostic checkpoint");
         if(postfracture_checkpoint_steps&&fracture_model=="crack_band_energy")throw std::invalid_argument("Use energy history outputs for continuous damage diagnostics");
-        if(layered_kinematics&&(interface_order!=2||plate_surface_order!=2||fracture_model!="crack_band_energy"))throw std::invalid_argument("The qualified layered volume path requires quadratic inner/outer traces and energy crack-band damage");
+        if(layered_kinematics&&(interface_order!=2||plate_surface_order!=2||(fracture_model!="crack_band_energy"&&fracture_model!="extrinsic_cohesive")))throw std::invalid_argument("The qualified layered volume path requires quadratic inner/outer traces and energy crack-band damage");
         if(!coated || !quasistatic || material!="dpc" || plate_contact!="outer_surface" ||
             patch_test || rest_test || smoke_test || (shell_layers!=3 && shell_layers!=5) ||
             pd_spacing<=0 || pd_cfl<=0 || pd_cfl>.2 || pd_hourglass<0 ||

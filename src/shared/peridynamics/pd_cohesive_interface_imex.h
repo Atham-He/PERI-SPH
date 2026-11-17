@@ -21,10 +21,13 @@ namespace SPH::peridynamics
  * Theta(delta)=-ft*min(|delta|/dc,1)*delta/|delta|. At kappa=delta=0,
  * P is the closed traction ball, so finite insertion traction does not require
  * an artificial opening, an initial elastic-energy offset, or modified masses.
+ * An optional softening_evaluation is an outer iterate, allowing a converged
+ * fully implicit softening solve; the default remains Scheme B.
  * The caller must independently verify discrete bulk-force/energy transfer at
  * topology insertion. This solver does NOT make an inconsistent insertion valid.
  *
- * B is a FIXED linear signed one-sided surface trace; row.projector optionally
+ * B is a FIXED signed trace Jacobian (scalar MLS weights plus optional full
+ * geometric blocks); row.projector optionally
  * projects that trace (e.g. onto a closed face's tangent plane). Normals, trace
  * support, projection active-set and current geometry are frozen in this solve.
  * A changing normal/projector requires the outer objective geometric derivative
@@ -63,7 +66,11 @@ namespace SPH::peridynamics
 class CohesiveInterfaceIMEX
 {
   public:
-    struct Entry {size_t node=0;Real weight=0;};
+    struct Entry {
+        size_t node=0;Real weight=0;
+        Matd geometric=Matd::Zero();
+        Matd block()const{return weight*Matd::Identity()+geometric;}
+    };
     struct Facet
     {
         std::vector<Entry> entries;
@@ -123,13 +130,16 @@ class CohesiveInterfaceIMEX
             // Canonicalize it: a tolerated non-range offset must never become
             // a physical opening or an adhesion reaction in a zero-rank row.
             f.jump_offset=f.projector*f.jump_offset;
-            std::map<size_t,Real>merged;
+            std::map<size_t,Matd>merged;
             for(const Entry&e:f.entries)
-            {if(e.node>=inverse_mass_.size()||!std::isfinite(e.weight))throw std::invalid_argument("Invalid cohesive MLS trace entry");merged[e.node]+=e.weight;}
-            f.entries.clear();Real weight_sum=0,abs_weight_sum=0;
-            for(const auto&e:merged)if(e.second!=0){f.entries.push_back({e.first,e.second});weight_sum+=e.second;abs_weight_sum+=std::abs(e.second);}
-            if(f.entries.empty()||std::abs(weight_sum)>1e-10*std::max(abs_weight_sum,Real(1)))
-                throw std::invalid_argument("Signed crack trace must reproduce common rigid translation");
+            {
+                if(e.node>=inverse_mass_.size()||!std::isfinite(e.weight)||!e.geometric.allFinite())throw std::invalid_argument("Invalid cohesive trace Jacobian entry");
+                auto it=merged.try_emplace(e.node,Matd::Zero()).first;it->second+=e.block();
+            }
+            f.entries.clear();Matd translation=Matd::Zero();Real absolute_sum=0;
+            for(const auto&e:merged)if(e.second.norm()!=0){f.entries.push_back({e.first,0,e.second});translation+=e.second;absolute_sum+=e.second.norm();}
+            if(f.entries.empty()||translation.norm()>1e-10*std::max(absolute_sum,Real(1)))
+                throw std::invalid_argument("Signed crack Jacobian must reproduce common rigid translation");
         }
     }
 
@@ -137,7 +147,7 @@ class CohesiveInterfaceIMEX
     {
         requireNodes(q);std::vector<Vecd>out(facets_.size(),Vecd::Zero());
         for(size_t k=0;k<facets_.size();++k)
-        {const Facet&f=facets_[k];for(const Entry&e:f.entries)out[k]+=e.weight*q[e.node];out[k]=f.projector*out[k];if(include_offsets)out[k]+=f.jump_offset;}
+        {const Facet&f=facets_[k];for(const Entry&e:f.entries)out[k]+=e.block()*q[e.node];out[k]=f.projector*out[k];if(include_offsets)out[k]+=f.jump_offset;}
         return out;
     }
     std::vector<Vecd> applyBT(const std::vector<Vecd>&v)const
@@ -145,17 +155,17 @@ class CohesiveInterfaceIMEX
         if(v.size()!=facets_.size())throw std::invalid_argument("Wrong cohesive transpose facet count");
         std::vector<Vecd>out(inverse_mass_.size(),Vecd::Zero());
         for(size_t k=0;k<facets_.size();++k)
-        {if(!v[k].allFinite())throw std::invalid_argument("Nonfinite cohesive transpose input");Vecd value=facets_[k].projector.transpose()*v[k];for(const Entry&e:facets_[k].entries)out[e.node]+=e.weight*value;}
+        {if(!v[k].allFinite())throw std::invalid_argument("Nonfinite cohesive transpose input");Vecd value=facets_[k].projector.transpose()*v[k];for(const Entry&e:facets_[k].entries)out[e.node]+=e.block().transpose()*value;}
         return out;
     }
 
     Result solve(const std::vector<Vecd>&qfree,const std::vector<Vecd>&old_jump,
         const std::vector<History>&old_history,Real dt,
-        const std::vector<Vecd>&warm_dual={})const
+        const std::vector<Vecd>&warm_dual={},const std::vector<Vecd>&softening_evaluation={})const
     {
         requireNodes(qfree);const size_t count=facets_.size();
         if(old_jump.size()!=count||old_history.size()!=count||(!warm_dual.empty()&&warm_dual.size()!=count)||
-           !std::isfinite(dt)||dt<=0||!std::isfinite(dt*dt))
+           (!softening_evaluation.empty()&&softening_evaluation.size()!=count)||!std::isfinite(dt)||dt<=0||!std::isfinite(dt*dt))
             throw std::invalid_argument("Invalid cohesive solve state/time step");
         Result result;result.positions=qfree;result.jump=applyB(qfree,true);result.history=old_history;
         result.dual.assign(count,Vecd::Zero());result.softening_traction.assign(count,Vecd::Zero());
@@ -177,7 +187,14 @@ class CohesiveInterfaceIMEX
                 throw std::invalid_argument("Old cohesive maximum opening is smaller than its old jump");
             if(kap>=delta_f)continue;active[k]=true;++result.active_facets;
             compliance[k]=kap/strength;s[k]=sqrt_area[k]*result.jump[k];
-            if(old_r>0)result.softening_traction[k]=-strength*std::min(old_r/delta_f,Real(1))*projected_old_jump[k]/old_r;
+            Vecd theta_jump=projected_old_jump[k];
+            if(!softening_evaluation.empty()){
+                theta_jump=softening_evaluation[k];
+                if(!theta_jump.allFinite()||(f.projector*theta_jump-theta_jump).norm()>1e-10*std::max(delta_f,theta_jump.norm()))throw std::invalid_argument("Invalid outer cohesive softening evaluation");
+                theta_jump=f.projector*theta_jump;
+            }
+            Real theta_radius=theta_jump.stableNorm();
+            if(theta_radius>0)result.softening_traction[k]=-strength*std::min(theta_radius/delta_f,Real(1))*theta_jump/theta_radius;
             theta[k]=sqrt_area[k]*result.softening_traction[k];
             if(!warm_dual.empty()){if(!warm_dual[k].allFinite())throw std::invalid_argument("Nonfinite warm cohesive dual");result.dual[k]=project(warm_dual[k],k,sqrt_area[k]);}
             opening_scale=std::max({opening_scale,result.jump[k].stableNorm(),old_r,kap});
@@ -281,10 +298,10 @@ class CohesiveInterfaceIMEX
     {
         std::vector<Vecd>column_abs_sum(inverse_mass_.size(),Vecd::Zero());
         for(size_t k=0;k<facets_.size();++k)if(active[k])for(const Entry&e:facets_[k].entries)
-            for(size_t d=0;d<3;++d)column_abs_sum[e.node][d]+=sqrt_area[k]*std::abs(e.weight)*facets_[k].projector.col(d).cwiseAbs().sum();
+            for(size_t d=0;d<3;++d)column_abs_sum[e.node][d]+=sqrt_area[k]*(facets_[k].projector*e.block()).col(d).cwiseAbs().sum();
         Real bound=0;
         for(size_t k=0;k<facets_.size();++k)if(active[k])for(size_t a=0;a<3;++a)
-        {Real row=compliance[k];for(const Entry&e:facets_[k].entries)for(size_t d=0;d<3;++d)row+=dt*dt*sqrt_area[k]*std::abs(e.weight*facets_[k].projector(a,d))*inverse_mass_[e.node][d]*column_abs_sum[e.node][d];bound=std::max(bound,row);}
+        {Real row=compliance[k];for(const Entry&e:facets_[k].entries)for(size_t d=0;d<3;++d)row+=dt*dt*sqrt_area[k]*std::abs((facets_[k].projector*e.block())(a,d))*inverse_mass_[e.node][d]*column_abs_sum[e.node][d];bound=std::max(bound,row);}
         if(!std::isfinite(bound))throw std::runtime_error("Nonfinite cohesive IMEX Lipschitz bound");return bound;
     }
 };

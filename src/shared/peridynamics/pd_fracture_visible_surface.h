@@ -21,9 +21,9 @@ class VisibleCrackSurface : public ReferenceSolidSurface
     VisibleCrackSurface(SolidForcePort&p,const StdVec<Vecd>&targets,
                         const StdVec<size_t>&target_anchors,
                         solid_dynamics::PDLayeredFractureReference&r,
-                        Real spacing,Real support_ratio=2.5,unsigned order=2)
+                        Real spacing,Real support_ratio=2.5,unsigned order=2,const StdVec<Vecd>&side_normals={},const StdVec<Vecd>&transfer_values={},const StdVec<Vecd>&transfer_velocities={})
       :ReferenceSolidSurface(p,targets,order,DeferredBuildTag{}),reference_(r),
-       anchors_(target_anchors),original_targets_(targets),dp_(spacing),support_(spacing*support_ratio)
+       anchors_(target_anchors),original_targets_(targets),side_normals_(side_normals),transfer_values_(transfer_values),transfer_velocity_values_(transfer_velocities),dp_(spacing),support_(spacing*support_ratio)
     {
         if(spacing<=0||support_ratio<=1||!std::isfinite(support_)||order<1||order>2)
             throw std::invalid_argument("Invalid one-sided crack trace support/order");
@@ -32,6 +32,9 @@ class VisibleCrackSurface : public ReferenceSolidSurface
         for(size_t i=0;i<p.count;++i)
             if((p.reference[i]-r.X[i]).norm()>128*std::numeric_limits<Real>::epsilon()*std::max(dp_,r.X[i].norm()))
                 throw std::invalid_argument("Force-port and fracture reference coordinates differ");
+        if((!transfer_values_.empty()&&transfer_values_.size()!=targets.size())||(!transfer_velocity_values_.empty()&&transfer_velocity_values_.size()!=targets.size()))throw std::invalid_argument("Crack trace transfer-value dimensions");
+        if(!side_normals_.empty()&&side_normals_.size()!=targets.size())throw std::invalid_argument("Crack trace side-normal dimensions");
+        for(size_t q=0;q<side_normals_.size();++q)if(!side_normals_[q].allFinite()||std::abs(side_normals_[q].norm()-1)>1e-8||(p.reference[anchors_[q]]-targets[q]).dot(side_normals_[q])<=0)throw std::invalid_argument("Crack trace side does not contain its material anchor");
         std::unordered_map<Cell,StdVec<size_t>,Hash>cells;
         for(size_t j=0;j<p.count;++j)cells[cell(p.reference[j])].push_back(j);
         candidate_.resize(targets.size());affected_.resize(p.count);
@@ -53,21 +56,27 @@ class VisibleCrackSurface : public ReferenceSolidSurface
             if(candidate_[q].empty())throw std::runtime_error("No material support for a crack trace");
             for(size_t j:candidate_[q])affected_[j].push_back(q);
         }
+        reference_.registerTraceSupport(support_);
         rebuildAll();
     }
     size_t materialAnchor(size_t q)const{return anchors_.at(q);}
     size_t builtTopologyVersion()const{return version_;}
-    bool isCurrent()const{return version_==reference_.topology_version&&!reference_.topologyPending();}
-    size_t mappingVersion()const override{return version_;}
+    bool isCurrent()const{return version_==reference_.topology_version&&!reference_.topologyPending()&&!transfer_pending_;}
+    size_t mappingVersion()const override{return generation_;}
     void ensureCurrent()const override
     {if(!isCurrent())throw std::runtime_error("One-sided crack surface was not rebuilt after topology change");}
+    const StdVec<Vecd>&transferValues()const{return transfer_values_;}
+    const StdVec<Vecd>&transferVelocities()const{return transfer_velocity_values_;}
+    void captureTransferValues(){ensureCurrent();StdVec<Vecd>next(points.size()),vel(points.size());for(size_t q=0;q<points.size();++q){next[q]=position(q);vel[q]=velocity(q);}transfer_values_=std::move(next);transfer_velocity_values_=std::move(vel);transfer_pending_=true;}
+    void restoreTransferValues(const StdVec<Vecd>&values,const StdVec<Vecd>&velocities={}){if((!values.empty()&&values.size()!=points.size())||(!velocities.empty()&&velocities.size()!=points.size()))throw std::invalid_argument("Restored trace transfer dimensions");transfer_values_=values;transfer_velocity_values_=velocities;transfer_pending_=true;}
     void rebuildAll()
     {
         requireReferenceCurrent();StdVec<size_t>ids(points.size());for(size_t q=0;q<ids.size();++q)ids[q]=q;rebuild(ids);
     }
     void rebuildChanged()
     {
-        requireReferenceCurrent();if(version_==reference_.topology_version)return;
+        requireReferenceCurrent();if(version_==reference_.topology_version&&!transfer_pending_)return;
+        if(transfer_pending_){rebuildAll();return;}
         if(version_+1!=reference_.topology_version){rebuildAll();return;}
         if(reference_.changed_particles.empty())throw std::runtime_error("Crack trace topology changed without an affected-owner list");
         StdVec<unsigned char>marked(points.size(),0);StdVec<size_t>ids;
@@ -87,9 +96,9 @@ class VisibleCrackSurface : public ReferenceSolidSurface
     struct FitInfo {int order=0;Real affine=0,polynomial=0,value=0,condition=0,l1=0;};
     solid_dynamics::PDLayeredFractureReference&reference_;
     StdVec<size_t>anchors_;
-    StdVec<Vecd>original_targets_;
+    StdVec<Vecd>original_targets_,side_normals_,transfer_values_,transfer_velocity_values_;
     Real dp_,support_;
-    size_t version_=~size_t(0);
+    size_t version_=~size_t(0),generation_=0;bool transfer_pending_=false;
     StdVec<StdVec<size_t>>candidate_,affected_;
     StdVec<FitInfo>fit_info_;
     Cell cell(const Vecd&x)const
@@ -141,6 +150,7 @@ class VisibleCrackSurface : public ReferenceSolidSurface
         info.order=N==10?2:1;info.affine=ae;info.polynomial=pe;info.value=functional_error;info.condition=inverse.condition;info.l1=l1;
         return true;
     }
+    bool onSide(size_t q,size_t j)const{return side_normals_.empty()||(port.reference[j]-points[q]).dot(side_normals_[q])>=-128*std::numeric_limits<Real>::epsilon()*dp_;}
     void buildRow(size_t q,Row&row,FitInfo&info)const
     {
         size_t anchor=anchors_[q];
@@ -150,13 +160,13 @@ class VisibleCrackSurface : public ReferenceSolidSurface
         // severBondPair() may legitimately record topology before an explicit
         // surface is available. Never average a disconnected opposite side.
         StdVec<unsigned char>member(port.count,0),connected(port.count,0);
-        for(size_t j:candidate_[q])member[j]=1;
+        for(size_t j:candidate_[q])if(onSide(q,j))member[j]=1;
         StdVec<size_t>queue{anchor};connected[anchor]=1;
         for(size_t k=0;k<queue.size();++k){size_t i=queue[k];const auto&nb=reference_.neighbors(i);for(size_t n=0;n<nb.current_size_;++n){size_t j=nb.j_[n];if(reference_.live(i,n)&&member[j]&&!connected[j]&&reference_.visible(i,j)){connected[j]=1;queue.push_back(j);}}}
         StdVec<size_t>nodes;StdVec<Real>weight;Real total=0;Matd covariance=Matd::Zero();
         for(size_t j:candidate_[q])
         {
-            if(!connected[j]||!reference_.visible(anchor,j)||!reference_.visibleReference(points[q],reference_.X[j]))continue;
+            if(!onSide(q,j)||!connected[j]||!reference_.visible(anchor,j)||!reference_.visibleReference(points[q],reference_.X[j]))continue;
             Vecd z=(port.reference[j]-points[q])/dp_;Real w=std::exp(-z.squaredNorm())*port.volume[j]/std::pow(dp_,3);
             if(!std::isfinite(w)||w<=0)throw std::runtime_error("Nonpositive/underflowed crack trace quadrature weight");
             nodes.push_back(j);weight.push_back(w);total+=w;covariance+=w*z*z.transpose();
@@ -168,9 +178,19 @@ class VisibleCrackSurface : public ReferenceSolidSurface
         bool accepted=reproduction_order==2&&fit<10>(q,nodes,weight,L,row,info);
         if(!accepted)accepted=fit<4>(q,nodes,weight,L,row,info);
         if(!accepted)throw std::runtime_error("One-sided crack trace value functional is unresolved at target "+std::to_string(q)+" (anchor "+std::to_string(anchor)+"); no bonding constraint or material was removed to bypass fit failure");
+        if(!transfer_values_.empty()){
+            if(reference_.transfer_positions.size()!=port.count)throw std::runtime_error("Trace transfer has no matching continuous-state field");
+            const size_t modes=info.order==2?10:4,fields=transfer_velocity_values_.empty()?3:6;Real tau=reference_.transferVelocityTimeScale();if(fields==6&&reference_.transfer_velocity.size()!=port.count)throw std::runtime_error("Missing trace velocity transfer state");Eigen::MatrixXd B(nodes.size(),modes),Y(nodes.size(),fields),G(nodes.size(),1);Eigen::VectorXd W(nodes.size());
+            for(size_t a=0;a<nodes.size();++a){Vecd z=L*((port.reference[nodes[a]]-points[q])/dp_);if(modes==10)B.row(a)=basis<10>(z).transpose();else B.row(a)=basis<4>(z).transpose();Y.block(a,0,1,3)=reference_.transfer_positions[nodes[a]].transpose();if(fields==6)Y.block(a,3,1,3)=tau*reference_.transfer_velocity[nodes[a]].transpose();G(a,0)=row.weight[a];W[a]=weight[a];}
+            Eigen::MatrixXd target(fields,1);target.topRows(3)=transfer_values_[q];if(fields==6)target.bottomRows(3)=tau*transfer_velocity_values_[q];transferReconstruction(B,W,Y,G,target,2e-15);
+            Real sum=0;Vecd affine=Vecd::Zero();Eigen::VectorXd polynomial=Eigen::VectorXd::Zero(modes);info.l1=0;
+            for(size_t a=0;a<nodes.size();++a){row.weight[a]=G(a,0);sum+=row.weight[a];affine+=row.weight[a]*(port.reference[nodes[a]]-points[q])/dp_;polynomial+=row.weight[a]*B.row(a).transpose();info.l1+=std::abs(row.weight[a]);}
+            polynomial[0]-=1;info.affine=std::max(std::abs(sum-1),affine.norm());info.polynomial=polynomial.norm();
+            if(info.affine>1e-8||info.polynomial>1e-8)throw std::runtime_error("State transfer lost crack-trace polynomial consistency");
+        }
         // Check the committed row against current visibility, independently of
         // polynomial reproduction. No weight clipping or post-normalization.
-        for(size_t j:row.index)if(!connected[j]||!reference_.visible(anchor,j)||!reference_.visibleReference(points[q],reference_.X[j]))
+        for(size_t j:row.index)if(!onSide(q,j)||!connected[j]||!reference_.visible(anchor,j)||!reference_.visibleReference(points[q],reference_.X[j]))
             throw std::runtime_error("A crack trace interpolation row crosses its recorded crack geometry");
     }
     void rebuild(const StdVec<size_t>&ids)
@@ -186,7 +206,7 @@ class VisibleCrackSurface : public ReferenceSolidSurface
             affine_points+=f.order==1;affine_error=std::max(affine_error,f.affine);polynomial_error=std::max(polynomial_error,f.polynomial);
             largest_condition_number=std::max(largest_condition_number,f.condition);maximum_value_error=std::max(maximum_value_error,f.value);maximum_weight_l1=std::max(maximum_weight_l1,f.l1);
         }
-        version_=reference_.topology_version;
+        version_=reference_.topology_version;transfer_pending_=false;++generation_;
     }
 };
 }

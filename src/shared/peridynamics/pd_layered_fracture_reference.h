@@ -8,6 +8,7 @@
  * Its use therefore does not by itself validate strength or Gc-controlled growth.
  */
 #include "adaptation.h"
+#include "pd_consistent_reconstruction.h"
 #include "pd_layered_correspondence.h"
 #include <Eigen/Geometry>
 #include <array>
@@ -35,9 +36,9 @@ class PDLayeredFractureReference : public PDLayeredQuadraticReference
     {
         StdVec<StdVec<unsigned char>> live;
         StdVec<CrackFacet> facets;
-        size_t physical_broken_bonds=0;
+        size_t physical_broken_bonds=0;StdVec<Vecd>transfer_positions,transfer_velocity;StdVec<Matd>transfer_gradient;
     };
-    StdVec<Vecd> X;
+    StdVec<Vecd> X,transfer_positions,transfer_velocity;StdVec<Matd>transfer_gradient;
     StdVec<int> degree;
     StdVec<size_t> changed_particles;
     size_t topology_version=0,affine_rows=0,physical_broken_bonds=0;
@@ -87,7 +88,14 @@ class PDLayeredFractureReference : public PDLayeredQuadraticReference
         for(size_t n=0;n<rows.at(anchor).size();++n)if(rows[anchor][n].j==node&&!live(anchor,n))return false;
         return visibleReference(X.at(anchor),X.at(node));
     }
-    bool topologyPending()const{return geometry_changed_||pending_bonds_;}
+    bool topologyPending()const{return geometry_changed_||pending_bonds_||reconstruction_pending_;}
+    void setTransferState(const StdVec<Vecd>&q,const StdVec<Matd>&F,const StdVec<Vecd>&v){
+        if(topologyPending()||q.size()!=X.size()||F.size()!=X.size()||v.size()!=X.size())throw std::invalid_argument("Invalid/overlapping conservative transfer state");
+        for(size_t i=0;i<q.size();++i)if(!q[i].allFinite()||!v[i].allFinite()||!F[i].allFinite()||F[i].determinant()<=0)throw std::invalid_argument("Nonfinite conservative transfer state");
+        transfer_positions=q;transfer_velocity=v;transfer_gradient=F;reconstruction_pending_=true;
+    }
+    Real transferVelocityTimeScale(){auto&mat=DynamicCast<HughesWingetSolid>(this,sph_body_->getMatterMaterial());return sph_body_->getSPHAdaptation().ReferenceSpacing()/mat.ReferenceSoundSpeed();}
+    void registerTraceSupport(Real radius){if(!std::isfinite(radius)||radius<=0)throw std::invalid_argument("Invalid crack visibility support radius");maximum_trace_support_=std::max(maximum_trace_support_,radius);}
 
     /** An energy/growth controller may call this after its OWN physical event
      * check. Rebuilding is explicit, so a batch can be committed atomically. */
@@ -124,7 +132,7 @@ class PDLayeredFractureReference : public PDLayeredQuadraticReference
     }
     TopologyState captureTopology()const
     {
-        requireInitialized();TopologyState t;t.facets=facets_;t.physical_broken_bonds=physical_broken_bonds;t.live.resize(rows.size());
+        requireInitialized();TopologyState t;t.transfer_positions=transfer_positions;t.transfer_velocity=transfer_velocity;t.transfer_gradient=transfer_gradient;t.facets=facets_;t.physical_broken_bonds=physical_broken_bonds;t.live.resize(rows.size());
         for(size_t i=0;i<rows.size();++i){t.live[i].resize(rows[i].size());for(size_t n=0;n<rows[i].size();++n)t.live[i][n]=live(i,n);}
         return t;
     }
@@ -150,11 +158,12 @@ class PDLayeredFractureReference : public PDLayeredQuadraticReference
         const Real old_condition=max_moment_condition,old_reproduction_error=max_reproduction_error;
         const Real old_dt=elastic_dt_bound;
         const bool old_geometry_changed=geometry_changed_,old_pending_bonds=pending_bonds_;
+        const bool old_full_geometry=full_geometry_rebuild_;const size_t old_committed_facets=committed_facets_;const bool old_reconstruction_pending=reconstruction_pending_;
         try
         {
             for(size_t i=0;i<rows.size();++i)for(size_t n=0;n<rows[i].size();++n)
                 inner_configuration_[i].bondLive_[n]=bool(t.live[i][n]);
-            facets_.swap(next_facets);physical_broken_bonds=t.physical_broken_bonds;geometry_changed_=true;
+            transfer_positions=t.transfer_positions;transfer_velocity=t.transfer_velocity;transfer_gradient=t.transfer_gradient;facets_.swap(next_facets);physical_broken_bonds=t.physical_broken_bonds;geometry_changed_=true;full_geometry_rebuild_=true;
             updateAfterFailure();
         }
         catch(...)
@@ -172,7 +181,7 @@ class PDLayeredFractureReference : public PDLayeredQuadraticReference
             maximum_affine_error=old_affine_error;maximum_quadratic_error=old_quadratic_error;
             maximum_gradient_norm=old_gradient_norm;max_surface_functional_error=old_surface_error;
             max_moment_condition=old_condition;max_reproduction_error=old_reproduction_error;elastic_dt_bound=old_dt;
-            geometry_changed_=old_geometry_changed;pending_bonds_=old_pending_bonds;
+            geometry_changed_=old_geometry_changed;pending_bonds_=old_pending_bonds;full_geometry_rebuild_=old_full_geometry;committed_facets_=old_committed_facets;transfer_positions=before.transfer_positions;transfer_velocity=before.transfer_velocity;transfer_gradient=before.transfer_gradient;reconstruction_pending_=old_reconstruction_pending;
             throw;
         }
     }
@@ -180,7 +189,7 @@ class PDLayeredFractureReference : public PDLayeredQuadraticReference
     void updateAfterFailure()
     {
         using namespace peridynamics::layered_detail;
-        requireInitialized();changed_particles.clear();bool changed=geometry_changed_;
+        requireInitialized();changed_particles.clear();bool changed=geometry_changed_||reconstruction_pending_;
         for(size_t i=0;i<rows.size();++i)
         {
             const auto&nb=inner_configuration_[i];bool row_changed=false;
@@ -199,7 +208,22 @@ class PDLayeredFractureReference : public PDLayeredQuadraticReference
         if(!changed){pending_bonds_=false;return;}
         // A new visibility barrier can affect interface traces even if its
         // nearby bonds had already failed. Rebuild trace owners conservatively.
-        if(geometry_changed_){changed_particles.resize(rows.size());for(size_t i=0;i<rows.size();++i)changed_particles[i]=i;}
+        if(geometry_changed_){
+            // Every trace segment is shorter than twice its registered support.
+            // Expanded AABBs conservatively contain all affected endpoints.
+            // Restoring topology still forces a complete visibility rebuild.
+            StdVec<unsigned char>marked(rows.size(),0);for(size_t j:changed_particles)marked[j]=1;
+            bool all=full_geometry_rebuild_||committed_facets_>facets_.size();
+            Real margin=2*std::max(maximum_trace_support_,sph_body_->getSPHAdaptation().getKernel()->CutOffRadius());
+            for(size_t k=committed_facets_;k<facets_.size()&&!all;++k){const auto&f=facets_[k];
+                if(f.kind==CrackFacet::Kind::PlaneDisk&&std::isinf(f.radius)){all=true;break;}
+                Vecd lo,hi;if(f.kind==CrackFacet::Kind::Triangle){lo=hi=f.vertex[0];for(const auto&v:f.vertex){lo=lo.cwiseMin(v);hi=hi.cwiseMax(v);}}else{lo=f.origin-Vecd::Constant(f.radius);hi=f.origin+Vecd::Constant(f.radius);}
+                lo.array()-=margin;hi.array()+=margin;
+                for(size_t i=0;i<X.size();++i)if((X[i].array()>=lo.array()).all()&&(X[i].array()<=hi.array()).all())marked[i]=1;
+            }
+            changed_particles.clear();for(size_t i=0;i<X.size();++i)if(all||marked[i])changed_particles.push_back(i);
+            if(changed_particles.empty()){changed_particles.resize(rows.size());for(size_t i=0;i<rows.size();++i)changed_particles[i]=i;}
+        }
         affine_rows=0;maximum_affine_error=maximum_quadratic_error=maximum_gradient_norm=0;
         minimum_surface_rank=9;max_surface_functional_error=0;max_moment_condition=0;
         Real dp=sph_body_->getSPHAdaptation().ReferenceSpacing();
@@ -253,6 +277,21 @@ class PDLayeredFractureReference : public PDLayeredQuadraticReference
                 size_t n=size_t(it-rows[i].begin());if(!nb.bondLive_[n])throw std::runtime_error("Broken thickness-column support is not representable");
                 it->gradient+=normal*(2/geometry.thickness[column])*geometry.derivative[level][m];
             }
+            if(!transfer_positions.empty()){
+                Matd current=Matd::Zero();for(const auto&e:rows[i])current+=(transfer_positions[e.j]-transfer_positions[i])*e.gradient.transpose();
+                Matd delta=transfer_gradient[i]-current;
+                if(delta.norm()>1e-10*std::max(Real(1),transfer_gradient[i].norm())){
+                    if((delta*normal).norm()>5e-9)throw std::runtime_error("Fracture transfer would alter normal-column kinematics");
+                    StdVec<size_t>ids;for(size_t n=0;n<rows[i].size();++n)if(nb.bondLive_[n]&&geometry.layer_of[rows[i][n].j]==level)ids.push_back(n);
+                    Eigen::MatrixXd B(ids.size(),9),Y(ids.size(),3),G(ids.size(),3);Eigen::VectorXd W(ids.size());
+                    for(size_t a=0;a<ids.size();++a){const auto&e=rows[i][ids[a]];B.row(a)=basis9(L*(X[e.j]-X[i])).transpose();Y.row(a)=(transfer_positions[e.j]-transfer_positions[i]).transpose();G.row(a)=e.gradient.transpose();W[a]=nb.W_ij_[ids[a]]*volume[e.j]/sum;}
+                    Eigen::MatrixXd target=Y.transpose()*G+delta;
+                    peridynamics::transferReconstruction(B,W,Y,G,target,1e-9);
+                    for(size_t a=0;a<ids.size();++a)rows[i][ids[a]].gradient=G.row(a).transpose();
+                }
+                Matd check=Matd::Zero();for(const auto&e:rows[i])check+=(transfer_positions[e.j]-transfer_positions[i])*e.gradient.transpose();
+                if((check-transfer_gradient[i]).norm()>1e-8)throw std::runtime_error("Conservative fracture gradient transfer failed");
+            }
             Matd reproduced=Matd::Zero();
             Eigen::Matrix<Real,9,3>second=Eigen::Matrix<Real,9,3>::Zero(),exact=Eigen::Matrix<Real,9,3>::Zero();exact.topRows<3>()=Matd::Identity()/dp;
             for(const auto&e:rows[i])
@@ -268,7 +307,7 @@ class PDLayeredFractureReference : public PDLayeredQuadraticReference
         max_reproduction_error=std::max(maximum_affine_error,maximum_quadratic_error);
         updateBound();
         for(size_t i=0;i<rows.size();++i)for(size_t n=0;n<rows[i].size();++n)cached_live_[i][n]=inner_configuration_[i].bondLive_[n];
-        geometry_changed_=false;pending_bonds_=false;++topology_version;
+        geometry_changed_=false;pending_bonds_=false;full_geometry_rebuild_=false;committed_facets_=facets_.size();reconstruction_pending_=false;++topology_version;
     }
     size_t topologyVersion()const override{return topology_version;}
     void checkIntact(size_t i)const override
@@ -281,7 +320,7 @@ class PDLayeredFractureReference : public PDLayeredQuadraticReference
     }
 
   private:
-    bool initialized_=false,geometry_changed_=false,pending_bonds_=false;
+    bool initialized_=false,geometry_changed_=false,pending_bonds_=false,reconstruction_pending_=false;bool full_geometry_rebuild_=false;size_t committed_facets_=0;Real maximum_trace_support_=0;
     StdVec<CrackFacet> facets_;
     StdVec<StdVec<unsigned char>> cached_live_;
     Real*broken_fraction;int*reproduction,*bond_count;
@@ -309,6 +348,8 @@ class PDLayeredFractureReference : public PDLayeredQuadraticReference
     }
     void validateTopologyState(const TopologyState&t)const
     {
+        if((!t.transfer_positions.empty()||!t.transfer_gradient.empty()||!t.transfer_velocity.empty())&&(t.transfer_positions.size()!=rows.size()||t.transfer_gradient.size()!=rows.size()||t.transfer_velocity.size()!=rows.size()))throw std::invalid_argument("Restored transfer-state dimensions");
+        for(size_t i=0;i<t.transfer_positions.size();++i)if(!t.transfer_positions[i].allFinite()||!t.transfer_velocity[i].allFinite()||!t.transfer_gradient[i].allFinite()||t.transfer_gradient[i].determinant()<=0)throw std::invalid_argument("Invalid restored conservative transfer state");
         if(t.live.size()!=rows.size())throw std::invalid_argument("Fracture topology restore size");
         // Check every row size before indexing a reciprocal row supplied by t.
         for(size_t i=0;i<rows.size();++i)if(t.live[i].size()!=rows[i].size())

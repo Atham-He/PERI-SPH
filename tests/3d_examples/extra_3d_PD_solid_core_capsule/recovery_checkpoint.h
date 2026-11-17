@@ -63,7 +63,7 @@ class Control {
     static void durable(const fs::path&p){int fd=::open(p.c_str(),O_RDONLY);if(fd<0)throw std::runtime_error("Checkpoint fsync open failed");int code=::fsync(fd);::close(fd);if(code)throw std::runtime_error("Checkpoint fsync failed");}
  public:
     std::string resume,fingerprint;
-    uint64_t stop_step=0;
+    uint64_t stop_step=0,schema_version=2;
     bool take(const std::string&s){
         if(s.rfind("--resume-state=",0)==0)resume=s.substr(15);
         else if(s.rfind("--checkpoint-fingerprint=",0)==0)fingerprint=s.substr(25);
@@ -75,12 +75,12 @@ class Control {
     template<class Transfer>void save(const fs::path&out,const std::vector<std::string>&csv,size_t step,Transfer&&transfer){
         if(!enabled())return;
         auto slot=serial++%2;auto target=out/("checkpoint_"+std::to_string(slot)+".bin"),temp=fs::path(target.string()+".tmp");
-        Archive a(temp,false);uint64_t version=2;std::string magic="PERI_SNSNI_RESTART",identity=fingerprint,folder=fs::absolute(out).string();
+        Archive a(temp,false);uint64_t version=schema_version;std::string magic="PERI_SNSNI_RESTART",identity=fingerprint,folder=fs::absolute(out).string();
         a.fields(magic,version,identity,folder);auto names=csv;a.value(names);
         std::vector<uint64_t>sizes;for(auto&n:names)sizes.push_back(fs::file_size(out/n));a.value(sizes);
         transfer(a);a.finish();durable(temp);fs::rename(temp,target);
         auto manifest=out/"checkpoint.latest.json",mtmp=fs::path(manifest.string()+".tmp");
-        {std::ofstream m(mtmp);m<<"{\"version\":2,\"file\":"<<std::quoted(target.string())<<",\"step\":"<<step<<",\"fingerprint\":"<<std::quoted(fingerprint)<<"}\n";m.flush();if(!m)throw std::runtime_error("Checkpoint manifest write failed");}
+        {std::ofstream m(mtmp);m<<"{\"version\":"<<schema_version<<",\"file\":"<<std::quoted(target.string())<<",\"step\":"<<step<<",\"fingerprint\":"<<std::quoted(fingerprint)<<"}\n";m.flush();if(!m)throw std::runtime_error("Checkpoint manifest write failed");}
         durable(mtmp);fs::rename(mtmp,manifest);last=std::chrono::steady_clock::now();
         std::cout<<"CHECKPOINT step="<<step<<" file="<<target<<std::endl;
     }
@@ -89,7 +89,7 @@ class Control {
         if(!enabled())throw std::runtime_error("Resume requires a pinned input/source fingerprint");
         Archive a(resume,true);std::string magic,identity,folder;uint64_t version=0;
         a.fields(magic,version,identity,folder);
-        if(magic!="PERI_SNSNI_RESTART"||version!=2||identity!=fingerprint)throw std::runtime_error("Checkpoint identity/version mismatch");
+        if(magic!="PERI_SNSNI_RESTART"||version!=schema_version||identity!=fingerprint)throw std::runtime_error("Checkpoint identity/version mismatch");
         std::vector<std::string>names;std::vector<uint64_t>sizes;a.fields(names,sizes);
         if(names!=csv||sizes.size()!=names.size()||fs::absolute(folder)==fs::absolute(out))throw std::runtime_error("Resume must use a fresh output segment and matching CSV schema");
         transfer(a);a.finish();

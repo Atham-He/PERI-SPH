@@ -29,16 +29,18 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
         if(reference.topologyPending())throw std::runtime_error("Rebuild the layered gradient before its live residual");
         using namespace peridynamics::layered_detail;size_t count=particles_->TotalRealParticles();projection.resize(count);residual_order.resize(count);maximum_projection_error=0;StdVec<Real>rate(count,0);
         for(size_t i=0;i<count;++i){
-            const auto&nb=reference.neighbors(i);projection[i].assign(nb.current_size_,Entry{});Real total=0;Matd covariance=Matd::Zero();
+            const auto&nb=reference.neighbors(i);projection[i].assign(nb.current_size_,Entry{});Real total=0,original_total=0;for(size_t n=0;n<nb.current_size_;++n)original_total+=nb.W_ij_[n]*volume[nb.j_[n]];Matd covariance=Matd::Zero();
             for(size_t n=0;n<nb.current_size_;++n)if(reference.live(i,n)){size_t j=nb.j_[n];Vecd z=reference.X[j]-reference.X[i];Real a=nb.W_ij_[n]*volume[j];total+=a;covariance+=a*z*z.transpose();}
             if(total<=0)throw std::runtime_error("No live bulk support; unsupported fragments require a separate verified kinematic model");
             covariance/=total;Eigen::SelfAdjointEigenSolver<Matd>ce(covariance);if(ce.info()!=Eigen::Success||ce.eigenvalues().minCoeff()<=0)throw std::runtime_error("Live residual covariance lacks 3D affine support");
             Matd L=ce.eigenvectors()*ce.eigenvalues().cwiseSqrt().cwiseInverse().asDiagonal()*ce.eigenvectors().transpose();M9 moment=M9::Zero();
-            for(size_t n=0;n<nb.current_size_;++n)if(reference.live(i,n)){auto&e=projection[i][n];Vecd z=L*(reference.X[nb.j_[n]]-reference.X[i]);e.basis<<z[0],z[1],z[2],z[0]*z[0],z[1]*z[1],z[2]*z[2],z[0]*z[1],z[0]*z[2],z[1]*z[2];e.weight=nb.W_ij_[n]*volume[nb.j_[n]]/total;moment+=e.weight*e.basis*e.basis.transpose();}
-            MomentInverse<9> inverse(moment);bool quadratic=inverse.rank==9;residual_order[i]=quadratic?2:1;M9 expected=M9::Zero();if(quadratic)expected.setIdentity();else expected.topLeftCorner<3,3>().setIdentity();
-            Matd affine=moment.topLeftCorner<3,3>();Eigen::LDLT<Matd>asolve(affine);M9 check=M9::Zero();
-            for(size_t n=0;n<nb.current_size_;++n)if(reference.live(i,n)){auto&e=projection[i][n];if(quadratic)e.coefficient=e.weight*inverse.inverse*e.basis;else{e.basis.tail<6>().setZero();e.coefficient.head<3>()=e.weight*asolve.solve(e.basis.head<3>());}check+=e.basis*e.coefficient.transpose();Real k=volume[i]*stabilizer*e.weight;rate[i]+=2*k/mass[i];rate[nb.j_[n]]+=2*k/mass[nb.j_[n]];}
-            Real error=(check-expected).norm();maximum_projection_error=std::max(maximum_projection_error,error);if(error>1e-8)throw std::runtime_error("Live residual polynomial reproduction failed");
+            for(size_t n=0;n<nb.current_size_;++n)if(reference.live(i,n)){auto&e=projection[i][n];Vecd z=L*(reference.X[nb.j_[n]]-reference.X[i]);e.basis<<z[0],z[1],z[2],z[0]*z[0],z[1]*z[1],z[2]*z[2],z[0]*z[1],z[0]*z[2],z[1]*z[2];e.weight=nb.W_ij_[n]*volume[nb.j_[n]]/original_total;moment+=e.weight*e.basis*e.basis.transpose();}
+            // The LS fitted values are unique even when the quadratic
+            // coefficients are not. Retain their represented span; do not
+            // introduce a stiffer affine residual on damaged supports.
+            MomentInverse<9> inverse(moment);residual_order[i]=2;
+            for(size_t n=0;n<nb.current_size_;++n)if(reference.live(i,n)){auto&e=projection[i][n];e.coefficient=e.weight*inverse.inverse*e.basis;Real k=volume[i]*stabilizer*e.weight;rate[i]+=2*k/mass[i];rate[nb.j_[n]]+=2*k/mass[nb.j_[n]];}
+            Real error=(moment*inverse.inverse*moment-moment).norm()/moment.norm();maximum_projection_error=std::max(maximum_projection_error,error);if(error>1e-8)throw std::runtime_error("Live residual least-squares projection failed");
         }
         Real largest=0;for(Real a:rate)largest=std::max(largest,a);stabilizer_dt=largest>0?.2/std::sqrt(largest):std::numeric_limits<Real>::infinity();version=reference.topology_version;
     }

@@ -1,10 +1,15 @@
 #pragma once
 #include "data_type.h"
 #include <Eigen/Eigenvalues>
+#include <Eigen/SVD>
 #include <stdexcept>
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <cstdlib>
+#include <fstream>
+#include <iomanip>
+#include <sstream>
 namespace SPH::peridynamics {
 /** Minimum weighted change of a discrete reconstruction, subject to its old
  * polynomial moments AND a transferred continuous-state functional.
@@ -29,15 +34,28 @@ inline void transferReconstruction(const Eigen::MatrixXd&B,const Eigen::VectorXd
     auto values=eig.eigenvalues();M inverse=M::Zero(moment.rows(),moment.cols());Real largest=values.maxCoeff();
     for(int i=0;i<values.size();++i)if(values[i]>1e-12*largest)inverse.noalias()+=eig.eigenvectors().col(i)*eig.eigenvectors().col(i).transpose()/values[i];
     M residual=Y-B*(inverse*(B.transpose()*W.asDiagonal()*Y));
+    // Reorthogonalize small non-polynomial fields without subtracting two
+    // large coordinate fields again. Normal-equation cancellation must not
+    // turn an exact transfer constraint into apparent missing support.
+    for(int pass=0;pass<2;++pass)residual-=B*(inverse*(B.transpose()*W.asDiagonal()*residual));
     Eigen::VectorXd scale=Eigen::VectorXd::Zero(Y.cols());
     for(int j=0;j<Y.cols();++j){Real data_scale=Y.col(j).norm()/std::sqrt(Real(Y.rows()));Real rms=std::sqrt((residual.col(j).array().square()*W.array()).sum());if(rms>1024*std::numeric_limits<Real>::epsilon()*std::max(data_scale,Real(1e-30)))scale[j]=1/rms;}
-    M Z=residual*scale.asDiagonal();M gram=Z.transpose()*W.asDiagonal()*Z;
-    Eigen::SelfAdjointEigenSolver<M> e(gram);if(e.info()!=Eigen::Success)throw std::runtime_error("Constrained GMLS transfer factorization");
-    M pinv=M::Zero(Y.cols(),Y.cols());Real max=e.eigenvalues().maxCoeff();for(int j=0;j<Y.cols();++j)if(e.eigenvalues()[j]>1e-11*max)pinv.noalias()+=e.eigenvectors().col(j)*e.eigenvectors().col(j).transpose()/e.eigenvalues()[j];
-    M correction=W.asDiagonal()*Z*pinv*scale.asDiagonal()*error;
-    if(!correction.allFinite()||(B.transpose()*correction).norm()>1e-8*std::max(Real(1),G.norm()))throw std::runtime_error("Conservative reconstruction violates polynomial consistency");
-    M next=G+correction;
-    if((Y.transpose()*next-target).norm()>tolerance)throw std::runtime_error("Live support cannot transfer the continuous state consistently; no forces or positions were corrected");
+    M Z=residual*scale.asDiagonal(),weighted=W.cwiseSqrt().asDiagonal()*Z;
+    // Direct singular values avoid squaring the conditioning of transferred
+    // fields that can be almost polynomial or mutually dependent.
+    Eigen::JacobiSVD<M> svd(weighted,Eigen::ComputeThinU|Eigen::ComputeThinV);svd.setThreshold(1e-12);
+    M right_inverse=W.cwiseSqrt().asDiagonal()*svd.matrixU()*svd.singularValues().unaryExpr([&](Real v){return v>1e-12*svd.singularValues().maxCoeff()?1/v:0;}).asDiagonal()*svd.matrixV().transpose()*scale.asDiagonal();
+    M next=G;
+    for(int iteration=0;iteration<5;++iteration){M remaining=target-Y.transpose()*next;if(remaining.norm()<=tolerance)break;M correction=right_inverse*remaining;
+        // Iterative refinement of the SAME constrained linear problem.
+        correction-=W.asDiagonal()*B*(inverse*(B.transpose()*correction));
+        if(!correction.allFinite())throw std::runtime_error("Nonfinite conservative reconstruction correction");next+=correction;
+    }
+    M change=next-G;Real polynomial_error=(B.transpose()*change).norm(),transfer_error=(Y.transpose()*next-target).norm();
+    if(!next.allFinite()||polynomial_error>1e-8*std::max(Real(1),G.norm())||transfer_error>tolerance){
+        if(const char*path=std::getenv("PERI_TRANSFER_AUDIT_FILE")){std::ifstream existing(path);if(!existing.good()){std::ofstream f(path);f<<std::setprecision(17)<<B.rows()<<' '<<B.cols()<<' '<<Y.cols()<<' '<<G.cols()<<' '<<tolerance<<'\n';auto matrix=[&](const auto&a){f<<a.rows()<<' '<<a.cols()<<'\n'<<a<<'\n';};matrix(B);matrix(W);matrix(Y);matrix(G);matrix(target);matrix(next);matrix(svd.singularValues());}}
+        std::ostringstream message;message<<std::setprecision(17)<<"Conservative reconstruction unresolved: state_error="<<transfer_error<<", tolerance="<<tolerance<<", polynomial_error="<<polynomial_error<<", fields="<<Y.cols()<<", rank="<<svd.rank();throw std::runtime_error(message.str());
+    }
     G=std::move(next);
 }
 }

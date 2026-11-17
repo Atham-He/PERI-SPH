@@ -63,9 +63,10 @@ class Control {
     static void durable(const fs::path&p){int fd=::open(p.c_str(),O_RDONLY);if(fd<0)throw std::runtime_error("Checkpoint fsync open failed");int code=::fsync(fd);::close(fd);if(code)throw std::runtime_error("Checkpoint fsync failed");}
  public:
     std::string resume,fingerprint;
-    uint64_t stop_step=0,schema_version=2;
+    uint64_t stop_step=0,schema_version=2;bool stop_after_equilibrium=false;
     bool take(const std::string&s){
-        if(s.rfind("--resume-state=",0)==0)resume=s.substr(15);
+        if(s=="--checkpoint-stop-after-equilibrium")stop_after_equilibrium=true;
+        else if(s.rfind("--resume-state=",0)==0)resume=s.substr(15);
         else if(s.rfind("--checkpoint-fingerprint=",0)==0)fingerprint=s.substr(25);
         else if(s.rfind("--checkpoint-stop-step=",0)==0)stop_step=std::stoull(s.substr(23));
         else return false;return true;

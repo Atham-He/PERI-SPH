@@ -3,6 +3,10 @@
 #include "pd_solid_reference_coupling.h"
 #include <array>
 #include <map>
+#include <fstream>
+#include <iomanip>
+#include <cstdlib>
+#include <sstream>
 
 namespace SPH::peridynamics::cohesive_geometry_detail {
 template<size_t N>struct Jet {
@@ -52,7 +56,7 @@ class CohesiveSurfaceEvolution {
         if(!std::isfinite(ft)||!std::isfinite(Gc)||std::min(ft,Gc)<=0)throw std::invalid_argument("Invalid extrinsic cohesive inputs");
         for(const auto&a:q){if(!std::isfinite(a.area)||a.area<=0)throw std::invalid_argument("Invalid cohesive reference area");for(const auto&t:a.trace)if(!t.surface||t.point>=t.surface->rows.size())throw std::invalid_argument("Invalid cohesive geometry trace");}
     }
-    Geometry geometry(size_t k,const Field&q)const {
+    Geometry geometry(size_t k,const Field&q,Real zero_opening_tolerance=0)const {
         using J=cohesive_geometry_detail::Jet<15>;
         const auto&facet=quadrature.at(k);std::array<std::array<J,3>,5>a;
         for(size_t j=0;j<5;++j){const auto&t=facet.trace[j];t.surface->ensureCurrent();Vecd x=Vecd::Zero();const auto&row=t.surface->rows[t.point];
@@ -65,7 +69,7 @@ class CohesiveSurfaceEvolution {
         for(const auto&z:n)norm2=norm2+z*z;
         if(norm2.v<=0||!std::isfinite(norm2.v))throw std::runtime_error("Cohesive face normal lost geometric rank");
         J norm=cohesive_geometry_detail::sqrt(norm2);for(auto&z:n)z=z/norm;J gn(0);for(size_t d=0;d<3;++d)gn=gn+jump[d]*n[d];
-        for(size_t d=0;d<3;++d)effective[d]=gn.v>=0?jump[d]:jump[d]-gn*n[d];
+        for(size_t d=0;d<3;++d)effective[d]=gn.v>=-zero_opening_tolerance?jump[d]:jump[d]-gn*n[d];
         Geometry g;g.normal_gap=gn.v;g.linear.reference_area=facet.area;std::map<size_t,Matd>nodes;
         for(size_t d=0;d<3;++d){g.jump[d]=effective[d].v;g.normal[d]=n[d].v;}
         for(size_t j=0;j<5;++j){Matd derivative;for(size_t d=0;d<3;++d)for(size_t e=0;e<3;++e)derivative(d,e)=effective[d].d[3*j+e];const auto&t=facet.trace[j];const auto&row=t.surface->rows[t.point];
@@ -84,21 +88,32 @@ class CohesiveSurfaceEvolution {
         for(size_t k=0;k<old.size();++k){previous_jump[k]=geometry(k,qold).jump;
             if(old[k].kappa==0&&previous_jump[k].norm()<=tolerance)previous_jump[k].setZero();
             if(previous_jump[k].norm()>old[k].kappa+tolerance&&old[k].kappa<delta_f)throw std::runtime_error("Cohesive committed history below previous opening");}
-        CohesiveInterfaceIMEX::Result inner;
+        CohesiveInterfaceIMEX::Result inner;std::ostringstream audit; audit<<std::setprecision(17);Real last_change=0,last_geometry_error=0;
         for(size_t outer=1;outer<=max_outer_iterations;++outer){std::vector<CohesiveInterfaceIMEX::Facet>linear;Field theta;
-            for(size_t k=0;k<old.size();++k){auto g=geometry(k,iterate);if(old[k].kappa==0&&g.normal_gap<0&&g.jump.norm()<=tolerance){g.linear.projector=Matd::Identity()-g.normal*g.normal.transpose();g.linear.jump_offset=g.linear.projector*g.linear.jump_offset;g.jump=g.linear.projector*g.jump;}linear.push_back(g.linear);theta.push_back(g.jump);}
+            for(size_t k=0;k<old.size();++k){Real zero=old[k].kappa==0?tolerance:0;auto g=geometry(k,iterate,zero);
+                // At zero opening the correct subgradient is the tensile
+                // half-ball. Treat only the existing convergence-sized zero
+                // neighbourhood as that boundary; do not alternate unilateral
+                // branches on round-off-sized signed gaps.
+                g.linear.traction_halfspace_normal=g.normal;
+                if(g.normal_gap< -zero){g.linear.projector=Matd::Identity()-g.normal*g.normal.transpose();g.linear.jump_offset=g.linear.projector*g.linear.jump_offset;g.jump=g.linear.projector*g.jump;}
+                linear.push_back(g.linear);Vecd soft=g.jump;if(g.normal_gap<0)soft-=g.normal*g.normal.dot(soft);theta.push_back(soft);}
             CohesiveInterfaceIMEX::Options options;options.absolute_opening_tolerance=absolute_tolerance*.05;options.relative_tolerance=relative_tolerance*.05;
             CohesiveInterfaceIMEX solver(ft,Gc,inverse_mass,linear,options);
             inner=solver.solve(qfree,previous_jump,old,dt,warm,theta);result.dual_iterations+=inner.iterations;
             Real change=0,geometry_error=0;for(size_t i=0;i<iterate.size();++i)change=std::max(change,(inner.positions[i]-iterate[i]).norm());
             for(size_t k=0;k<old.size();++k)geometry_error=std::max(geometry_error,(geometry(k,inner.positions).jump-inner.jump[k]).norm());
+            last_change=change;last_geometry_error=geometry_error;
+            if(std::getenv("PERI_COHESIVE_AUDIT_FILE")){audit<<"OUTER "<<outer<<" change "<<change<<" geometry "<<geometry_error<<" innerKKT "<<inner.projected_opening_residual<<'\n';for(size_t k=0;k<old.size();++k){auto g=geometry(k,inner.positions);audit<<k<<" gn "<<g.normal_gap<<" jump "<<g.jump.transpose()<<" traction "<<inner.traction[k].transpose()<<" kappa "<<old[k].kappa<<'\n';}}
             iterate=inner.positions;warm=inner.dual;result.outer_iterations=outer;
             if(change<=tolerance&&geometry_error<=tolerance){result.converged=true;break;}
         }
-        if(!result.converged)throw std::runtime_error("Nonlinear objective cohesive drift did not converge; history unchanged");
+        if(!result.converged){
+            if(const char*path=std::getenv("PERI_COHESIVE_AUDIT_FILE")){std::ofstream f(path);f<<std::setprecision(17)<<"COHESIVE_REPLAY_V1 "<<qfree.size()<<' '<<old.size()<<' '<<ft<<' '<<Gc<<' '<<dt<<'\n';for(size_t i=0;i<qfree.size();++i)f<<qfree[i].transpose()<<' '<<qold[i].transpose()<<' '<<inverse_mass[i].transpose()<<'\n';for(size_t k=0;k<old.size();++k){f<<quadrature[k].area<<' '<<old[k].kappa<<'\n';for(const auto&v:quadrature[k].trace){const auto&r=v.surface->rows[v.point];f<<r.index.size();for(size_t j=0;j<r.index.size();++j)f<<' '<<r.index[j]<<' '<<r.weight[j];f<<'\n';}}f<<audit.str();}
+            std::ostringstream message;message<<std::setprecision(17)<<"Nonlinear objective cohesive drift did not converge; history unchanged; change="<<last_change<<" geometry="<<last_geometry_error<<" KKT="<<inner.projected_opening_residual;throw std::runtime_error(message.str());}
         result.positions=iterate;result.force.assign(iterate.size(),Vecd::Zero());result.history=old;
         Vecd resultant=Vecd::Zero(),torque=Vecd::Zero();Real force_scale=0,length=0;
-        for(size_t k=0;k<old.size();++k){auto g=geometry(k,iterate);Real r=g.jump.norm(),kap=std::max(old[k].kappa,r);Vecd traction;
+        for(size_t k=0;k<old.size();++k){auto g=geometry(k,iterate,old[k].kappa==0?tolerance:0);Real r=g.jump.norm(),kap=std::max(old[k].kappa,r);Vecd traction;
             // Interior dual + zero opening is the set-valued intact state, not
             // irreversible damage caused by linear-solver round-off.
             bool adhered=old[k].kappa==0&&r<=tolerance&&inner.monotone_traction[k].norm()<ft*(1-1e-7);

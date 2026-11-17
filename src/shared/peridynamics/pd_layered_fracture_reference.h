@@ -286,7 +286,7 @@ class PDLayeredFractureReference : public PDLayeredQuadraticReference
                     Eigen::MatrixXd B(ids.size(),9),Y(ids.size(),3),G(ids.size(),3);Eigen::VectorXd W(ids.size());
                     for(size_t a=0;a<ids.size();++a){const auto&e=rows[i][ids[a]];B.row(a)=basis9(L*(X[e.j]-X[i])).transpose();Y.row(a)=(transfer_positions[e.j]-transfer_positions[i]).transpose();G.row(a)=e.gradient.transpose();W[a]=nb.W_ij_[ids[a]]*volume[e.j]/sum;}
                     Eigen::MatrixXd target=Y.transpose()*G+delta;
-                    peridynamics::transferReconstruction(B,W,Y,G,target,1e-9);
+                    try{peridynamics::transferReconstruction(B,W,Y,G,target,1e-9);}catch(const std::exception&e){throw std::runtime_error("Gradient transfer particle "+std::to_string(i)+": "+e.what());}
                     for(size_t a=0;a<ids.size();++a)rows[i][ids[a]].gradient=G.row(a).transpose();
                 }
                 Matd check=Matd::Zero();for(const auto&e:rows[i])check+=(transfer_positions[e.j]-transfer_positions[i])*e.gradient.transpose();

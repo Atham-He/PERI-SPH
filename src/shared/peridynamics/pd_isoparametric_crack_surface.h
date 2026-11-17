@@ -3,28 +3,44 @@
 #include <array>
 #include <unordered_map>
 #include <map>
+#include <sstream>
+#include <iomanip>
 namespace SPH::peridynamics {
 struct BilinearCrackGeometry {
     using Param=Eigen::Vector2d;
     struct Value {std::array<Real,4>N,Nu,Nv,Nuv;Vecd x=Vecd::Zero(),u=Vecd::Zero(),v=Vecd::Zero(),uv=Vecd::Zero();};
     static Value evaluate(const std::array<Vecd,4>&x,const Param&p){Real s=p[0],t=p[1];Value a;
         a.N={(1-s)*(1-t),s*(1-t),s*t,(1-s)*t};a.Nu={-(1-t),1-t,t,-t};a.Nv={-(1-s),-s,s,1-s};a.Nuv={1,-1,1,-1};
-        for(size_t i=0;i<4;++i){a.x+=a.N[i]*x[i];a.u+=a.Nu[i]*x[i];a.v+=a.Nv[i]*x[i];a.uv+=a.Nuv[i]*x[i];}return a;
+        Vecd e=x[1]-x[0],f=x[3]-x[0],warp=(x[2]-x[3])-e;a.x=x[0]+s*e+t*f+s*t*warp;a.u=e+t*warp;a.v=f+s*warp;a.uv=warp;return a;
     }
-    static Param closest(const std::array<Vecd,4>&x,const Vecd&q,Param p=Param(.5,.5)){
+    static Param closest(const std::array<Vecd,4>&global,const Vecd&point,Param p=Param(.5,.5)){
+        // Translate once before the Newton solve. Thin rotated faces must not
+        // lose stationarity through subtraction of large global coordinates.
+        std::array<Vecd,4>x;for(size_t i=0;i<4;++i)x[i]=global[i]-global[0];Vecd q=point-global[0];
+        Real coordinate_scale=std::max({q.norm(),x[1].norm(),x[2].norm(),x[3].norm(),Real(1e-30)});
         for(size_t iteration=0;iteration<40;++iteration){auto a=evaluate(x,p);Vecd r=q-a.x;Eigen::Matrix2d H;H<<a.u.squaredNorm(),a.u.dot(a.v)-r.dot(a.uv),a.u.dot(a.v)-r.dot(a.uv),a.v.squaredNorm();
             Real scale=std::max(a.u.squaredNorm(),a.v.squaredNorm());if(!std::isfinite(scale)||scale<=0)throw std::runtime_error("Crack contact surface has no geometric rank");
-            Param gradient(a.u.dot(r),a.v.dot(r));Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> e(H);
+            Param gradient(a.u.dot(r),a.v.dot(r));
+            Real roundoff=64*std::numeric_limits<Real>::epsilon()*coordinate_scale;
+            if(std::abs(gradient[0])<=roundoff*a.u.norm()&&std::abs(gradient[1])<=roundoff*a.v.norm())return p;
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d> e(H);
             if(e.info()!=Eigen::Success)throw std::runtime_error("Crack projection factorization");
             if(e.eigenvalues().minCoeff()<=1e-13*scale){H<<a.u.squaredNorm(),a.u.dot(a.v),a.u.dot(a.v),a.v.squaredNorm();}
             if(H.determinant()<=1e-14*scale*scale)throw std::runtime_error("Crack contact patch is geometrically unresolved");
             Param step=H.ldlt().solve(gradient);if(!step.allFinite())throw std::runtime_error("Nonfinite closest crack projection");
             if(step.norm()<2e-12)return p;
-            Real old=r.squaredNorm(),alpha=1;bool accepted=false;
-            for(size_t line=0;line<25;++line){Param trial=p+alpha*step;Real value=(q-evaluate(x,trial).x).squaredNorm();if(value<=old*(1+1e-14)){p=trial;accepted=true;break;}alpha*=.5;}
+            Real alpha=1;bool accepted=false;
+            for(size_t line=0;line<25;++line){Param d=alpha*step;
+                // Exact difference of squared distances in the local bilinear
+                // increment. Comparing two nearly equal |r|^2 values stalls
+                // thin rotated faces before their tangential Newton correction.
+                Vecd dx=d[0]*a.u+d[1]*a.v+d[0]*d[1]*a.uv;
+                Real change=dx.squaredNorm()-2*r.dot(dx);
+                Real rounding=64*std::numeric_limits<Real>::epsilon()*(dx.squaredNorm()+2*r.cwiseAbs().dot(dx.cwiseAbs()));
+                if(change<=rounding){p+=d;accepted=true;break;}alpha*=.5;}
             if(!accepted){if(gradient.norm()<1e-12*scale)return p;throw std::runtime_error("Closest crack projection failed its descent check");}
         }
-        throw std::runtime_error("Closest crack-surface projection did not converge");
+        std::ostringstream message;message<<std::setprecision(17)<<"Closest crack-surface projection did not converge; local_q "<<q.transpose()<<" param "<<p.transpose()<<" corners ";for(const auto&v:x)message<<v.transpose()<<" / ";throw std::runtime_error(message.str());
     }
 };
 /** One surface finite element whose corner DOFs are one-sided bulk traces.

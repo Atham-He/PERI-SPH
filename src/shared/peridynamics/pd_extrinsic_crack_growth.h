@@ -89,19 +89,19 @@ class ExtrinsicCrackGrowth {
     }
     static std::vector<Candidate>readBank(const std::string&file,const LayeredParticleGeometry&geometry){
         std::ifstream f(file);std::string magic;size_t count=0,columns=0;f>>magic>>count>>columns;
-        if(magic!="PD_COHESIVE_BANK_V1"||columns!=geometry.columns.size()||count==0||count>1000000)throw std::runtime_error("Invalid physical crack bank schema/geometry");
+        if(magic!="PD_COHESIVE_BANK_V2"||columns!=geometry.columns.size()||count==0||count>1000000)throw std::runtime_error("Invalid physical crack bank schema/geometry");
         std::vector<Candidate>bank;std::set<uint64_t>ids;
-        for(size_t i=0;i<count;++i){Candidate c;size_t minus=0,plus=0,nb=0,nq=0;f>>c.id>>minus>>plus>>nb>>nq;
-            if(!ids.insert(c.id).second||minus>=columns||plus>=columns||minus==plus||nb==0||nb>4||nq==0||nq>32)throw std::runtime_error("Invalid physical crack bank patch");
+        for(size_t i=0;i<count;++i){Candidate c;size_t nb=0,nq=0,ns=0;f>>c.id>>nb>>nq>>ns;
+            if(!ids.insert(c.id).second||nb==0||nb>4||nq==0||nq>32||ns==0||ns>32)throw std::runtime_error("Invalid crack bank patch");
             auto point=[&](Vecd&v){f>>v[0]>>v[1]>>v[2];if(!f||!v.allFinite())throw std::runtime_error("Invalid crack bank coordinate");};
             for(auto&v:c.vertex)point(v);c.normal=(c.vertex[1]-c.vertex[0]).cross(c.vertex[2]-c.vertex[0]).normalized();
-            Vecd direction=geometry.reference[geometry.columns[plus][0]]-geometry.reference[geometry.columns[minus][0]];
-            if(!c.normal.allFinite()||c.normal.dot(direction)<=0)throw std::runtime_error("Crack bank normal/owner mismatch");
-            c.barrier.resize(nb);for(auto&t:c.barrier)for(auto&v:t)point(v);
-            c.point.resize(nq);c.area.resize(nq);for(size_t q=0;q<nq;++q){point(c.point[q]);f>>c.area[q];if(!f||!std::isfinite(c.area[q])||c.area[q]<=0)throw std::runtime_error("Invalid crack bank area");}
-            for(size_t l=0;l<geometry.columns[minus].size();++l)c.stress_pairs.push_back({geometry.columns[minus][l],geometry.columns[plus][l]});bank.push_back(c);
+            if(!c.normal.allFinite())throw std::runtime_error("Degenerate crack-bank face");
+            c.barrier.resize(nb);for(auto&t:c.barrier)for(auto&v:t)point(v);c.point.resize(nq);c.area.resize(nq);
+            for(size_t q=0;q<nq;++q){point(c.point[q]);f>>c.area[q];if(!f||!std::isfinite(c.area[q])||c.area[q]<=0)throw std::runtime_error("Invalid crack area");}
+            for(size_t j=0;j<ns;++j){size_t minus=0,plus=0;f>>minus>>plus;if(!f||minus>=geometry.reference.size()||plus>=geometry.reference.size()||geometry.layer_of[minus]!=geometry.layer_of[plus]||(geometry.reference[plus]-geometry.reference[minus]).dot(c.normal)<=0)throw std::runtime_error("Crack bank stress-sample side/layer mismatch");c.stress_pairs.push_back({minus,plus});}
+            bank.push_back(c);
         }
-        std::string extra;if(f>>extra)throw std::runtime_error("Trailing physical crack bank input");return bank;
+        std::string extra;if(f>>extra)throw std::runtime_error("Trailing crack bank input");return bank;
     }
     /** totalEnergy returns bulk+surface+contact+external constraint recoverable
      * energy. q/v/plastic histories stay fixed throughout this topology event. */
@@ -137,7 +137,7 @@ class ExtrinsicCrackGrowth {
     }
     Field cohesiveForces(const Field&q)const {
         Field f(q.size(),Vecd::Zero());CohesiveSurfaceEvolution model(ft,Gc,quadrature());
-        for(size_t k=0;k<history.size();++k){auto g=model.geometry(k,q);Real kap=history[k].kappa;Vecd t=Vecd::Zero();if(kap>0&&kap<delta_f)t=ft*(1/kap-1/delta_f)*g.jump;else if(kap==0&&k<last_traction.size())t=last_traction[k];for(const auto&e:g.linear.entries)f[e.node]-=model.quadrature[k].area*e.block().transpose()*t;}
+        for(size_t k=0;k<history.size();++k){Real kap=history[k].kappa;auto g=model.geometry(k,q,kap==0?model.absolute_tolerance+model.relative_tolerance*delta_f:0);Vecd t=Vecd::Zero();if(kap>0&&kap<delta_f)t=ft*(1/kap-1/delta_f)*g.jump;else if(kap==0&&k<last_traction.size())t=last_traction[k];for(const auto&e:g.linear.entries)f[e.node]-=model.quadrature[k].area*e.block().transpose()*t;}
         return f;
     }
     void applyContact(){

@@ -77,6 +77,7 @@ class CohesiveInterfaceIMEX
         Real reference_area=0;
         Matd projector=Matd::Identity();
         Vecd jump_offset=Vecd::Zero(); // projected fixed affine offset, in m
+        Vecd traction_halfspace_normal=Vecd::Zero(); // optional t.n >= 0, within projector range
     };
     struct History {Real kappa=0;};
     struct Options
@@ -129,6 +130,7 @@ class CohesiveInterfaceIMEX
             // The tolerance admits only round-off in supplied projected data.
             // Canonicalize it: a tolerated non-range offset must never become
             // a physical opening or an adhesion reaction in a zero-rank row.
+            if(!f.traction_halfspace_normal.allFinite()||(f.traction_halfspace_normal.norm()!=0&&std::abs(f.traction_halfspace_normal.norm()-1)>1e-10))throw std::invalid_argument("Invalid unilateral cohesive dual normal");
             f.jump_offset=f.projector*f.jump_offset;
             std::map<size_t,Matd>merged;
             for(const Entry&e:f.entries)
@@ -193,7 +195,7 @@ class CohesiveInterfaceIMEX
                 if(!theta_jump.allFinite()||(f.projector*theta_jump-theta_jump).norm()>1e-10*std::max(delta_f,theta_jump.norm()))throw std::invalid_argument("Invalid outer cohesive softening evaluation");
                 theta_jump=f.projector*theta_jump;
             }
-            Real theta_radius=theta_jump.stableNorm();
+            theta_jump=effectiveOpening(theta_jump,k);Real theta_radius=theta_jump.stableNorm();
             if(theta_radius>0)result.softening_traction[k]=-strength*std::min(theta_radius/delta_f,Real(1))*theta_jump/theta_radius;
             theta[k]=sqrt_area[k]*result.softening_traction[k];
             if(!warm_dual.empty()){if(!warm_dual[k].allFinite())throw std::invalid_argument("Nonfinite warm cohesive dual");result.dual[k]=project(warm_dual[k],k,sqrt_area[k]);}
@@ -253,13 +255,13 @@ class CohesiveInterfaceIMEX
         for(size_t k=0;k<count;++k)if(active[k])
         {result.monotone_traction[k]=result.dual[k]/sqrt_area[k];result.traction[k]=result.monotone_traction[k]+result.softening_traction[k];surface_force[k]=-facets_[k].reference_area*result.traction[k];Real range_error=(result.monotone_traction[k]-facets_[k].projector*result.monotone_traction[k]).stableNorm();
          result.maximum_dual_range_error=std::max(result.maximum_dual_range_error,range_error);
-         result.maximum_dual_constraint_error=std::max({result.maximum_dual_constraint_error,range_error,std::max(Real(0),result.monotone_traction[k].stableNorm()-strength)});}
+         result.maximum_dual_constraint_error=std::max({result.maximum_dual_constraint_error,range_error,std::max(Real(0),result.monotone_traction[k].stableNorm()-strength),std::max(Real(0),-result.monotone_traction[k].dot(facets_[k].traction_halfspace_normal))});}
         if(result.maximum_dual_constraint_error>strength*(options_.relative_tolerance+256*std::numeric_limits<Real>::epsilon()))
             throw std::runtime_error("Cohesive IMEX dual violates its ball/range feasibility tolerance");
         result.nodal_force=applyBT(surface_force);result.correction.assign(qfree.size(),Vecd::Zero());
         for(size_t i=0;i<qfree.size();++i)
         {result.correction[i]=dt*dt*inverse_mass_[i].cwiseProduct(result.nodal_force[i]);result.positions[i]+=result.correction[i];if(!result.positions[i].allFinite())throw std::runtime_error("Nonfinite cohesive corrected position");}
-        result.jump=applyB(result.positions,true);
+        result.jump=applyB(result.positions,true);for(size_t k=0;k<count;++k)result.jump[k]=effectiveOpening(result.jump[k],k);
         for(size_t k=0;k<count;++k)
         {
             Real old_k=old_history[k].kappa,new_k=std::max(old_k,result.jump[k].stableNorm()),A=facets_[k].reference_area;
@@ -290,7 +292,15 @@ class CohesiveInterfaceIMEX
     void requireNodes(const std::vector<Vecd>&q)const
     {if(q.size()!=inverse_mass_.size())throw std::invalid_argument("Wrong cohesive nodal vector count");for(const Vecd&v:q)if(!v.allFinite())throw std::invalid_argument("Nonfinite cohesive nodal state");}
     Vecd project(const Vecd&z,size_t k,Real sqrt_area)const
-    {Vecd p=facets_[k].projector*z;Real radius=strength*sqrt_area,norm=p.stableNorm();if(norm>radius)p*=radius/norm;return p;}
+    {Vecd p=facets_[k].projector*z,n=facets_[k].projector*facets_[k].traction_halfspace_normal;Real n2=n.squaredNorm();
+        // Exact proximal projection onto range(P) intersected with the tensile
+        // half-ball. The default zero normal retains the original full ball.
+        if(n2>1e-24&&p.dot(n)<0)p-=n*(p.dot(n)/n2);
+        Real radius=strength*sqrt_area,norm=p.stableNorm();if(norm>radius)p*=radius/norm;return p;}
+    Vecd effectiveOpening(Vecd jump,size_t k)const {
+        Vecd n=facets_[k].projector*facets_[k].traction_halfspace_normal;Real n2=n.squaredNorm();
+        if(n2>1e-24&&jump.dot(n)<0)jump-=n*(jump.dot(n)/n2);return jump;
+    }
     Real storedEnergy(const Vecd&jump,Real kappa)const
     {if(kappa==0||kappa>=delta_f)return 0;return .5*strength*(1/kappa-1/delta_f)*jump.squaredNorm();}
     Real lipschitzBound(const std::vector<bool>&active,const std::vector<Real>&sqrt_area,

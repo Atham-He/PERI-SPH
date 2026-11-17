@@ -36,6 +36,17 @@ physical area. Numerical least-squares energy released by removing support is
 reported separately as stabilizer transfer loss. It is never counted as Gc.
 There is no additive energy offset, velocity kick, force scaling or stress reset.
 
+The coupled convex dual uses a scalar Gershgorin majorizer for each facet's
+three-vector block. For its symmetric Hessian H, diag(L_k I)-H is positive
+semidefinite by diagonal dominance. This is FISTA under a fixed linear change
+of variables, with the same exact half-ball projection and physical KKT/force
+checks. It prevents the large compliance of an old open facet from setting the
+iteration step for a newly inserted facet. No physical time step, mass or law
+parameter is changed. The zero-opening subgradient includes the strength
+boundary; a feasible boundary traction alone is not damage. When an emerging
+opening requires tighter force accuracy, the same inner problem is refined
+before any history is committed.
+
 Bulk forces use explicit half kicks. The surface drift solves coupled cohesive
 constraints with physical inverse masses and moving-normal geometry. The budget
 reports cohesive force work, irreversible Gc work and time-integration loss

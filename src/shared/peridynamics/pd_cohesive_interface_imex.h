@@ -203,7 +203,7 @@ class CohesiveInterfaceIMEX
         }
         // A matrix-free Gershgorin upper bound, without cancellation of absolute
         // contributions. No dense DOF or facet matrix is allocated.
-        result.lipschitz_bound=lipschitzBound(active,sqrt_area,compliance,dt);
+        std::vector<Real>metric=lipschitzBounds(active,sqrt_area,compliance,dt);result.lipschitz_bound=0;for(Real value:metric)result.lipschitz_bound=std::max(result.lipschitz_bound,value);
         auto multiplyD=[&](const std::vector<Vecd>&v)
         {
             std::vector<Vecd>weighted(count,Vecd::Zero());for(size_t k=0;k<count;++k)if(active[k])weighted[k]=sqrt_area[k]*v[k];
@@ -221,7 +221,7 @@ class CohesiveInterfaceIMEX
             // unique; zero-jump traction may be nonunique, so keep feasible warm
             // values there rather than invent an adhesion reaction.
             for(size_t k=0;k<count;++k)if(active[k])
-            {Vecd direction=facets_[k].projector*s[k];Real norm=direction.stableNorm();
+            {Vecd direction=effectiveOpening(facets_[k].projector*s[k],k);Real norm=direction.stableNorm();
              if(norm>0)result.dual[k]=project(strength*sqrt_area[k]*(direction/norm),k,sqrt_area[k]);
              else ++result.indeterminate_prescribed_adhesion_facets;}
             result.converged=true;
@@ -232,14 +232,17 @@ class CohesiveInterfaceIMEX
             for(size_t iteration=1;iteration<=options_.max_iterations;++iteration)
             {
                 auto makeStep=[&](const std::vector<Vecd>&point)
-                {auto g=gradient(point);std::vector<Vecd>step(count,Vecd::Zero());for(size_t k=0;k<count;++k)if(active[k])step[k]=project(point[k]-g[k]/L,k,sqrt_area[k]);return step;};
+                {auto g=gradient(point);std::vector<Vecd>step(count,Vecd::Zero());for(size_t k=0;k<count;++k)if(active[k]){
+                    if(metric[k]>0)step[k]=project(point[k]-g[k]/metric[k],k,sqrt_area[k]);
+                    else{Vecd direction=effectiveOpening(facets_[k].projector*s[k],k);Real norm=direction.stableNorm();step[k]=norm>0?project(strength*sqrt_area[k]*(direction/norm),k,sqrt_area[k]):project(point[k],k,sqrt_area[k]);}}
+                    return step;};
                 std::vector<Vecd>candidate=makeStep(y);Real next_objective=objective(candidate);
                 // Monotone restart prevents acceleration from retaining an
                 // uphill step; a plain PG step uses the proven global bound.
                 if(next_objective>current_objective+64*std::numeric_limits<Real>::epsilon()*std::max(std::abs(current_objective),std::abs(next_objective)))
                 {y=result.dual;acceleration=1;candidate=makeStep(y);next_objective=objective(candidate);}
                 auto g=gradient(candidate);Real residual=0;
-                for(size_t k=0;k<count;++k)if(active[k])residual=std::max(residual,(L/sqrt_area[k])*(candidate[k]-project(candidate[k]-g[k]/L,k,sqrt_area[k])).stableNorm());
+                for(size_t k=0;k<count;++k)if(active[k]&&metric[k]>0)residual=std::max(residual,(metric[k]/sqrt_area[k])*(candidate[k]-project(candidate[k]-g[k]/metric[k],k,sqrt_area[k])).stableNorm());
                 result.iterations=iteration;result.projected_opening_residual=residual;result.relative_residual=residual/opening_scale;
                 if(residual<=tolerance){result.dual=std::move(candidate);result.converged=true;break;}
                 Real next_acceleration=options_.accelerate?.5*(1+std::sqrt(1+4*acceleration*acceleration)):1;
@@ -303,16 +306,22 @@ class CohesiveInterfaceIMEX
     }
     Real storedEnergy(const Vecd&jump,Real kappa)const
     {if(kappa==0||kappa>=delta_f)return 0;return .5*strength*(1/kappa-1/delta_f)*jump.squaredNorm();}
-    Real lipschitzBound(const std::vector<bool>&active,const std::vector<Real>&sqrt_area,
+    std::vector<Real> lipschitzBounds(const std::vector<bool>&active,const std::vector<Real>&sqrt_area,
         const std::vector<Real>&compliance,Real dt)const
     {
         std::vector<Vecd>column_abs_sum(inverse_mass_.size(),Vecd::Zero());
         for(size_t k=0;k<facets_.size();++k)if(active[k])for(const Entry&e:facets_[k].entries)
             for(size_t d=0;d<3;++d)column_abs_sum[e.node][d]+=sqrt_area[k]*(facets_[k].projector*e.block()).col(d).cwiseAbs().sum();
-        Real bound=0;
+        // Each scalar block dominates every absolute Hessian row in that
+        // facet. For the symmetric positive-semidefinite dual Hessian H,
+        // diag(metric[k] I)-H is diagonally dominant and positive semidefinite.
+        // This is ordinary FISTA after the fixed change zhat=sqrt(metric)*z;
+        // scalar blocks preserve the exact ball/half-ball proximal projection.
+        // A soft old facet's kappa/ft cannot throttle an unrelated fresh facet.
+        std::vector<Real>metric(facets_.size(),0);
         for(size_t k=0;k<facets_.size();++k)if(active[k])for(size_t a=0;a<3;++a)
-        {Real row=compliance[k];for(const Entry&e:facets_[k].entries)for(size_t d=0;d<3;++d)row+=dt*dt*sqrt_area[k]*std::abs((facets_[k].projector*e.block())(a,d))*inverse_mass_[e.node][d]*column_abs_sum[e.node][d];bound=std::max(bound,row);}
-        if(!std::isfinite(bound))throw std::runtime_error("Nonfinite cohesive IMEX Lipschitz bound");return bound;
+        {Real row=compliance[k];for(const Entry&e:facets_[k].entries)for(size_t d=0;d<3;++d)row+=dt*dt*sqrt_area[k]*std::abs((facets_[k].projector*e.block())(a,d))*inverse_mass_[e.node][d]*column_abs_sum[e.node][d];metric[k]=std::max(metric[k],row);}
+        for(Real value:metric)if(!std::isfinite(value))throw std::runtime_error("Nonfinite cohesive IMEX block majorizer");return metric;
     }
 };
 } // namespace SPH::peridynamics

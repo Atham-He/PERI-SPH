@@ -42,7 +42,7 @@ class CohesiveSurfaceEvolution {
         // plus, matching minus, then three minus-face vertices for its normal.
         std::array<TracePoint,5> trace;Real area=0;
     };
-    struct Geometry {Vecd jump=Vecd::Zero(),normal=Vecd::Zero();Real normal_gap=0;CohesiveInterfaceIMEX::Facet linear;};
+    struct Geometry {Vecd jump=Vecd::Zero(),normal=Vecd::Zero();Real normal_gap=0;bool normal_derivative_active=true;CohesiveInterfaceIMEX::Facet linear;};
     struct Result {
         Field positions,force,jump,traction;std::vector<History>history;
         Real stored=0,dissipated=0,dissipation_increment=0;
@@ -69,8 +69,10 @@ class CohesiveSurfaceEvolution {
         for(const auto&z:n)norm2=norm2+z*z;
         if(norm2.v<=0||!std::isfinite(norm2.v))throw std::runtime_error("Cohesive face normal lost geometric rank");
         J norm=cohesive_geometry_detail::sqrt(norm2);for(auto&z:n)z=z/norm;J gn(0);for(size_t d=0;d<3;++d)gn=gn+jump[d]*n[d];
-        for(size_t d=0;d<3;++d)effective[d]=gn.v>=-zero_opening_tolerance?jump[d]:jump[d]-gn*n[d];
-        Geometry g;g.normal_gap=gn.v;g.linear.reference_area=facet.area;std::map<size_t,Matd>nodes;
+        Real raw_norm=0;for(size_t d=0;d<3;++d)raw_norm+=jump[d].v*jump[d].v;
+        bool normal_active=gn.v>=0||(gn.v>=-zero_opening_tolerance&&std::sqrt(raw_norm)<=zero_opening_tolerance);
+        for(size_t d=0;d<3;++d)effective[d]=normal_active?jump[d]:jump[d]-gn*n[d];
+        Geometry g;g.normal_gap=gn.v;g.normal_derivative_active=normal_active;g.linear.reference_area=facet.area;std::map<size_t,Matd>nodes;
         for(size_t d=0;d<3;++d){g.jump[d]=effective[d].v;g.normal[d]=n[d].v;}
         for(size_t j=0;j<5;++j){Matd derivative;for(size_t d=0;d<3;++d)for(size_t e=0;e<3;++e)derivative(d,e)=effective[d].d[3*j+e];const auto&t=facet.trace[j];const auto&row=t.surface->rows[t.point];
             for(size_t b=0;b<row.index.size();++b)nodes.try_emplace(row.index[b],Matd::Zero()).first->second+=row.weight[b]*derivative;
@@ -88,7 +90,8 @@ class CohesiveSurfaceEvolution {
         for(size_t k=0;k<old.size();++k){previous_jump[k]=geometry(k,qold).jump;
             if(old[k].kappa==0&&previous_jump[k].norm()<=tolerance)previous_jump[k].setZero();
             if(previous_jump[k].norm()>old[k].kappa+tolerance&&old[k].kappa<delta_f)throw std::runtime_error("Cohesive committed history below previous opening");}
-        CohesiveInterfaceIMEX::Result inner;std::ostringstream audit; audit<<std::setprecision(17);Real last_change=0,last_geometry_error=0;
+        CohesiveInterfaceIMEX::Result inner;std::ostringstream audit; audit<<std::setprecision(17);Real last_change=0,last_geometry_error=0,inner_precision=1;
+        auto dumpFailure=[&](){if(const char*path=std::getenv("PERI_COHESIVE_AUDIT_FILE")){std::ofstream f(path);f<<std::setprecision(17)<<"COHESIVE_REPLAY_V1 "<<qfree.size()<<' '<<old.size()<<' '<<ft<<' '<<Gc<<' '<<dt<<'\n';for(size_t i=0;i<qfree.size();++i)f<<qfree[i].transpose()<<' '<<qold[i].transpose()<<' '<<inverse_mass[i].transpose()<<'\n';for(size_t k=0;k<old.size();++k){f<<quadrature[k].area<<' '<<old[k].kappa<<'\n';for(const auto&v:quadrature[k].trace){const auto&r=v.surface->rows[v.point];f<<r.index.size();for(size_t j=0;j<r.index.size();++j)f<<' '<<r.index[j]<<' '<<r.weight[j];f<<'\n';}}f<<audit.str();}};
         for(size_t outer=1;outer<=max_outer_iterations;++outer){std::vector<CohesiveInterfaceIMEX::Facet>linear;Field theta;
             for(size_t k=0;k<old.size();++k){Real zero=old[k].kappa==0?tolerance:0;auto g=geometry(k,iterate,zero);
                 // At zero opening the correct subgradient is the tensile
@@ -96,27 +99,41 @@ class CohesiveSurfaceEvolution {
                 // neighbourhood as that boundary; do not alternate unilateral
                 // branches on round-off-sized signed gaps.
                 g.linear.traction_halfspace_normal=g.normal;
-                if(g.normal_gap< -zero){g.linear.projector=Matd::Identity()-g.normal*g.normal.transpose();g.linear.jump_offset=g.linear.projector*g.linear.jump_offset;g.jump=g.linear.projector*g.jump;}
+                if(!g.normal_derivative_active){g.linear.projector=Matd::Identity()-g.normal*g.normal.transpose();g.linear.jump_offset=g.linear.projector*g.linear.jump_offset;g.jump=g.linear.projector*g.jump;}
                 linear.push_back(g.linear);Vecd soft=g.jump;if(g.normal_gap<0)soft-=g.normal*g.normal.dot(soft);theta.push_back(soft);}
-            CohesiveInterfaceIMEX::Options options;options.absolute_opening_tolerance=absolute_tolerance*.05;options.relative_tolerance=relative_tolerance*.05;
+            CohesiveInterfaceIMEX::Options options;options.absolute_opening_tolerance=absolute_tolerance*.05*inner_precision;options.relative_tolerance=relative_tolerance*.05*inner_precision;
             CohesiveInterfaceIMEX solver(ft,Gc,inverse_mass,linear,options);
-            inner=solver.solve(qfree,previous_jump,old,dt,warm,theta);result.dual_iterations+=inner.iterations;
+            Field projected_previous=previous_jump;for(size_t k=0;k<old.size();++k)projected_previous[k]=linear[k].projector*projected_previous[k];
+            try{inner=solver.solve(qfree,projected_previous,old,dt,warm,theta);}catch(...){dumpFailure();throw;}result.dual_iterations+=inner.iterations;
             Real change=0,geometry_error=0;for(size_t i=0;i<iterate.size();++i)change=std::max(change,(inner.positions[i]-iterate[i]).norm());
             for(size_t k=0;k<old.size();++k)geometry_error=std::max(geometry_error,(geometry(k,inner.positions).jump-inner.jump[k]).norm());
             last_change=change;last_geometry_error=geometry_error;
             if(std::getenv("PERI_COHESIVE_AUDIT_FILE")){audit<<"OUTER "<<outer<<" change "<<change<<" geometry "<<geometry_error<<" innerKKT "<<inner.projected_opening_residual<<'\n';for(size_t k=0;k<old.size();++k){auto g=geometry(k,inner.positions);audit<<k<<" gn "<<g.normal_gap<<" jump "<<g.jump.transpose()<<" traction "<<inner.traction[k].transpose()<<" kappa "<<old[k].kappa<<'\n';}}
             iterate=inner.positions;warm=inner.dual;result.outer_iterations=outer;
-            if(change<=tolerance&&geometry_error<=tolerance){result.converged=true;break;}
+            Real law_error=0;for(size_t k=0;k<old.size();++k){auto g=geometry(k,iterate,old[k].kappa==0?tolerance:0);Real r=g.jump.norm(),kap=std::max(old[k].kappa,r);Vecd physical=inner.traction[k];
+                if(kap>=delta_f)physical.setZero();else if(!(old[k].kappa==0&&r<=tolerance)&&kap>0)physical=ft*(1/kap-1/delta_f)*g.jump;
+                law_error=std::max(law_error,(physical-inner.traction[k]).norm()/ft);}
+            if(std::getenv("PERI_COHESIVE_AUDIT_FILE"))audit<<"LAW_ERROR "<<law_error<<" inner_precision "<<inner_precision<<'\n';
+            if(change<=tolerance&&geometry_error<=tolerance){
+                if(law_error<=1e-5){result.converged=true;break;}
+                // Force consistency also belongs to nonlinear convergence.
+                // Refine the SAME convex subproblem, not material parameters or
+                // the acceptance threshold, when an emerging opening makes its
+                // traction more sensitive than the generic displacement test.
+                Real floor=16*std::numeric_limits<Real>::epsilon()*delta_f/(.05*(absolute_tolerance+relative_tolerance*delta_f));
+                inner_precision=std::max(floor,inner_precision*std::clamp(.5e-5/law_error,Real(.1),Real(.5)));
+            }
         }
         if(!result.converged){
-            if(const char*path=std::getenv("PERI_COHESIVE_AUDIT_FILE")){std::ofstream f(path);f<<std::setprecision(17)<<"COHESIVE_REPLAY_V1 "<<qfree.size()<<' '<<old.size()<<' '<<ft<<' '<<Gc<<' '<<dt<<'\n';for(size_t i=0;i<qfree.size();++i)f<<qfree[i].transpose()<<' '<<qold[i].transpose()<<' '<<inverse_mass[i].transpose()<<'\n';for(size_t k=0;k<old.size();++k){f<<quadrature[k].area<<' '<<old[k].kappa<<'\n';for(const auto&v:quadrature[k].trace){const auto&r=v.surface->rows[v.point];f<<r.index.size();for(size_t j=0;j<r.index.size();++j)f<<' '<<r.index[j]<<' '<<r.weight[j];f<<'\n';}}f<<audit.str();}
+            dumpFailure();
             std::ostringstream message;message<<std::setprecision(17)<<"Nonlinear objective cohesive drift did not converge; history unchanged; change="<<last_change<<" geometry="<<last_geometry_error<<" KKT="<<inner.projected_opening_residual;throw std::runtime_error(message.str());}
         result.positions=iterate;result.force.assign(iterate.size(),Vecd::Zero());result.history=old;
         Vecd resultant=Vecd::Zero(),torque=Vecd::Zero();Real force_scale=0,length=0;
         for(size_t k=0;k<old.size();++k){auto g=geometry(k,iterate,old[k].kappa==0?tolerance:0);Real r=g.jump.norm(),kap=std::max(old[k].kappa,r);Vecd traction;
-            // Interior dual + zero opening is the set-valued intact state, not
-            // irreversible damage caused by linear-solver round-off.
-            bool adhered=old[k].kappa==0&&r<=tolerance&&inner.monotone_traction[k].norm()<ft*(1-1e-7);
+            // The whole feasible half-ball, including its strength boundary,
+            // is a valid subgradient at zero opening. Round-off at that boundary
+            // must not create a new maximum opening and irreversible damage.
+            bool adhered=old[k].kappa==0&&r<=tolerance;
             if(adhered){kap=0;traction=inner.traction[k];}
             else if(kap>=delta_f)traction.setZero();
             else if(kap>0)traction=ft*(1/kap-1/delta_f)*g.jump;
@@ -128,7 +145,7 @@ class CohesiveSurfaceEvolution {
         }
         for(size_t i=0;i<iterate.size();++i){result.position_residual=std::max(result.position_residual,(iterate[i]-qfree[i]-dt*dt*inverse_mass[i].cwiseProduct(result.force[i])).norm());resultant+=result.force[i];torque+=iterate[i].cross(result.force[i]);force_scale+=result.force[i].norm();length=std::max(length,iterate[i].norm());}
         result.force_residual=resultant.norm()/std::max(force_scale,Real(1e-30));result.torque_residual=torque.norm()/std::max(force_scale*length,Real(1e-30));
-        if(result.position_residual>8*tolerance||result.traction_residual>1e-5||result.dissipation_increment< -1e-20)throw std::runtime_error("Cohesive physical force/history residual failed; history unchanged");
+        if(result.position_residual>8*tolerance||result.traction_residual>1e-5||result.dissipation_increment< -1e-20){dumpFailure();std::ostringstream message;message<<std::setprecision(17)<<"Cohesive physical force/history residual failed; history unchanged; position="<<result.position_residual<<" traction="<<result.traction_residual<<" dissipation="<<result.dissipation_increment;throw std::runtime_error(message.str());}
         return result;
     }
 };

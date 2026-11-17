@@ -99,6 +99,16 @@ The old diffuse directional-damage history remains a diagnostic result only.
 It cannot be resumed into this physical-topology model. The old source is in Git
 history; there is only one active source tree and one active capsule entry.
 
+## Reading the capsule trajectory
+
+`capsule.pvd` contains shell, core, platens and the two actual faces of every
+activated crack facet. Shell `BrokenBondFraction` counts removed material
+interactions. On crack cells, `FractureWorkFraction` is the area-weighted spent
+Gc fraction, `FullyFailedAreaFraction` is the fraction with zero remaining
+cohesive traction, and `MaximumNormalOpening_m` is the current positive gap at
+that facet's quadrature. A completely decohered face can close under contact;
+a colour alone is not an opening measurement. Geometry is not magnified.
+
 ## Reproducibility
 
 Build `pd_physical_crack_benchmark` and `pd_snsni_capsule`. Generate the capsule

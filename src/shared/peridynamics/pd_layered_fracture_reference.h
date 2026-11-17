@@ -14,6 +14,8 @@
 #include <array>
 #include <cstdint>
 #include <utility>
+#include <numeric>
+#include <algorithm>
 
 namespace SPH::solid_dynamics
 {
@@ -55,6 +57,10 @@ class PDLayeredFractureReference : public PDLayeredQuadraticReference
     void build() override
     {
         if(initialized_){updateAfterFailure();return;}
+        // Canonicalize all coupled neighbour arrays once, before any layered
+        // stencil/reverse index is built. Parallel cell insertion order must
+        // not change a cross-process physical checkpoint or summation order.
+        for(auto&nb:inner_configuration_){std::vector<size_t>order(nb.current_size_);std::iota(order.begin(),order.end(),0);std::sort(order.begin(),order.end(),[&](size_t a,size_t b){return nb.j_[a]<nb.j_[b];});auto permute=[&](auto&values){if(values.size()<nb.current_size_)throw std::runtime_error("Incomplete reference neighbour arrays");auto old=values;for(size_t n=0;n<order.size();++n)values[n]=old[order[n]];};permute(nb.j_);permute(nb.W_ij_);permute(nb.dW_ij_);permute(nb.r_ij_);permute(nb.e_ij_);permute(nb.bondLive_);}
         X=geometry.reference;
         PDLayeredQuadraticReference::build();
         if(X.size()!=rows.size())throw std::logic_error("Layered fracture reference geometry mismatch");

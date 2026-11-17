@@ -84,9 +84,14 @@ is an assumption because a separate experimental mixed-mode law is unavailable.
    explicit time integration and checkpoint rejection/roundtrip.
 2. Reset that specimen to its intact topology, introduce one precrack and let
    three remaining facets activate under the fixed ft criterion. Integrate the
-   actual cohesive force work through complete softening. Check the real gap,
-   Gc work, insertion residual, raw/accounted energy budgets, contact across
-   neighbouring failed patches and restart of the fractured operator state.
+   dynamic force work and the raw/accounted time-integration budgets. A subcritical
+   ligament may remain after that free tensile history. Save the complete dynamic
+   state, then finish a prescribed rigid-fragment opening of 2 delta_f along the
+   pending faces' normals. History advances only from actual separation. This
+   second phase checks spatial virtual work and complete Gc expenditure; its load
+   parameter is displacement, not dynamic time. Keep its energy ledger separate.
+   Finally check contact across neighbouring failed patches and state restoration.
+   Neither the material inputs nor the original dynamic loading are changed.
 3. Check the capsule driver without advancing physical material history:
    unchanged DPC update, affine shell/core kinematics and the derivative of
    tie/platen constraint energy. Bind each receipt to source and executable hashes.
@@ -108,6 +113,14 @@ Gc fraction, `FullyFailedAreaFraction` is the fraction with zero remaining
 cohesive traction, and `MaximumNormalOpening_m` is the current positive gap at
 that facet's quadrature. A completely decohered face can close under contact;
 a colour alone is not an opening measurement. Geometry is not magnified.
+
+The formal runner `tools/verification/run_physical_fracture.py` executes one
+physical dynamic history, saves its complete state and resumes it in a fresh
+process for the spatial opening-work/contact checks. `--completed-state` can
+repeat the remaining checks with the same pinned physics. Coupled neighbour
+arrays are sorted together by material-point ID before layered stencils are
+built, preserving each bond/kernel value and making cross-process identity
+independent of parallel cell insertion order.
 
 ## Reproducibility
 

@@ -110,7 +110,43 @@ int main(int argc,char**argv){bool published=false;try{
  bool geometry_pass=checkpoint_roundtrip&&topology_guards&&component_count==2&&bad_bonds==0&&broken>0&&max_bulk<1e-12&&max_contact_error<1e-9&&max_slip<1e-10&&max_gap_error<1e-9&&max_fd<1e-5&&max_balance<1e-10&&max_torque<1e-9&&outside==0&&drift<1e-3&&gc_error<1e-5&&strength_error<1e-10&&fully_failed_traction==0&&damage_history_preserved&&live_damage_energy<1e-12&&live_damage_force<1e-10;
  {std::ofstream stage(out/"precrack_stage_acceptance.json");stage<<std::setprecision(17)<<"{\"status\":\""<<(geometry_pass?"PASSED":"FAILED")<<"\",\"broken_bond_pairs\":"<<broken<<",\"force_energy_relative_error\":"<<max_fd<<",\"force_balance\":"<<max_balance<<",\"torque_balance\":"<<max_torque<<",\"explicit_energy_relative_drift\":"<<drift<<"}\n";}
  if(!geometry_pass)throw std::runtime_error("Precrack geometry/energy acceptance failed");
-  auto automatic_growth=runAutomaticGrowthBenchmark(out,ref,bulk,port,intact_topology,s.x0,s.mass,s.x,s.v,acc,E,nu,ft,Gc,dp,t,K,nx,ny);
+  // Reproduce the capsule's failed boundary-owner update on THIS same slab.
+  // A reference boundary point can be across a new crack from its original
+  // nearest-node search anchor. Fixed crack-side ownership must still reject it.
+  {
+   auto saved=ref.captureTopology();StdVec<Vecd>saved_x(s.x,s.x+count),saved_v(s.v,s.v+count);
+   ref.restoreTopology(intact_topology);bulk.rebuild();
+   for(size_t i=0;i<count;++i){const auto&x=s.x0[i];s.x[i]=x+Vecd(.002*x[0]+.002*x[0]*x[1]/(nx*dp),-.001*x[1],.001*x[2]);s.v[i].setZero();bulk.evaluate(i);}
+   StdVec<Vecd>boundary={Vecd(-.05*dp,-.3*dp,t/2),Vecd(-.05*dp,.3*dp,t/2),Vecd(.05*dp,-.3*dp,t/2),Vecd(.05*dp,.3*dp,t/2)};
+   StdVec<size_t>wrong_owner;for(const auto&q:boundary)wrong_owner.push_back(anchors({q},q[0]>0?-1:1)[0]);
+   VisibleCrackSurface owned(port,boundary,wrong_owner,ref,dp,3,2,{},{},{},VisibleCrackSurface::AnchorOwnership::ReferencePoint);
+   VisibleCrackSurface fixed_owner(port,boundary,wrong_owner,ref,dp,3,2);
+   StdVec<Vecd>before,target;for(size_t q=0;q<boundary.size();++q){before.push_back(owned.position(q));target.push_back(before.back()+Vecd(0,0,.01*dp));}
+   Real spring_area=dp*t/boundary.size();
+   auto spring=[&](bool forces){Real U=0;if(forces)port.clear();for(size_t q=0;q<boundary.size();++q){Vecd d=owned.position(q)-target[q];U+=.5*K*spring_area*d.squaredNorm();if(forces)owned.scatter(q,-K*spring_area*d);}return U;};
+   Real old_energy=bulk.energy()+spring(false),old_hg=bulk.stabilizationEnergy();
+   owned.captureTransferValues();fixed_owner.captureTransferValues();
+   ref.setTransferState(StdVec<Vecd>(s.x,s.x+count),StdVec<Matd>(bulk.F,bulk.F+count),StdVec<Vecd>(s.v,s.v+count));
+   size_t actual_cuts=ref.cutPlane(Vecd::Zero(),Vecd::UnitX());bulk.rebuild();owned.rebuildChanged();
+   bool fixed_rejected=must_reject([&](){fixed_owner.rebuildChanged();});
+   Real transfer_error=0;size_t cross_entries=0;
+   for(size_t q=0;q<boundary.size();++q){transfer_error=std::max(transfer_error,(owned.position(q)-before[q]).norm()/dp);if(boundary[q][0]*s.x0[owned.materialAnchor(q)][0]<=0)++cross_entries;for(size_t j:owned.rows[q].index)if(boundary[q][0]*s.x0[j][0]<=0||!ref.visibleReference(boundary[q],s.x0[j]))++cross_entries;}
+   for(size_t i=0;i<count;++i)bulk.evaluate(i);
+   Real energy_error=std::abs(bulk.energy()+spring(false)-old_energy)/std::max(std::abs(old_energy),Real(1e-30)),hg_loss=old_hg-bulk.stabilizationEnergy();
+   VisibleCrackSurface restored(port,boundary,wrong_owner,ref,dp,3,2,{},owned.transferValues(),{},VisibleCrackSurface::AnchorOwnership::ReferencePoint);
+   Real restart_error=0;for(size_t q=0;q<boundary.size();++q){if(restored.materialAnchor(q)!=owned.materialAnchor(q)||restored.rows[q].index!=owned.rows[q].index)throw std::runtime_error("Boundary reference ownership did not restore deterministically");for(size_t a=0;a<owned.rows[q].weight.size();++a)restart_error=std::max(restart_error,std::abs(restored.rows[q].weight[a]-owned.rows[q].weight[a]));}
+   spring(true);Real power=0;StdVec<Vecd>directions(count);for(size_t i=0;i<count;++i){directions[i]=Vecd(.012*std::sin(5*s.x0[i][0]/dp),.008*std::cos(3*s.x0[i][1]/dp),.004);power+=s.mass[i]*port.external[i].dot(directions[i]);}
+   Real eps=1e-9;for(size_t i=0;i<count;++i)s.x[i]+=eps*directions[i];Real ep=spring(false);for(size_t i=0;i<count;++i)s.x[i]-=2*eps*directions[i];Real em=spring(false);for(size_t i=0;i<count;++i)s.x[i]+=eps*directions[i];
+   Real work_error=std::abs((ep-em)/(2*eps)+power)/std::max(std::abs(power),Real(1e-20));
+   StdVec<Vecd>held;for(size_t q=0;q<boundary.size();++q)held.push_back(owned.position(q));
+   for(size_t i=0;i<count;++i)if(s.x0[i][0]<0)s.x[i]+=Vecd(-20e-6,7e-6,0);
+   Real opposite_motion=0;for(size_t q=0;q<boundary.size();++q)if(boundary[q][0]>0)opposite_motion=std::max(opposite_motion,(owned.position(q)-held[q]).norm()/dp);
+   bool passed=fixed_rejected&&actual_cuts>0&&owned.reassignedPoints()==boundary.size()&&cross_entries==0&&transfer_error<1e-9&&energy_error<1e-8&&work_error<1e-5&&opposite_motion<1e-12&&restart_error<1e-12;
+   std::ofstream report(out/"surface_ownership_acceptance.json");report<<std::setprecision(17)<<"{\"status\":\""<<(passed?"PASSED":"FAILED")<<"\",\"same_specimen_particles\":"<<count<<",\"reassigned_boundary_points\":"<<owned.reassignedPoints()<<",\"wrong_fixed_owner_rejected\":"<<(fixed_rejected?"true":"false")<<",\"cross_crack_interpolation_entries\":"<<cross_entries<<",\"position_transfer_error_over_spacing\":"<<transfer_error<<",\"physical_and_constraint_energy_relative_error\":"<<energy_error<<",\"separate_stabilizer_loss_J\":"<<hg_loss<<",\"force_work_relative_error\":"<<work_error<<",\"opposite_fragment_motion_leak_over_spacing\":"<<opposite_motion<<",\"restored_weight_error\":"<<restart_error<<",\"parameters_changed\":false}\n";report.close();
+   for(size_t i=0;i<count;++i){s.x[i]=saved_x[i];s.v[i]=saved_v[i];}ref.restoreTopology(saved);bulk.rebuild();
+   if(!passed)throw std::runtime_error("Same-specimen boundary ownership/energy acceptance failed");
+  }
+   auto automatic_growth=runAutomaticGrowthBenchmark(out,ref,bulk,port,intact_topology,s.x0,s.mass,s.x,s.v,acc,E,nu,ft,Gc,dp,t,K,nx,ny);
  if(automatic_growth.completed_only){std::ofstream report(out/"acceptance.json");report<<R"({"geometry_status":"PASSED","overall_status":"DYNAMIC_STAGE_COMPLETE_GC_PENDING","capsule_restart_allowed":false})"<<'\n';std::cout<<"COMPLETED_DYNAMIC_CHECKPOINT_SAVED"<<std::endl;return 86;}
   bool pass=geometry_pass&&automatic_growth.passed;
  std::ofstream report(out/"acceptance.json");report<<std::setprecision(17)<<"{\"geometry_status\":\""<<(geometry_pass?"PASSED":"FAILED")<<"\",\"overall_status\":\""<<(pass?"PASSED":"FAILED")<<"\",\"capsule_restart_allowed\":false,\"growth_insertion_status\":\""<<(automatic_growth.passed?"PASSED":"FAILED")<<"\",\"fracture_checkpoint_roundtrip_passed\":true,\"corrupt_or_incompatible_checkpoint_rejected\":true,\"topology_cache_guards_passed\":true,\"specimens\":1,\"physical_particles\":"<<count<<",\"disconnected_components\":"<<component_count<<",\"broken_bond_pairs\":"<<broken<<",\"live_damage_history_preserved\":"<<(damage_history_preserved?"true":"false")<<",\"live_damage_energy_over_E_volume\":"<<live_damage_energy<<",\"live_damage_force_over_E_area\":"<<live_damage_force<<",\"live_bonds_crossing_precrack\":"<<bad_bonds<<",\"maximum_visual_opening_m\":0.0006,\"sliding_m\":"<<2*dp<<",\"bulk_energy_over_E_volume\":"<<max_bulk<<",\"contact_force_error_over_E_area\":"<<max_contact_error<<",\"sliding_force_over_E_area\":"<<max_slip<<",\"gap_error_over_spacing\":"<<max_gap_error<<",\"force_energy_relative_error\":"<<max_fd<<",\"force_balance\":"<<max_balance<<",\"torque_balance\":"<<max_torque<<",\"outside_projections\":"<<outside<<",\"explicit_undamped_steps\":200,\"explicit_dt_s\":"<<dt<<",\"explicit_energy_relative_drift\":"<<drift<<",\"cohesive_Gc_J_m2\":"<<work<<",\"cohesive_Gc_relative_error\":"<<gc_error<<",\"cohesive_peak_relative_error\":"<<strength_error<<",\"growth_topology_insertion_tested\":true,\"material_parameters_changed\":false,\"particles_deleted\":0}\n";

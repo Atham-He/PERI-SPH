@@ -42,6 +42,23 @@ intact initial operator, so algebraic reassociation cannot alter restored forces
 are history and are included in checkpoints; they are not discarded as caches.
 An unresolved constraint is an error, not permission to erase material.
 
+Boundary quadrature points and explicit crack-side nodes have different ownership.
+An inner/outer boundary point is attached to its immutable reference coordinate;
+the initially nearest PD node is only a search anchor. If a new crack separates
+that node from the point, its owner is resolved to the nearest geometrically
+visible node within the original support. Live connectivity and visibility still
+filter every interpolation entry. Explicitly sided crack traces retain fixed
+material-node ownership and reject a crossing; their side is never reassigned.
+Point coordinates, quadrature areas, penalty stiffness and physical states are
+unchanged. The existing constrained transfer preserves the boundary value and
+the force scatter remains the exact transpose of the rebuilt map.
+
+The same slab verification deliberately puts reference boundary points opposite
+their initial search anchors, then cuts the slab. It checks zero crossing entries,
+independent fragment motion, physical/constraint energy transfer, force work and
+deterministic reconstruction. This is part of the existing specimen's acceptance,
+not a new parameter or loading matrix.
+
 The signed physical insertion-energy residual is measured against Gc times new
 physical area. Numerical least-squares energy released by removing support is
 reported separately as stabilizer transfer loss. It is never counted as Gc.
@@ -133,6 +150,16 @@ inner radius, thickness, PD spacing and existing horizon. Run the formal benchma
 before `pd_snsni_capsule --preflight-only`. The production owner is
 `tools/peri_run_physical_capsule.py`; it requires PASSED receipts and matching
 source, input and executable hashes. It performs no parameter modification.
+
+`--resume-checkpoint` together with `--resume-manifest` continues a saved capsule
+history into a fresh result root after an implementation repair. The owner verifies
+the original schema/checkpoint identity and exact config, DPC table, geometry cache
+and crack-bank hashes against the new inputs. The original history fingerprint
+remains attached to unchanged checkpoint bytes; the current execution has a
+separate source/binary fingerprint. Native checksum and restored-force validation
+must pass before the next topology event. Prior CSV and trajectory segments remain
+part of the same history. A repaired executable still needs fresh slab and coupled
+preflight acceptance; there is no automatic retry or initial-state restart.
 
 The constrained transfer is an adaptation of conservation-aware state transfer,
 not a literal implementation of Powell-Sabin finite-element remeshing. A useful

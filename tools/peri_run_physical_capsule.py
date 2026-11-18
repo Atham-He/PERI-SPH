@@ -49,7 +49,8 @@ def run(a):
     source=Path(a.source).resolve();binary=Path(a.binary).resolve();cfg=Path(a.config).resolve();cache=Path(a.cells).resolve();bank=Path(a.bank).resolve()
     acceptance=json.loads((Path(a.benchmark_root)/'acceptance.json').read_text());growth=json.loads((Path(a.benchmark_root)/'automatic_growth_acceptance.json').read_text());preflight=json.loads(Path(a.preflight).read_text())
     benchmark_manifest=json.loads(Path(a.benchmark_manifest).read_text());preflight_manifest=json.loads(Path(a.preflight_manifest).read_text())
-    if acceptance.get('overall_status')!='PASSED' or growth.get('status')!='PASSED' or preflight.get('status')!='PASSED':raise RuntimeError('Physical growth/energy or coupled-driver gate is not PASSED')
+    ownership=json.loads((Path(a.benchmark_root)/'surface_ownership_acceptance.json').read_text())
+    if acceptance.get('overall_status')!='PASSED' or growth.get('status')!='PASSED' or ownership.get('status')!='PASSED' or preflight.get('status')!='PASSED':raise RuntimeError('Physical growth/energy/ownership or coupled-driver gate is not PASSED')
     if benchmark_manifest.get('exit_code')!=0 or benchmark_manifest.get('diagnostic_replay') is not False:raise RuntimeError('Formal benchmark did not exit successfully or was a diagnostic replay')
     if subprocess.check_output(['git','status','--porcelain'],cwd=source,text=True).strip():raise RuntimeError('Pin a clean canonical source before the production history')
     values=dict(line.split('=',1) for line in cfg.read_text().splitlines() if line.strip() and not line.lstrip().startswith('#'))
@@ -65,10 +66,25 @@ def run(a):
             if sha(source/relative)!=digest:raise RuntimeError('Verified source changed after acceptance: '+relative)
     benchmark_binary=Path(a.benchmark_binary)
     if benchmark_manifest.get('binary_sha256')!=sha(benchmark_binary):raise RuntimeError('Accepted benchmark executable has changed')
-    fingerprint=hashlib.sha256(json.dumps(identity,sort_keys=True).encode()).hexdigest();owner=process_identity(os.getpid())
-    manifest={'created_UTC':utc(),'source':str(source),'binary':str(binary),'input_config':str(cfg),'identity':identity,'fingerprint':fingerprint,'owner':owner,'same_history_checkpoint_handoff':True,'material_parameters_changed':False,'capsule_kinematics':'NOSB_PD_shell_plus_SNSNI_solid_SPH_core','benchmark_root':str(Path(a.benchmark_root).resolve()),'preflight':str(Path(a.preflight).resolve()),'segments':[]}
-    put(root/'production_manifest.json',manifest);segments=[];checkpoint=None
-    for segment in range(2):
+    execution_fingerprint=hashlib.sha256(json.dumps(identity,sort_keys=True).encode()).hexdigest();fingerprint=execution_fingerprint;owner=process_identity(os.getpid())
+    inherited=[];checkpoint=None
+    if bool(a.resume_checkpoint)!=bool(a.resume_manifest):raise RuntimeError('Continuation requires both checkpoint and its original production manifest')
+    if a.resume_checkpoint:
+        origin=Path(a.resume_manifest).resolve();previous=json.loads(origin.read_text());checkpoint=Path(a.resume_checkpoint).resolve()
+        latest=json.loads((checkpoint.parent/'checkpoint.latest.json').read_text())
+        if latest['version']!=4 or latest['fingerprint']!=previous['fingerprint'] or Path(latest['file']).resolve()!=checkpoint:raise RuntimeError('Continuation checkpoint identity/schema differs from its original manifest')
+        for name in ['config_sha256','DPC_table_sha256','core_cache_sha256','crack_bank_sha256','checkpoint_schema']:
+            if identity[name]!=previous['identity'][name]:raise RuntimeError('Continuation would change a frozen physical input: '+name)
+        fingerprint=previous['fingerprint']
+        inherited=previous['segments']
+        if not inherited or root==origin.parent:raise RuntimeError('Continuation needs an original history and a fresh output root')
+        receipt={'recorded_UTC':utc(),'status':'INPUTS_VERIFIED_NATIVE_STATE_CHECK_PENDING','origin_manifest':str(origin),'origin_manifest_sha256':sha(origin),'origin_source_commit':previous['identity']['source_commit'],'source_commit':identity['source_commit'],'checkpoint':str(checkpoint),'checkpoint_sha256':sha(checkpoint),'checkpoint_step':latest['step'],'history_fingerprint':fingerprint,'execution_fingerprint':execution_fingerprint,'frozen_inputs_unchanged':True,'checkpoint_bytes_modified':False,'loading_history_reset':False,'native_force_and_checksum_verification_required':True}
+        put(root/'resume_compatibility.json',receipt)
+    manifest={'created_UTC':utc(),'source':str(source),'binary':str(binary),'input_config':str(cfg),'identity':identity,'fingerprint':fingerprint,'execution_fingerprint':execution_fingerprint,'owner':owner,'same_history_checkpoint_handoff':True,'material_parameters_changed':False,'capsule_kinematics':'NOSB_PD_shell_plus_SNSNI_solid_SPH_core','benchmark_root':str(Path(a.benchmark_root).resolve()),'preflight':str(Path(a.preflight).resolve()),'segments':list(inherited)}
+    if (root/'production_manifest.json').exists():raise RuntimeError('Output root already has a production manifest')
+    put(root/'production_manifest.json',manifest);segments=[Path(x['output']) for x in inherited]
+    sequence=[len(inherited)] if checkpoint else range(2)
+    for segment in sequence:
         if sha(binary)!=identity['binary_sha256'] or sha(cfg)!=identity['config_sha256'] or sha(material)!=identity['DPC_table_sha256'] or sha(bank)!=identity['crack_bank_sha256'] or sha(cache)!=identity['core_cache_sha256']:raise RuntimeError('Pinned source/input/binary changed before continuation')
         output=root/('mechanics_segment_'+str(segment));runtime=root/('runtime_segment_'+str(segment));runtime.mkdir(exist_ok=True)
         if output.exists() and any(output.iterdir()):raise RuntimeError('Production output segment already contains results')
@@ -86,6 +102,9 @@ def run(a):
                 while process.poll() is None:
                     state={'recorded_UTC':utc(),'status':'RUNNING','owner':owner,'native':native,'segment':segment,'output':str(output),'latest_progress':row(output/'progress.csv'),'latest_equilibrium':row(output/'equilibria.csv'),'source_commit':identity['source_commit'],'fingerprint':fingerprint,'capsule_running':True}
                     put(root/'owner_progress.json',state);index(root,segments)
+                    validation=output/'resume_validation.json'
+                    if a.resume_checkpoint and validation.exists():
+                        native_check=json.loads(validation.read_text());receipt.update(status='PASSED' if native_check.get('status')=='PASSED' else 'FAILED',native_state_validation=native_check);put(root/'resume_compatibility.json',receipt)
                     if a.status_file:
                         target=Path(a.status_file);review=json.loads(target.read_text()) if target.exists() else {};review.update(status='PHYSICAL_CAPSULE_RUNNING',physical_capsule_running=True,capsule_restart_allowed=True,source_commit=identity['source_commit'],source_worktree_clean=True,owner_progress=str(root/'owner_progress.json'),production_manifest=str(root/'production_manifest.json'));put(target,review)
                     time.sleep(30)
@@ -112,7 +131,7 @@ def run(a):
 if __name__=='__main__':
     p=argparse.ArgumentParser()
     for option in ['source','binary','config','cells','bank','output-root','benchmark-root','preflight','benchmark-manifest','benchmark-binary','preflight-manifest']:p.add_argument('--'+option,required=True)
-    p.add_argument('--status-file');a=p.parse_args()
+    p.add_argument('--status-file');p.add_argument('--resume-checkpoint');p.add_argument('--resume-manifest');a=p.parse_args()
     try:run(a)
     except BaseException as error:
         root=Path(a.output_root);root.mkdir(parents=True,exist_ok=True);put(root/'owner_progress.json',{'recorded_UTC':utc(),'status':'FAILED','capsule_running':False,'error':str(error),'traceback':traceback.format_exc()})

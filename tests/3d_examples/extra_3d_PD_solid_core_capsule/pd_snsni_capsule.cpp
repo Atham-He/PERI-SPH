@@ -97,8 +97,9 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells)
     for(const auto&face:cr.faces)if(face.boundary)for(const auto&q:face.q){points.push_back(q.x);areas.push_back(q.w);}
     for(const auto&n:sphereDirections(R,o.contact_quadrature_scale*o.spacing))outer_points.push_back(R*n);
     SnsniCoupledSurface cs(core_port,points,cr);
-    // Material anchors are searched once; visibility and live connectivity
-    // rebuild the same material attachment after each actual crack event.
+    // The reference boundary coordinate is the material attachment. A nearest
+    // node is only its initial search anchor and may lie across a later crack.
+    // Resolve the same point's visible side after a cut; never average fragments.
     using Cell=std::array<long long,3>;struct Hash{size_t operator()(const Cell&a)const{size_t h=0;for(auto v:a)h^=std::hash<long long>{}(v)+0x9e3779b9+(h<<6)+(h>>2);return h;}};
     std::unordered_map<Cell,StdVec<size_t>,Hash>grid;Real cell_size=2*o.pd_spacing;
     auto cell=[&](const Vecd&x){return Cell{(long long)std::floor(x[0]/cell_size),(long long)std::floor(x[1]/cell_size),(long long)std::floor(x[2]/cell_size)};};
@@ -106,8 +107,8 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells)
     auto anchors=[&](const StdVec<Vecd>&targets){StdVec<size_t>ids;for(const auto&q:targets){auto c=cell(q);Real best=std::numeric_limits<Real>::infinity();size_t owner=sn;
         for(int a=-1;a<=1;++a)for(int b=-1;b<=1;++b)for(int d=-1;d<=1;++d){auto it=grid.find(Cell{c[0]+a,c[1]+b,c[2]+d});if(it!=grid.end())for(size_t j:it->second){Real r=(sX[j]-q).squaredNorm();if(r<best){best=r;owner=j;}}}
         if(owner==sn)throw std::runtime_error("No shell material owner for interface/plate trace");ids.push_back(owner);}return ids;};
-    VisibleCrackSurface si(pd_port,points,anchors(points),sr,o.pd_spacing,o.interface_shell_support,2);
-    VisibleCrackSurface so(pd_port,outer_points,anchors(outer_points),sr,o.pd_spacing,o.interface_shell_support,2);
+    VisibleCrackSurface si(pd_port,points,anchors(points),sr,o.pd_spacing,o.interface_shell_support,2,{},{},{},VisibleCrackSurface::AnchorOwnership::ReferencePoint);
+    VisibleCrackSurface so(pd_port,outer_points,anchors(outer_points),sr,o.pd_spacing,o.interface_shell_support,2,{},{},{},VisibleCrackSurface::AnchorOwnership::ReferencePoint);
     Real Eref=o.constraint_E>0?o.constraint_E:o.core_E,Ktie=o.tie_factor*Eref/o.spacing,Kcontact=o.contact_factor*Eref/o.spacing;
     BondedSolidInterface tie(si,cs,areas,Ktie,R);StdVec<Real>outer_areas(outer_points.size(),4*Pi*R*R/outer_points.size());
     SolidSurfacePlaneContact contact(so,outer_areas,Kcontact,R);
@@ -143,6 +144,7 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells)
     std::ofstream progress(out/"progress.csv"),eq(out/"equilibria.csv"),events(out/"fracture_events.csv");
     const char*header="step,stage,elapsed_s,strain,compression_m,dt_s,upper_N,lower_N,force_residual,plate_imbalance,kinetic_ratio,core_min_J,shell_min_J,broken_bond_pairs,crack_facets,failed_cohesive_quadrature,max_crack_gap_m,cohesive_stored_J,fracture_work_J,shell_stored_J,interface_energy_J,contact_energy_J,crack_contact_energy_J,max_penetration_m,platen_work_J,core_internal_work_J,damping_loss_J,cohesive_algorithmic_loss_J,stabilizer_transfer_loss_J,insertion_defect_J,mechanical_budget_J\n";
     progress<<std::setprecision(17)<<header;eq<<std::setprecision(17)<<header;events<<std::setprecision(17)<<"event,step,stage,strain,candidate,strength_ratio,broken_bond_pairs,max_gap_m\n";
+    std::ofstream surface_audit(out/"surface_reconstruction_events.csv");surface_audit<<std::setprecision(17)<<"step,stage,strain,candidate,inner_reassigned_points,outer_reassigned_points,maximum_affine_error,maximum_polynomial_error,maximum_trace_l1,insertion_energy_fraction\n";
 std::vector<std::pair<Real,std::string>>frame_index;
     auto snapshot=[&](const std::string&tag,Real u){Field cpos(cr.cells.size()),cd(time.displacement.begin(),time.displacement.begin()+cn);StdVec<Real>pressure(cr.cells.size()),J(cr.cells.size()),alpha(cr.cells.size());
         for(size_t l=0;l<cr.cells.size();++l){cpos[l]=cr.cells[l].center+cr.value(l,cd);pressure[l]=cb.pending[l].material.p;J[l]=cb.F[l].determinant();alpha[l]=cb.history[l].alpha;}vtkPoints(out/"vtp"/("core_"+tag+".vtp"),cpos,{}, {},pressure,J,alpha,{},{});
@@ -190,13 +192,15 @@ std::vector<std::pair<Real,std::string>>frame_index;
     };
     auto save=[&](){progress.flush();eq.flush();events.flush();recovery::checkpoint.save(out,{"progress.csv","equilibria.csv","fracture_events.csv"},time.steps,transfer);};
     if(!recovery::checkpoint.resume.empty()){progress.close();eq.close();events.close();recovery::checkpoint.load(out,{"progress.csv","equilibria.csv","fracture_events.csv"},transfer);progress.open(out/"progress.csv",std::ios::app);eq.open(out/"equilibria.csv",std::ios::app);events.open(out/"fracture_events.csv",std::ios::app);progress<<std::setprecision(17);eq<<std::setprecision(17);events<<std::setprecision(17);
-        Field expected=bulk_force;assembleShellAndConstraints(compression(stage_time));Real error=0,scale=0;for(size_t j=0;j<count;++j){error=std::max(error,(bulk_force[j]-expected[j]).norm());scale=std::max(scale,expected[j].norm());}if(error>1e-9*std::max(scale,Real(1e-20)))throw std::runtime_error("Resumed physical-fracture force does not reproduce committed checkpoint");cohesive_force=growth.cohesiveForces(growth.positions());snapshot("resumed",compression(stage_time));}
+        Field expected=bulk_force;assembleShellAndConstraints(compression(stage_time));Real error=0,scale=0;for(size_t j=0;j<count;++j){error=std::max(error,(bulk_force[j]-expected[j]).norm());scale=std::max(scale,expected[j].norm());}if(error>1e-9*std::max(scale,Real(1e-20)))throw std::runtime_error("Resumed physical-fracture force does not reproduce committed checkpoint");cohesive_force=growth.cohesiveForces(growth.positions());snapshot("resumed",compression(stage_time));
+        std::ofstream receipt(out/"resume_validation.json");receipt<<std::setprecision(17)<<"{\"status\":\"PASSED\",\"step\":"<<time.steps<<",\"strain\":"<<compression(stage_time)/o.diameter<<",\"force_relative_error\":"<<error/std::max(scale,Real(1e-20))<<",\"core_commits\":"<<cb.commits<<",\"kinetic_energy_J\":"<<time.kinetic()<<",\"loading_history_reset\":false}\n";}
     save();
     while(stage<=o.load_steps){size_t prior_stage=stage,prior_cracks=growth.insertion_events;
         if(time.steps%50==0){for(size_t event=0;event<bank.size();++event){size_t k=growth.select();if(k==bank.size())break;
             Real ratio=growth.strengthRatio(k);size_t prior_core_commits=cb.commits;bool inserted=growth.insert(k,false,refresh,eventEnergy,prepareTransfer,rollbackTransfer);if(cb.commits!=prior_core_commits)throw std::runtime_error("Topology event advanced frozen core material history");
             if(!inserted&&!growth.last_candidate_unresolved){snapshot("stopped_before_rejected_crack",compression(stage_time));save();throw std::runtime_error("Capsule physical insertion rejected: "+growth.last_rejection);}
-            if(inserted){onset=true;cohesive_force=growth.cohesiveForces(growth.positions());events<<"new_cohesive_crack"<<','<<time.steps<<','<<stage<<','<<compression(stage_time)/o.diameter<<','<<bank[k].id<<','<<ratio<<','<<sr.physical_broken_bonds<<','<<growth.max_gap<<'\n';events.flush();}
+            if(inserted){onset=true;cohesive_force=growth.cohesiveForces(growth.positions());events<<"new_cohesive_crack"<<','<<time.steps<<','<<stage<<','<<compression(stage_time)/o.diameter<<','<<bank[k].id<<','<<ratio<<','<<sr.physical_broken_bonds<<','<<growth.max_gap<<'\n';events.flush();
+                surface_audit<<time.steps<<','<<stage<<','<<compression(stage_time)/o.diameter<<','<<bank[k].id<<','<<si.reassignedPoints()<<','<<so.reassignedPoints()<<','<<std::max(si.affine_error,so.affine_error)<<','<<std::max(si.polynomial_error,so.polynomial_error)<<','<<std::max(si.maximum_weight_l1,so.maximum_weight_l1)<<','<<growth.last_insertion.fraction<<'\n';surface_audit.flush();}
             else{events<<"unresolved_geometric_facet_no_material_cut"<<','<<time.steps<<','<<stage<<','<<compression(stage_time)/o.diameter<<','<<bank[k].id<<','<<ratio<<','<<sr.physical_broken_bonds<<','<<growth.max_gap<<'\n';events.flush();}
         }}
         // A cascade changes topology at one fixed physical time. Preserve

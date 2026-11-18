@@ -15,15 +15,19 @@ namespace SPH::peridynamics
 class VisibleCrackSurface : public ReferenceSolidSurface
 {
   public:
+    // A crack-side trace belongs to an explicit material node. A boundary
+    // quadrature point instead belongs to its immutable reference coordinate:
+    // its pre-fracture nearest node may be across a newly inserted crack.
+    enum class AnchorOwnership { MaterialNode, ReferencePoint };
     StdVec<int> row_order;
     size_t affine_points=0,inactive_points=0;
     Real maximum_value_error=0,maximum_weight_l1=0;
     VisibleCrackSurface(SolidForcePort&p,const StdVec<Vecd>&targets,
                         const StdVec<size_t>&target_anchors,
                         solid_dynamics::PDLayeredFractureReference&r,
-                        Real spacing,Real support_ratio=2.5,unsigned order=2,const StdVec<Vecd>&side_normals={},const StdVec<Vecd>&transfer_values={},const StdVec<Vecd>&transfer_velocities={})
+                        Real spacing,Real support_ratio=2.5,unsigned order=2,const StdVec<Vecd>&side_normals={},const StdVec<Vecd>&transfer_values={},const StdVec<Vecd>&transfer_velocities={},AnchorOwnership ownership=AnchorOwnership::MaterialNode)
       :ReferenceSolidSurface(p,targets,order,DeferredBuildTag{}),reference_(r),
-       anchors_(target_anchors),original_targets_(targets),side_normals_(side_normals),transfer_values_(transfer_values),transfer_velocity_values_(transfer_velocities),dp_(spacing),support_(spacing*support_ratio)
+        anchors_(target_anchors),original_targets_(targets),side_normals_(side_normals),transfer_values_(transfer_values),transfer_velocity_values_(transfer_velocities),dp_(spacing),support_(spacing*support_ratio),ownership_(ownership)
     {
         if(spacing<=0||support_ratio<=1||!std::isfinite(support_)||order<1||order>2)
             throw std::invalid_argument("Invalid one-sided crack trace support/order");
@@ -34,6 +38,8 @@ class VisibleCrackSurface : public ReferenceSolidSurface
                 throw std::invalid_argument("Force-port and fracture reference coordinates differ");
         if((!transfer_values_.empty()&&transfer_values_.size()!=targets.size())||(!transfer_velocity_values_.empty()&&transfer_velocity_values_.size()!=targets.size()))throw std::invalid_argument("Crack trace transfer-value dimensions");
         if(!side_normals_.empty()&&side_normals_.size()!=targets.size())throw std::invalid_argument("Crack trace side-normal dimensions");
+        if(ownership_==AnchorOwnership::ReferencePoint&&!side_normals_.empty())throw std::invalid_argument("An explicitly sided crack trace requires fixed material-node ownership");
+        for(size_t q=0;q<targets.size();++q)if(!targets[q].allFinite()||anchors_[q]>=p.count)throw std::invalid_argument("Invalid crack-trace target/material anchor");
         for(size_t q=0;q<side_normals_.size();++q)if(!side_normals_[q].allFinite()||std::abs(side_normals_[q].norm()-1)>1e-8||(p.reference[anchors_[q]]-targets[q]).dot(side_normals_[q])<=0)throw std::invalid_argument("Crack trace side does not contain its material anchor");
         std::unordered_map<Cell,StdVec<size_t>,Hash>cells;
         for(size_t j=0;j<p.count;++j)cells[cell(p.reference[j])].push_back(j);
@@ -59,7 +65,8 @@ class VisibleCrackSurface : public ReferenceSolidSurface
         reference_.registerTraceSupport(support_);
         rebuildAll();
     }
-    size_t materialAnchor(size_t q)const{return anchors_.at(q);}
+    size_t materialAnchor(size_t q)const{ensureCurrent();return fit_info_.at(q).anchor;}
+    size_t reassignedPoints()const{ensureCurrent();size_t count=0;for(size_t q=0;q<anchors_.size();++q)count+=fit_info_[q].anchor!=anchors_[q];return count;}
     size_t builtTopologyVersion()const{return version_;}
     bool isCurrent()const{return version_==reference_.topology_version&&!reference_.topologyPending()&&!transfer_pending_;}
     size_t mappingVersion()const override{return generation_;}
@@ -93,11 +100,12 @@ class VisibleCrackSurface : public ReferenceSolidSurface
     using Cell=std::array<long long,3>;
     struct Hash
     {size_t operator()(const Cell&a)const{size_t h=0;for(long long v:a)h^=std::hash<long long>{}(v)+0x9e3779b9+(h<<6)+(h>>2);return h;}};
-    struct FitInfo {int order=0;Real affine=0,polynomial=0,value=0,condition=0,l1=0;};
+    struct FitInfo {int order=0;size_t anchor=~size_t(0);Real affine=0,polynomial=0,value=0,condition=0,l1=0;};
     solid_dynamics::PDLayeredFractureReference&reference_;
     StdVec<size_t>anchors_;
     StdVec<Vecd>original_targets_,side_normals_,transfer_values_,transfer_velocity_values_;
     Real dp_,support_;
+    AnchorOwnership ownership_;
     size_t version_=~size_t(0),generation_=0;bool transfer_pending_=false;
     StdVec<StdVec<size_t>>candidate_,affected_;
     StdVec<FitInfo>fit_info_;
@@ -151,9 +159,24 @@ class VisibleCrackSurface : public ReferenceSolidSurface
         return true;
     }
     bool onSide(size_t q,size_t j)const{return side_normals_.empty()||(port.reference[j]-points[q]).dot(side_normals_[q])>=-128*std::numeric_limits<Real>::epsilon()*dp_;}
+    size_t resolveAnchor(size_t q)const
+    {
+        // Resolve from the original reference anchor on every rebuild. No
+        // current-position nearest search, history-dependent fragment switch,
+        // enlarged support or crossing of a recorded crack is permitted.
+        const size_t original=anchors_[q];
+        if(ownership_==AnchorOwnership::MaterialNode||reference_.visibleReference(reference_.X[original],points[q]))return original;
+        size_t owner=port.count;Real best=std::numeric_limits<Real>::infinity();
+        for(size_t j:candidate_[q])if(onSide(q,j)&&reference_.visibleReference(points[q],reference_.X[j])){
+            Real distance=(reference_.X[j]-points[q]).squaredNorm();
+            if(distance<best){best=distance;owner=j;}
+        }
+        if(owner==port.count)throw std::runtime_error("Reference boundary point has no visible material owner in its unchanged support");
+        return owner;
+    }
     void buildRow(size_t q,Row&row,FitInfo&info)const
     {
-        size_t anchor=anchors_[q];
+        size_t anchor=resolveAnchor(q);info.anchor=anchor;
         if(!reference_.visibleReference(reference_.X[anchor],points[q]))
             throw std::runtime_error("Crack trace target lies across a crack from its own material anchor");
         // Geometric visibility and local LIVE connectivity are both needed:

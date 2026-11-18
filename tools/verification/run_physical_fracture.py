@@ -57,7 +57,8 @@ def run(a):
     manifest.update(completed_dynamic_checkpoint=str(completed),completed_dynamic_checkpoint_sha256=sha(completed))
     output=root/'benchmark';native('benchmark_work_contact',output,{'PERI_GROWTH_RESUME_COMPLETED_DYNAMIC':str(completed)},0)
     acceptance=json.loads((output/'acceptance.json').read_text());growth=json.loads((output/'automatic_growth_acceptance.json').read_text());protocol=json.loads((output/'opening_protocol.json').read_text())
-    if acceptance.get('overall_status')!='PASSED' or growth.get('status')!='PASSED' or not protocol.get('completed_dynamic_state_restart_passed'):raise RuntimeError('Formal fracture acceptance is not PASSED')
+    ownership=json.loads((output/'surface_ownership_acceptance.json').read_text())
+    if acceptance.get('overall_status')!='PASSED' or growth.get('status')!='PASSED' or ownership.get('status')!='PASSED' or not protocol.get('completed_dynamic_state_restart_passed'):raise RuntimeError('Formal fracture/ownership acceptance is not PASSED')
     # Preserve both native segments; expose one full dynamic curve and a PVD
     # referring to its original frames. Opening has a separate load-parameter PVD.
     for name in ['automatic_growth.csv','automatic_growth_events.csv']:
@@ -68,7 +69,7 @@ def run(a):
     for dataset in tree.findall('.//DataSet'):dataset.set('file',os.path.relpath((origin/dataset.get('file')).resolve(),output).replace(os.sep,'/'))
     tree.write(output/'automatic_growth.pvd',encoding='utf-8',xml_declaration=True)
     put(output/'dynamic_curve_origin.json',{'directory':str(origin),'checkpoint_sha256':sha(completed),'same_complete_state':True,'no_time_or_material_history_reset':True,'prescribed_opening_is_separate_spatial_work_test':True})
-    manifest.update(status='PASSED',exit_code=0,ended_UTC=utc(),opening_protocol=protocol);put(root/'benchmark_process.json',manifest);print('FORMAL_FRACTURE_ACCEPTANCE_PASSED',flush=True)
+    manifest.update(status='PASSED',exit_code=0,ended_UTC=utc(),opening_protocol=protocol,surface_ownership=ownership);put(root/'benchmark_process.json',manifest);print('FORMAL_FRACTURE_ACCEPTANCE_PASSED',flush=True)
 
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--source',required=True);p.add_argument('--build',required=True);p.add_argument('--output-root',required=True);p.add_argument('--completed-state');a=p.parse_args()

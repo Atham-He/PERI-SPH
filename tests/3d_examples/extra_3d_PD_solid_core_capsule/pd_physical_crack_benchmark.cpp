@@ -189,6 +189,73 @@ int main(int argc,char**argv){bool published=false;try{
    for(size_t j=0;j<count;++j){s.x[j]=saved_x[j];s.v[j]=saved_v[j];}port.clear();
    if(!passed)throw std::runtime_error("Fixed-column force, lever arm or work acceptance failed");
   }
+  {
+   // On the same slab, a smooth displacement across the future cut has
+   // different polynomial data on either side. After the cut the old plate
+   // point cannot be reproduced with all quadratic moments on one side.
+   const auto saved_topology=ref.captureTopology();
+   StdVec<Vecd> saved_x(s.x,s.x+count),saved_v(s.v,s.v+count);
+   ref.restoreTopology(intact_topology);
+   bulk.rebuild();
+   for(size_t i=0;i<count;++i){
+       Vecd X=s.x0[i]/dp;
+       Real x=X[0],y=X[1],z=X[2],left=std::min(x,Real(0));
+       s.x[i]=s.x0[i]+.0005*dp*Vecd(x*y+left*left*left,y*z+.5*left*left*left,
+                                   x*x+z*z+.7*left*left*left);
+       s.v[i]=Vecd(.013+.002*x,-.007+.001*y,.02+.003*z);
+   }
+   StdVec<Vecd> surface_points{Vecd(.12*dp,.18*dp,t/2)};
+   auto owner=anchors(surface_points,1);
+   VisibleCrackSurface strict(port,surface_points,owner,ref,dp,2.5,2);
+   VisibleCrackSurface platen(port,surface_points,owner,ref,dp,2.5,2,{},{},{},
+                              VisibleCrackSurface::AnchorOwnership::ReferencePoint,
+                              VisibleCrackSurface::TransferOrder::AllowAffinePositionTransfer);
+   if(platen.row_order[0]!=2)throw std::runtime_error("Platen fixture did not start in quadratic order");
+   SolidSurfacePlaneContact plane(platen,{dp*dp},K,dp);
+   const Vecd previous=platen.position(0);
+   const Real upper=previous[2]-.01*dp,lower=upper-3*t;
+   auto contact_energy=[&](){port.clear();plane.apply(lower,upper);return plane.energy;};
+   const Real before=contact_energy();
+   const Vecd previous_force=plane.force[0];
+   strict.captureTransferValues();platen.captureTransferValues();
+   if(!ref.cutPlane(Vecd::Zero(),Vecd::UnitX()))throw std::runtime_error("Platen fixture did not cut slab");
+   bulk.rebuild();
+   for(size_t i=0;i<count;++i)bulk.evaluate(i);
+   ref.setTransferState(StdVec<Vecd>(s.x,s.x+count),StdVec<Matd>(bulk.F,bulk.F+count),StdVec<Vecd>(s.v,s.v+count));
+   ref.updateAfterFailure();
+   bool strict_unresolved=false;
+   try{strict.rebuildChanged();}
+   catch(const std::runtime_error&e){strict_unresolved=std::string(e.what()).find("Conservative reconstruction unresolved")!=std::string::npos;}
+   platen.rebuildChanged();
+   const Real after=contact_energy();
+   const Real position_error=(platen.position(0)-previous).norm();
+   const Real energy_error=std::abs(after/before-1);
+   Vecd total_force=Vecd::Zero(),moment=Vecd::Zero();
+   Real power=0;size_t crossing=0;
+   for(size_t i=0;i<count;++i){
+       Vecd force=s.mass[i]*port.external[i];total_force+=force;moment+=s.x[i].cross(force);power+=force.dot(s.v[i]);
+   }
+   for(size_t i:platen.rows[0].index)crossing+=s.x0[i][0]<=0||!ref.visibleReference(surface_points[0],s.x0[i]);
+   const Real force_error=(total_force-previous_force).norm()/previous_force.norm();
+   const Real lever_error=(moment-previous.cross(previous_force)).norm()/(dp*previous_force.norm());
+   const Real h=1e-10;
+   for(size_t i=0;i<count;++i)s.x[i]+=h*s.v[i];const Real plus=contact_energy();
+   for(size_t i=0;i<count;++i)s.x[i]-=2*h*s.v[i];const Real minus=contact_energy();
+   const Real work_error=std::abs((plus-minus)/(2*h)+power)/std::abs(power);
+   const bool passed=strict_unresolved&&platen.row_order[0]==1&&platen.position_fallback_points==1&&
+                     !crossing&&position_error<=2e-15&&force_error<1e-8&&lever_error<1e-8&&
+                     energy_error<1e-8&&work_error<1e-5;
+   std::ofstream report(out/"platen_transfer_acceptance.json");
+   report<<std::setprecision(17)<<"{\"status\":\""<<(passed?"PASSED":"FAILED")
+         <<"\",\"same_specimen_particles\":"<<count<<",\"quadratic_confirmed_unresolved\":"<<(strict_unresolved?"true":"false")
+         <<",\"affine_points\":"<<platen.position_fallback_points<<",\"crossing_entries\":"<<crossing
+         <<",\"position_transfer_error_m\":"<<position_error<<",\"force_relative_error\":"<<force_error
+         <<",\"moment_relative_error_over_spacing\":"<<lever_error<<",\"contact_energy_relative_error\":"<<energy_error
+         <<",\"force_work_relative_error\":"<<work_error<<",\"trace_weight_l1\":"<<platen.maximum_weight_l1<<"}\n";
+   for(size_t i=0;i<count;++i){s.x[i]=saved_x[i];s.v[i]=saved_v[i];}
+   ref.restoreTopology(saved_topology);bulk.rebuild();port.clear();
+   if(!passed)throw std::runtime_error("Platen position, lever-arm or energy transfer acceptance failed");
+  }
    auto automatic_growth=runAutomaticGrowthBenchmark(out,ref,bulk,port,intact_topology,s.x0,s.mass,s.x,s.v,acc,E,nu,ft,Gc,dp,t,K,nx,ny);
  if(automatic_growth.completed_only){std::ofstream report(out/"acceptance.json");report<<R"({"geometry_status":"PASSED","overall_status":"DYNAMIC_STAGE_COMPLETE_GC_PENDING","capsule_restart_allowed":false})"<<'\n';std::cout<<"COMPLETED_DYNAMIC_CHECKPOINT_SAVED"<<std::endl;return 86;}
   bool pass=geometry_pass&&automatic_growth.passed;

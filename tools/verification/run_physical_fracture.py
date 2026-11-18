@@ -47,7 +47,32 @@ def run(a):
         return stage
     if a.completed_state:
         completed=Path(a.completed_state).resolve();origin=completed.parent;old=json.loads((origin/'process_identity.json').read_text())
-        if old.get('physics_fingerprint')!=fingerprint or old.get('exit_code')!=86:raise RuntimeError('Completed dynamic origin is not compatible and accepted')
+        if old.get('exit_code')!=86:raise RuntimeError('Completed dynamic origin did not finish its dynamic stage')
+        if old.get('physics_fingerprint')!=fingerprint:
+            if not a.recheck_platen_transfer:
+                raise RuntimeError('Completed dynamic origin is not compatible and accepted')
+            # A plate-only transfer repair leaves the default free fracture
+            # and crack-face operators intact. Retain the original dynamic
+            # evidence, then verify this executable against the exact saved
+            # forces, energy and cohesive state before the work/contact phase.
+            previous=json.loads((origin.parent/'benchmark_process.json').read_text())
+            unchanged_except={
+                'tests/3d_examples/extra_3d_PD_solid_core_capsule/pd_physical_crack_benchmark.cpp',
+                'src/shared/peridynamics/pd_consistent_reconstruction.h',
+                'src/shared/peridynamics/pd_fracture_visible_surface.h',
+            }
+            old_hashes=previous['verified_source_files_sha256']
+            changed={p for p in old_hashes.keys()|hashes.keys() if old_hashes.get(p)!=hashes.get(p)}
+            if (previous.get('status')!='PASSED' or previous.get('exit_code')!=0 or
+                previous.get('physics_fingerprint')!=old.get('physics_fingerprint') or
+                Path(previous['completed_dynamic_checkpoint']).resolve()!=completed or
+                previous.get('completed_dynamic_checkpoint_sha256')!=sha(completed) or
+                not changed<=unchanged_except):
+                raise RuntimeError('Prior published dynamics are outside the platen-only verification scope')
+            env['PERI_GROWTH_PHYSICS_FINGERPRINT']=old['physics_fingerprint']
+            manifest.update(loaded_dynamic_fingerprint=old['physics_fingerprint'],
+                            prior_dynamic_receipt_sha256=sha(origin.parent/'benchmark_process.json'),
+                            rechecked_platen_transfer=True)
         manifest['resumed_dynamic_origin']=str(origin)
     else:
         origin=root/'benchmark_dynamic';stage=native('benchmark_dynamic',origin,{'PERI_GROWTH_STOP_AFTER_COMPLETED_DYNAMIC':'1'},86)
@@ -58,7 +83,8 @@ def run(a):
     output=root/'benchmark';native('benchmark_work_contact',output,{'PERI_GROWTH_RESUME_COMPLETED_DYNAMIC':str(completed)},0)
     acceptance=json.loads((output/'acceptance.json').read_text());growth=json.loads((output/'automatic_growth_acceptance.json').read_text());protocol=json.loads((output/'opening_protocol.json').read_text())
     ownership=json.loads((output/'surface_ownership_acceptance.json').read_text())
-    if acceptance.get('overall_status')!='PASSED' or growth.get('status')!='PASSED' or ownership.get('status')!='PASSED' or not protocol.get('completed_dynamic_state_restart_passed'):raise RuntimeError('Formal fracture/ownership acceptance is not PASSED')
+    platen=json.loads((output/'platen_transfer_acceptance.json').read_text())
+    if acceptance.get('overall_status')!='PASSED' or growth.get('status')!='PASSED' or ownership.get('status')!='PASSED' or platen.get('status')!='PASSED' or not protocol.get('completed_dynamic_state_restart_passed'):raise RuntimeError('Formal fracture and platen transfer acceptance is not PASSED')
     # Preserve both native segments; expose one full dynamic curve and a PVD
     # referring to its original frames. Opening has a separate load-parameter PVD.
     for name in ['automatic_growth.csv','automatic_growth_events.csv']:
@@ -69,10 +95,10 @@ def run(a):
     for dataset in tree.findall('.//DataSet'):dataset.set('file',os.path.relpath((origin/dataset.get('file')).resolve(),output).replace(os.sep,'/'))
     tree.write(output/'automatic_growth.pvd',encoding='utf-8',xml_declaration=True)
     put(output/'dynamic_curve_origin.json',{'directory':str(origin),'checkpoint_sha256':sha(completed),'same_complete_state':True,'no_time_or_material_history_reset':True,'prescribed_opening_is_separate_spatial_work_test':True})
-    manifest.update(status='PASSED',exit_code=0,ended_UTC=utc(),opening_protocol=protocol,surface_ownership=ownership);put(root/'benchmark_process.json',manifest);print('FORMAL_FRACTURE_ACCEPTANCE_PASSED',flush=True)
+    manifest.update(status='PASSED',exit_code=0,ended_UTC=utc(),opening_protocol=protocol,surface_ownership=ownership,platen_transfer=platen);put(root/'benchmark_process.json',manifest);print('FORMAL_FRACTURE_ACCEPTANCE_PASSED',flush=True)
 
 if __name__=='__main__':
-    p=argparse.ArgumentParser();p.add_argument('--source',required=True);p.add_argument('--build',required=True);p.add_argument('--output-root',required=True);p.add_argument('--completed-state');a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--source',required=True);p.add_argument('--build',required=True);p.add_argument('--output-root',required=True);p.add_argument('--completed-state');p.add_argument('--recheck-platen-transfer',action='store_true');a=p.parse_args()
     try:run(a)
     except BaseException as error:
         root=Path(a.output_root);root.mkdir(parents=True,exist_ok=True);path=root/'benchmark_process.json';state=json.loads(path.read_text()) if path.exists() else {};state.update(status='FAILED',exit_code=1,error=str(error),traceback=traceback.format_exc(),recorded_UTC=utc());put(path,state);raise

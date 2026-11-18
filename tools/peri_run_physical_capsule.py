@@ -80,7 +80,8 @@ def run(a):
     acceptance=json.loads((Path(a.benchmark_root)/'acceptance.json').read_text());growth=json.loads((Path(a.benchmark_root)/'automatic_growth_acceptance.json').read_text());preflight=json.loads(Path(a.preflight).read_text())
     benchmark_manifest=json.loads(Path(a.benchmark_manifest).read_text());preflight_manifest=json.loads(Path(a.preflight_manifest).read_text())
     ownership=json.loads((Path(a.benchmark_root)/'surface_ownership_acceptance.json').read_text())
-    if acceptance.get('overall_status')!='PASSED' or growth.get('status')!='PASSED' or ownership.get('status')!='PASSED' or preflight.get('status')!='PASSED':raise RuntimeError('Physical growth/energy/ownership or coupled-driver gate is not PASSED')
+    platen=json.loads((Path(a.benchmark_root)/'platen_transfer_acceptance.json').read_text())
+    if acceptance.get('overall_status')!='PASSED' or growth.get('status')!='PASSED' or ownership.get('status')!='PASSED' or platen.get('status')!='PASSED' or preflight.get('status')!='PASSED':raise RuntimeError('Physical growth, platen transfer or coupled-driver gate is not PASSED')
     if benchmark_manifest.get('exit_code')!=0 or benchmark_manifest.get('diagnostic_replay') is not False:raise RuntimeError('Formal benchmark did not exit successfully or was a diagnostic replay')
     if a.column_tied_interface:
         column=json.loads((Path(a.benchmark_root)/'column_interface_acceptance.json').read_text())

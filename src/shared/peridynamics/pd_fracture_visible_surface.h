@@ -19,15 +19,17 @@ class VisibleCrackSurface : public ReferenceSolidSurface
     // quadrature point instead belongs to its immutable reference coordinate:
     // its pre-fracture nearest node may be across a newly inserted crack.
     enum class AnchorOwnership { MaterialNode, ReferencePoint };
+    enum class TransferOrder { PreservePolynomial, AllowAffinePositionTransfer };
     StdVec<int> row_order;
-    size_t affine_points=0,inactive_points=0;
+    size_t affine_points=0,inactive_points=0,position_fallback_points=0;
     Real maximum_value_error=0,maximum_weight_l1=0;
     VisibleCrackSurface(SolidForcePort&p,const StdVec<Vecd>&targets,
                         const StdVec<size_t>&target_anchors,
                         solid_dynamics::PDLayeredFractureReference&r,
-                        Real spacing,Real support_ratio=2.5,unsigned order=2,const StdVec<Vecd>&side_normals={},const StdVec<Vecd>&transfer_values={},const StdVec<Vecd>&transfer_velocities={},AnchorOwnership ownership=AnchorOwnership::MaterialNode)
+                        Real spacing,Real support_ratio=2.5,unsigned order=2,const StdVec<Vecd>&side_normals={},const StdVec<Vecd>&transfer_values={},const StdVec<Vecd>&transfer_velocities={},AnchorOwnership ownership=AnchorOwnership::MaterialNode,
+                        TransferOrder transfer_order=TransferOrder::PreservePolynomial)
       :ReferenceSolidSurface(p,targets,order,DeferredBuildTag{}),reference_(r),
-        anchors_(target_anchors),original_targets_(targets),side_normals_(side_normals),transfer_values_(transfer_values),transfer_velocity_values_(transfer_velocities),dp_(spacing),support_(spacing*support_ratio),ownership_(ownership)
+        anchors_(target_anchors),original_targets_(targets),side_normals_(side_normals),transfer_values_(transfer_values),transfer_velocity_values_(transfer_velocities),dp_(spacing),support_(spacing*support_ratio),ownership_(ownership),transfer_order_(transfer_order)
     {
         if(spacing<=0||support_ratio<=1||!std::isfinite(support_)||order<1||order>2)
             throw std::invalid_argument("Invalid one-sided crack trace support/order");
@@ -100,12 +102,13 @@ class VisibleCrackSurface : public ReferenceSolidSurface
     using Cell=std::array<long long,3>;
     struct Hash
     {size_t operator()(const Cell&a)const{size_t h=0;for(long long v:a)h^=std::hash<long long>{}(v)+0x9e3779b9+(h<<6)+(h>>2);return h;}};
-    struct FitInfo {int order=0;size_t anchor=~size_t(0);Real affine=0,polynomial=0,value=0,condition=0,l1=0;};
+    struct FitInfo {int order=0;size_t anchor=~size_t(0);bool position_fallback=false;Real affine=0,polynomial=0,value=0,condition=0,l1=0;};
     solid_dynamics::PDLayeredFractureReference&reference_;
     StdVec<size_t>anchors_;
     StdVec<Vecd>original_targets_,side_normals_,transfer_values_,transfer_velocity_values_;
     Real dp_,support_;
     AnchorOwnership ownership_;
+    TransferOrder transfer_order_;
     size_t version_=~size_t(0),generation_=0;bool transfer_pending_=false;
     StdVec<StdVec<size_t>>candidate_,affected_;
     StdVec<FitInfo>fit_info_;
@@ -174,6 +177,43 @@ class VisibleCrackSurface : public ReferenceSolidSurface
         if(owner==port.count)throw std::runtime_error("Reference boundary point has no visible material owner in its unchanged support");
         return owner;
     }
+    void transferRow(size_t q,const StdVec<size_t>&nodes,const StdVec<Real>&weight,
+                     const Matd&L,Row&row,FitInfo&info)const
+    {
+        if(transfer_values_.empty())return;
+        if(reference_.transfer_positions.size()!=port.count)
+            throw std::runtime_error("Trace transfer has no matching continuous-state field");
+        const size_t modes=info.order==2?10:4;
+        const size_t fields=transfer_velocity_values_.empty()?3:6;
+        const Real tau=reference_.transferVelocityTimeScale();
+        if(fields==6&&reference_.transfer_velocity.size()!=port.count)
+            throw std::runtime_error("Missing trace velocity transfer state");
+        Eigen::MatrixXd B(nodes.size(),modes),Y(nodes.size(),fields),G(nodes.size(),1);
+        Eigen::VectorXd W(nodes.size());
+        for(size_t a=0;a<nodes.size();++a){
+            Vecd z=L*((port.reference[nodes[a]]-points[q])/dp_);
+            if(modes==10)B.row(a)=basis<10>(z).transpose();
+            else B.row(a)=basis<4>(z).transpose();
+            Y.block(a,0,1,3)=reference_.transfer_positions[nodes[a]].transpose();
+            if(fields==6)Y.block(a,3,1,3)=tau*reference_.transfer_velocity[nodes[a]].transpose();
+            G(a,0)=row.weight[a];W[a]=weight[a];
+        }
+        Eigen::MatrixXd target(fields,1);target.topRows(3)=transfer_values_[q];
+        if(fields==6)target.bottomRows(3)=tau*transfer_velocity_values_[q];
+        transferReconstruction(B,W,Y,G,target,2e-15);
+
+        Real sum=0;Vecd affine=Vecd::Zero();
+        Eigen::VectorXd polynomial=Eigen::VectorXd::Zero(modes);info.l1=0;
+        for(size_t a=0;a<nodes.size();++a){
+            const Real w=G(a,0);row.weight[a]=w;sum+=w;
+            affine+=w*(port.reference[nodes[a]]-points[q])/dp_;
+            polynomial+=w*B.row(a).transpose();info.l1+=std::abs(w);
+        }
+        polynomial[0]-=1;
+        info.affine=std::max(std::abs(sum-1),affine.norm());info.polynomial=polynomial.norm();
+        if(info.affine>1e-8||info.polynomial>1e-8)
+            throw std::runtime_error("State transfer lost crack-trace polynomial consistency");
+    }
     void buildRow(size_t q,Row&row,FitInfo&info)const
     {
         size_t anchor=resolveAnchor(q);info.anchor=anchor;
@@ -201,15 +241,18 @@ class VisibleCrackSurface : public ReferenceSolidSurface
         bool accepted=reproduction_order==2&&fit<10>(q,nodes,weight,L,row,info);
         if(!accepted)accepted=fit<4>(q,nodes,weight,L,row,info);
         if(!accepted)throw std::runtime_error("One-sided crack trace value functional is unresolved at target "+std::to_string(q)+" (anchor "+std::to_string(anchor)+"); no bonding constraint or material was removed to bypass fit failure");
-        if(!transfer_values_.empty()){
-            if(reference_.transfer_positions.size()!=port.count)throw std::runtime_error("Trace transfer has no matching continuous-state field");
-            const size_t modes=info.order==2?10:4,fields=transfer_velocity_values_.empty()?3:6;Real tau=reference_.transferVelocityTimeScale();if(fields==6&&reference_.transfer_velocity.size()!=port.count)throw std::runtime_error("Missing trace velocity transfer state");Eigen::MatrixXd B(nodes.size(),modes),Y(nodes.size(),fields),G(nodes.size(),1);Eigen::VectorXd W(nodes.size());
-            for(size_t a=0;a<nodes.size();++a){Vecd z=L*((port.reference[nodes[a]]-points[q])/dp_);if(modes==10)B.row(a)=basis<10>(z).transpose();else B.row(a)=basis<4>(z).transpose();Y.block(a,0,1,3)=reference_.transfer_positions[nodes[a]].transpose();if(fields==6)Y.block(a,3,1,3)=tau*reference_.transfer_velocity[nodes[a]].transpose();G(a,0)=row.weight[a];W[a]=weight[a];}
-            Eigen::MatrixXd target(fields,1);target.topRows(3)=transfer_values_[q];if(fields==6)target.bottomRows(3)=tau*transfer_velocity_values_[q];try{transferReconstruction(B,W,Y,G,target,2e-15);}catch(const std::exception&e){throw std::runtime_error("Surface transfer point "+std::to_string(q)+": "+e.what());}
-            Real sum=0;Vecd affine=Vecd::Zero();Eigen::VectorXd polynomial=Eigen::VectorXd::Zero(modes);info.l1=0;
-            for(size_t a=0;a<nodes.size();++a){row.weight[a]=G(a,0);sum+=row.weight[a];affine+=row.weight[a]*(port.reference[nodes[a]]-points[q])/dp_;polynomial+=row.weight[a]*B.row(a).transpose();info.l1+=std::abs(row.weight[a]);}
-            polynomial[0]-=1;info.affine=std::max(std::abs(sum-1),affine.norm());info.polynomial=polynomial.norm();
-            if(info.affine>1e-8||info.polynomial>1e-8)throw std::runtime_error("State transfer lost crack-trace polynomial consistency");
+        try{
+            try{transferRow(q,nodes,weight,L,row,info);}
+            catch(const UnresolvedReconstruction&){
+                if(transfer_order_!=TransferOrder::AllowAffinePositionTransfer||info.order!=2||
+                    !transfer_velocity_values_.empty()||!fit<4>(q,nodes,weight,L,row,info))throw;
+                // The support, physical trace point and position tolerance
+                // are identical. Only the unsupported quadratic moments go.
+                transferRow(q,nodes,weight,L,row,info);
+                info.position_fallback=true;
+            }
+        }catch(const std::exception&e){
+            throw std::runtime_error("Surface transfer point "+std::to_string(q)+": "+e.what());
         }
         // Check the committed row against current visibility, independently of
         // polynomial reproduction. No weight clipping or post-normalization.
@@ -222,10 +265,11 @@ class VisibleCrackSurface : public ReferenceSolidSurface
         StdVec<Row>next(ids.size());StdVec<FitInfo>info(ids.size());
         for(size_t k=0;k<ids.size();++k)buildRow(ids[k],next[k],info[k]);
         for(size_t k=0;k<ids.size();++k){rows[ids[k]]=std::move(next[k]);fit_info_[ids[k]]=info[k];row_order[ids[k]]=info[k].order;}
-        affine_points=inactive_points=0;affine_error=polynomial_error=largest_condition_number=maximum_value_error=maximum_weight_l1=0;
+        affine_points=inactive_points=position_fallback_points=0;affine_error=polynomial_error=largest_condition_number=maximum_value_error=maximum_weight_l1=0;
         for(const auto&f:fit_info_)
         {
             if(f.order==0)throw std::logic_error("A crack trace row has no accepted material value functional");
+            position_fallback_points+=f.position_fallback;
             affine_points+=f.order==1;affine_error=std::max(affine_error,f.affine);polynomial_error=std::max(polynomial_error,f.polynomial);
             largest_condition_number=std::max(largest_condition_number,f.condition);maximum_value_error=std::max(maximum_value_error,f.value);maximum_weight_l1=std::max(maximum_weight_l1,f.l1);
         }

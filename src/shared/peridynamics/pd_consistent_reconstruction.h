@@ -11,6 +11,11 @@
 #include <iomanip>
 #include <sstream>
 namespace SPH::peridynamics {
+class UnresolvedReconstruction : public std::runtime_error
+{
+  public:
+    using std::runtime_error::runtime_error;
+};
 /** Minimum weighted change of a discrete reconstruction, subject to its old
  * polynomial moments AND a transferred continuous-state functional.
  * No q, velocity, mass, material constant or force is altered. The resulting
@@ -54,7 +59,7 @@ inline void transferReconstruction(const Eigen::MatrixXd&B,const Eigen::VectorXd
     M change=next-G;Real polynomial_error=(B.transpose()*change).norm(),transfer_error=(Y.transpose()*next-target).norm();
     if(!next.allFinite()||polynomial_error>1e-8*std::max(Real(1),G.norm())||transfer_error>tolerance){
         if(const char*path=std::getenv("PERI_TRANSFER_AUDIT_FILE")){std::ifstream existing(path);if(!existing.good()){std::ofstream f(path);f<<std::setprecision(17)<<B.rows()<<' '<<B.cols()<<' '<<Y.cols()<<' '<<G.cols()<<' '<<tolerance<<'\n';auto matrix=[&](const auto&a){f<<a.rows()<<' '<<a.cols()<<'\n'<<a<<'\n';};matrix(B);matrix(W);matrix(Y);matrix(G);matrix(target);matrix(next);matrix(svd.singularValues());}}
-        std::ostringstream message;message<<std::setprecision(17)<<"Conservative reconstruction unresolved: state_error="<<transfer_error<<", tolerance="<<tolerance<<", polynomial_error="<<polynomial_error<<", fields="<<Y.cols()<<", rank="<<svd.rank();throw std::runtime_error(message.str());
+        std::ostringstream message;message<<std::setprecision(17)<<"Conservative reconstruction unresolved: state_error="<<transfer_error<<", tolerance="<<tolerance<<", polynomial_error="<<polynomial_error<<", fields="<<Y.cols()<<", rank="<<svd.rank();throw UnresolvedReconstruction(message.str());
     }
     G=std::move(next);
 }

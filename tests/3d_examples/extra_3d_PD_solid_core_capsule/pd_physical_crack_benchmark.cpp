@@ -1,5 +1,6 @@
 #include "pd_snsni_capsule_fixture.h"
 #include "pd_broken_bond_energy.h"
+#include "pd_column_face_surface.h"
 #include "pd_fracture_visible_surface.h"
 #include "pd_crack_face_contact.h"
 #include "pd_cohesive_crack_law.h"
@@ -146,6 +147,47 @@ int main(int argc,char**argv){bool published=false;try{
    std::ofstream report(out/"surface_ownership_acceptance.json");report<<std::setprecision(17)<<"{\"status\":\""<<(passed?"PASSED":"FAILED")<<"\",\"same_specimen_particles\":"<<count<<",\"reassigned_boundary_points\":"<<owned.reassignedPoints()<<",\"wrong_fixed_owner_rejected\":"<<(fixed_rejected?"true":"false")<<",\"cross_crack_interpolation_entries\":"<<cross_entries<<",\"position_transfer_error_over_spacing\":"<<transfer_error<<",\"physical_and_constraint_energy_relative_error\":"<<energy_error<<",\"separate_stabilizer_loss_J\":"<<hg_loss<<",\"force_work_relative_error\":"<<work_error<<",\"opposite_fragment_motion_leak_over_spacing\":"<<opposite_motion<<",\"restored_weight_error\":"<<restart_error<<",\"parameters_changed\":false}\n";report.close();
    for(size_t i=0;i<count;++i){s.x[i]=saved_x[i];s.v[i]=saved_v[i];}ref.restoreTopology(saved);bulk.rebuild();
    if(!passed)throw std::runtime_error("Same-specimen boundary ownership/energy acceptance failed");
+  }
+  {
+   // The same precracked slab, held at a known rigid pose. Check the work and
+   // moment of normal tension and tangential traction applied at its inner face.
+   StdVec<Vecd>saved_x(s.x,s.x+count),saved_v(s.v,s.v+count);
+   ColumnFaceSolidSurface columns_at_face(port,geometry,-1);
+   Matd rotation=Eigen::AngleAxis<Real>(.37,Vecd(1,2,3).normalized()).toRotationMatrix();
+   set(0,0,rotation);
+   const size_t q=(nx/2)*ny+ny/2;
+   const auto&column=geometry.columns[q];
+   const Vecd force=rotation*Vecd(.03,-.04,-.05);
+   Vecd arm=-.5*t*(rotation*Vecd::UnitZ());
+   Vecd center=s.x[column[1]],expected_point=center+arm;
+   Real position_error=(columns_at_face.position(q)-expected_point).norm()/t;
+   port.clear();columns_at_face.scatter(q,force);
+   Vecd actual_force=Vecd::Zero(),moment=Vecd::Zero();size_t other_columns=0;
+   for(size_t j=0;j<count;++j){Vecd f=s.mass[j]*port.external[j];actual_force+=f;moment+=(s.x[j]-center).cross(f);other_columns+=f.squaredNorm()>0&&geometry.column_of[j]!=q;}
+   Real force_error=(actual_force-force).norm()/force.norm();
+   Real moment_error=(moment-arm.cross(force)).norm()/(t*force.norm());
+   const Vecd tie_gap=rotation*Vecd(.02*dp,-.01*dp,-.005*dp);
+   const Vecd target=columns_at_face.position(q)-tie_gap;
+   const Real k=K*dp*dp;
+   auto potential=[&](){return .5*k*(columns_at_face.position(q)-target).squaredNorm();};
+   port.clear();columns_at_face.scatter(q,-k*tie_gap);
+   Real power=0;for(size_t j=0;j<count;++j){s.v[j]=rotation*Vecd(.02,.01,-.03+.005*geometry.layer_of[j]);power+=s.mass[j]*port.external[j].dot(s.v[j]);}
+   const Real delta=1e-9;
+   for(size_t j=0;j<count;++j)s.x[j]+=delta*s.v[j];const Real plus=potential();
+   for(size_t j=0;j<count;++j)s.x[j]-=2*delta*s.v[j];const Real minus=potential();
+   Real work_error=std::abs((plus-minus)/(2*delta)+power)/std::abs(power);
+   Vecd held=columns_at_face.position(q);
+   for(size_t j=0;j<count;++j)if(s.x0[j][0]<0)s.x[j]+=rotation*Vecd(-20e-6,7e-6,0);
+   Real motion_leak=(columns_at_face.position(q)-held).norm()/dp;
+   bool passed=position_error<1e-10&&force_error<1e-12&&moment_error<1e-10&&work_error<1e-6&&other_columns==0&&motion_leak==0;
+   std::ofstream report(out/"column_interface_acceptance.json");report<<std::setprecision(17)
+       <<"{\"status\":\""<<(passed?"PASSED":"FAILED")<<"\",\"same_specimen_particles\":"<<count
+       <<",\"surface_arm_m\":"<<arm.norm()<<",\"position_error_over_thickness\":"<<position_error
+       <<",\"force_relative_error\":"<<force_error<<",\"moment_relative_error\":"<<moment_error
+       <<",\"force_work_relative_error\":"<<work_error<<",\"other_columns_receiving_force\":"<<other_columns
+       <<",\"opposite_fragment_motion_leak_over_spacing\":"<<motion_leak<<"}\n";
+   for(size_t j=0;j<count;++j){s.x[j]=saved_x[j];s.v[j]=saved_v[j];}port.clear();
+   if(!passed)throw std::runtime_error("Fixed-column force, lever arm or work acceptance failed");
   }
    auto automatic_growth=runAutomaticGrowthBenchmark(out,ref,bulk,port,intact_topology,s.x0,s.mass,s.x,s.v,acc,E,nu,ft,Gc,dp,t,K,nx,ny);
  if(automatic_growth.completed_only){std::ofstream report(out/"acceptance.json");report<<R"({"geometry_status":"PASSED","overall_status":"DYNAMIC_STAGE_COMPLETE_GC_PENDING","capsule_restart_allowed":false})"<<'\n';std::cout<<"COMPLETED_DYNAMIC_CHECKPOINT_SAVED"<<std::endl;return 86;}

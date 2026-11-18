@@ -64,6 +64,7 @@ class Control {
  public:
     std::string resume,fingerprint;
     uint64_t stop_step=0,schema_version=2;bool stop_after_equilibrium=false;
+    uint64_t compatible_read_version=0,read_version=0;
     bool take(const std::string&s){
         if(s=="--checkpoint-stop-after-equilibrium")stop_after_equilibrium=true;
         else if(s.rfind("--resume-state=",0)==0)resume=s.substr(15);
@@ -90,7 +91,8 @@ class Control {
         if(!enabled())throw std::runtime_error("Resume requires a pinned input/source fingerprint");
         Archive a(resume,true);std::string magic,identity,folder;uint64_t version=0;
         a.fields(magic,version,identity,folder);
-        if(magic!="PERI_SNSNI_RESTART"||version!=schema_version||identity!=fingerprint)throw std::runtime_error("Checkpoint identity/version mismatch");
+        if(magic!="PERI_SNSNI_RESTART"||(version!=schema_version&&(!compatible_read_version||version!=compatible_read_version))||identity!=fingerprint)throw std::runtime_error("Checkpoint identity/version mismatch");
+        read_version=version;
         std::vector<std::string>names;std::vector<uint64_t>sizes;a.fields(names,sizes);
         if(names!=csv||sizes.size()!=names.size()||fs::absolute(folder)==fs::absolute(out))throw std::runtime_error("Resume must use a fresh output segment and matching CSV schema");
         transfer(a);a.finish();

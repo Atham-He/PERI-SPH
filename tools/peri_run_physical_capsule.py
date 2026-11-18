@@ -3,7 +3,7 @@ No parameter search, retry, memory cap, notification service or scheduler.
 The first accepted load point closes segment 0; segment 1 continues its EXACT
 full state. A failure is saved/reported and never converted into a new case.
 """
-import argparse, csv, hashlib, json, os, subprocess, time, traceback
+import argparse, csv, hashlib, json, os, struct, subprocess, time, traceback
 from pathlib import Path
 from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
@@ -32,17 +32,47 @@ def row(path):
 
 def index(root,segments):
     frames={}
-    for output in segments:
+    for entry in segments:
+        output=Path(entry['output'])
         p=output/'capsule.pvd'
         if not p.exists():continue
         try:
             for a in ET.parse(p).findall('.//DataSet'):
                 f=(p.parent/a.attrib['file']).resolve()
-                if f.is_file():frames[float(a.attrib['timestep'])]=f
+                t=float(a.attrib['timestep'])
+                if f.is_file() and t<=entry.get('trajectory_end_s',float('inf')):frames[t]=f
         except (ET.ParseError,OSError):continue
     xml=ET.Element('VTKFile',type='Collection',version='0.1');collection=ET.SubElement(xml,'Collection')
     for t,f in sorted(frames.items()):ET.SubElement(collection,'DataSet',timestep=format(t,'.17g'),file=os.path.relpath(f,root).replace(os.sep,'/'))
     tmp=root/'capsule.pvd.tmp';ET.ElementTree(xml).write(tmp,encoding='utf-8',xml_declaration=True);tmp.replace(root/'capsule.pvd')
+
+def accepted_checkpoint(path, fingerprint, step):
+    """Identify a retained slot at a completed stage without altering its bytes.
+
+    The native reader still validates the full checksum and restored forces.
+    """
+    with path.open('rb') as f:
+        def read(fmt):
+            return struct.unpack(fmt,f.read(struct.calcsize(fmt)))[0]
+        def string():
+            length=read('<Q')
+            if length>1048576:raise RuntimeError('Invalid checkpoint metadata string')
+            return f.read(length).decode()
+        magic,version,identity,folder=string(),read('<Q'),string(),Path(string())
+        if (magic,version,identity)!=('PERI_SNSNI_RESTART',4,fingerprint) or folder.resolve()!=path.parent:
+            raise RuntimeError('Accepted checkpoint does not match its original history')
+        count=read('<Q')
+        if count!=3:raise RuntimeError('Unexpected accepted checkpoint CSV layout')
+        names=[string() for _ in range(count)]
+        if names!=['progress.csv','equilibria.csv','fracture_events.csv'] or read('<Q')!=count:
+            raise RuntimeError('Unexpected accepted checkpoint CSV layout')
+        sizes=[read('<Q') for _ in range(count)]
+        stage,stage_time,elapsed,checks=read('<Q'),read('<d'),read('<d'),read('<Q')
+    with (folder/'equilibria.csv').open('rb') as f:
+        rows=list(csv.DictReader(f.read(sizes[1]).decode().splitlines()))
+    if not rows or int(rows[-1]['step'])!=step or int(rows[-1]['stage'])+1!=stage or stage_time!=0 or checks!=0 or float(rows[-1]['elapsed_s'])!=elapsed:
+        raise RuntimeError('Retained slot does not end at the requested accepted load point')
+    return {'version':version,'fingerprint':identity,'step':step,'elapsed_s':elapsed}
 
 def run(a):
     root=Path(a.output_root).resolve();root.mkdir(parents=True,exist_ok=True)
@@ -52,9 +82,13 @@ def run(a):
     ownership=json.loads((Path(a.benchmark_root)/'surface_ownership_acceptance.json').read_text())
     if acceptance.get('overall_status')!='PASSED' or growth.get('status')!='PASSED' or ownership.get('status')!='PASSED' or preflight.get('status')!='PASSED':raise RuntimeError('Physical growth/energy/ownership or coupled-driver gate is not PASSED')
     if benchmark_manifest.get('exit_code')!=0 or benchmark_manifest.get('diagnostic_replay') is not False:raise RuntimeError('Formal benchmark did not exit successfully or was a diagnostic replay')
+    if a.column_tied_interface:
+        column=json.loads((Path(a.benchmark_root)/'column_interface_acceptance.json').read_text())
+        if column.get('status')!='PASSED' or '--column-tied-interface' not in preflight_manifest.get('argv',[]):
+            raise RuntimeError('Fixed-column benchmark or matched coupled preflight has not passed')
     if subprocess.check_output(['git','status','--porcelain'],cwd=source,text=True).strip():raise RuntimeError('Pin a clean canonical source before the production history')
     values=dict(line.split('=',1) for line in cfg.read_text().splitlines() if line.strip() and not line.lstrip().startswith('#'))
-    material=Path(values['dpc-table'].strip());identity={'source_commit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=source,text=True).strip(),'binary_sha256':sha(binary),'config_sha256':sha(cfg),'DPC_table_sha256':sha(material),'core_cache_sha256':sha(cache),'crack_bank_sha256':sha(bank),'checkpoint_schema':4}
+    material=Path(values['dpc-table'].strip());identity={'source_commit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=source,text=True).strip(),'binary_sha256':sha(binary),'config_sha256':sha(cfg),'DPC_table_sha256':sha(material),'core_cache_sha256':sha(cache),'crack_bank_sha256':sha(bank),'checkpoint_schema':5 if a.column_tied_interface else 4}
     # A PASSED file from an earlier executable/input cannot authorize a new run.
     for name,path in [('binary_sha256',binary),('config_sha256',cfg),('DPC_table_sha256',material),('core_cache_sha256',cache),('crack_bank_sha256',bank)]:
         if preflight_manifest.get(name)!=sha(path):raise RuntimeError('Coupled preflight identity mismatch: '+name)
@@ -69,26 +103,38 @@ def run(a):
     execution_fingerprint=hashlib.sha256(json.dumps(identity,sort_keys=True).encode()).hexdigest();fingerprint=execution_fingerprint;owner=process_identity(os.getpid())
     inherited=[];checkpoint=None
     if bool(a.resume_checkpoint)!=bool(a.resume_manifest):raise RuntimeError('Continuation requires both checkpoint and its original production manifest')
+    if a.resume_accepted_step and (not a.column_tied_interface or not a.resume_checkpoint):
+        raise RuntimeError('An explicit retained equilibrium is supported for a fixed-column handoff')
     if a.resume_checkpoint:
         origin=Path(a.resume_manifest).resolve();previous=json.loads(origin.read_text());checkpoint=Path(a.resume_checkpoint).resolve()
-        latest=json.loads((checkpoint.parent/'checkpoint.latest.json').read_text())
-        if latest['version']!=4 or latest['fingerprint']!=previous['fingerprint'] or Path(latest['file']).resolve()!=checkpoint:raise RuntimeError('Continuation checkpoint identity/schema differs from its original manifest')
-        for name in ['config_sha256','DPC_table_sha256','core_cache_sha256','crack_bank_sha256','checkpoint_schema']:
+        if a.resume_accepted_step:
+            latest=accepted_checkpoint(checkpoint,previous['fingerprint'],a.resume_accepted_step)
+        else:
+            latest=json.loads((checkpoint.parent/'checkpoint.latest.json').read_text())
+            if latest['fingerprint']!=previous['fingerprint'] or Path(latest['file']).resolve()!=checkpoint:raise RuntimeError('Continuation checkpoint differs from its original manifest')
+        if latest['version']!=previous['identity']['checkpoint_schema'] or (latest['version']!=identity['checkpoint_schema'] and not (a.resume_accepted_step and latest['version']==4)):
+            raise RuntimeError('Continuation checkpoint schema differs from its permitted source')
+        for name in ['config_sha256','DPC_table_sha256','core_cache_sha256','crack_bank_sha256']:
             if identity[name]!=previous['identity'][name]:raise RuntimeError('Continuation would change a frozen physical input: '+name)
         fingerprint=previous['fingerprint']
         inherited=previous['segments']
         if not inherited or root==origin.parent:raise RuntimeError('Continuation needs an original history and a fresh output root')
+        if a.resume_accepted_step:
+            entries=[entry for entry in inherited if Path(entry['output']).resolve()==checkpoint.parent]
+            if len(entries)!=1 or entries[0] is not inherited[-1]:raise RuntimeError('Accepted checkpoint must belong to the last original segment')
+            entries[0]['trajectory_end_s']=latest['elapsed_s']
         receipt={'recorded_UTC':utc(),'status':'INPUTS_VERIFIED_NATIVE_STATE_CHECK_PENDING','origin_manifest':str(origin),'origin_manifest_sha256':sha(origin),'origin_source_commit':previous['identity']['source_commit'],'source_commit':identity['source_commit'],'checkpoint':str(checkpoint),'checkpoint_sha256':sha(checkpoint),'checkpoint_step':latest['step'],'history_fingerprint':fingerprint,'execution_fingerprint':execution_fingerprint,'frozen_inputs_unchanged':True,'checkpoint_bytes_modified':False,'loading_history_reset':False,'native_force_and_checksum_verification_required':True}
         put(root/'resume_compatibility.json',receipt)
     manifest={'created_UTC':utc(),'source':str(source),'binary':str(binary),'input_config':str(cfg),'identity':identity,'fingerprint':fingerprint,'execution_fingerprint':execution_fingerprint,'owner':owner,'same_history_checkpoint_handoff':True,'material_parameters_changed':False,'capsule_kinematics':'NOSB_PD_shell_plus_SNSNI_solid_SPH_core','benchmark_root':str(Path(a.benchmark_root).resolve()),'preflight':str(Path(a.preflight).resolve()),'segments':list(inherited)}
     if (root/'production_manifest.json').exists():raise RuntimeError('Output root already has a production manifest')
-    put(root/'production_manifest.json',manifest);segments=[Path(x['output']) for x in inherited]
+    put(root/'production_manifest.json',manifest)
     sequence=[len(inherited)] if checkpoint else range(2)
     for segment in sequence:
         if sha(binary)!=identity['binary_sha256'] or sha(cfg)!=identity['config_sha256'] or sha(material)!=identity['DPC_table_sha256'] or sha(bank)!=identity['crack_bank_sha256'] or sha(cache)!=identity['core_cache_sha256']:raise RuntimeError('Pinned source/input/binary changed before continuation')
         output=root/('mechanics_segment_'+str(segment));runtime=root/('runtime_segment_'+str(segment));runtime.mkdir(exist_ok=True)
         if output.exists() and any(output.iterdir()):raise RuntimeError('Production output segment already contains results')
         cmd=[str(binary),'--config='+str(cfg),'--snsni-cells='+str(cache),'--fracture-facets='+str(bank),'--output='+str(output),'--checkpoint-fingerprint='+fingerprint]
+        if a.column_tied_interface:cmd.append('--column-tied-interface')
         if checkpoint is None:cmd.append('--checkpoint-stop-after-equilibrium')
         else:cmd.append('--resume-state='+str(checkpoint))
         log_path=root/('native_segment_'+str(segment)+'.log')
@@ -96,12 +142,12 @@ def run(a):
             process=subprocess.Popen(cmd,cwd=runtime,stdout=log,stderr=subprocess.STDOUT)
             try:native=process_identity(process.pid)
             except OSError:native={'pid':process.pid,'argv':cmd}
-            entry={'segment':segment,'output':str(output),'log':str(log_path),'native':native,'started_UTC':utc(),'argv':cmd};manifest['segments'].append(entry);segments.append(output);put(root/'production_manifest.json',manifest)
+            entry={'segment':segment,'output':str(output),'log':str(log_path),'native':native,'started_UTC':utc(),'argv':cmd};manifest['segments'].append(entry);put(root/'production_manifest.json',manifest)
             print('STARTED',segment,process.pid,flush=True)
             try:
                 while process.poll() is None:
                     state={'recorded_UTC':utc(),'status':'RUNNING','owner':owner,'native':native,'segment':segment,'output':str(output),'latest_progress':row(output/'progress.csv'),'latest_equilibrium':row(output/'equilibria.csv'),'source_commit':identity['source_commit'],'fingerprint':fingerprint,'capsule_running':True}
-                    put(root/'owner_progress.json',state);index(root,segments)
+                    put(root/'owner_progress.json',state);index(root,manifest['segments'])
                     validation=output/'resume_validation.json'
                     if a.resume_checkpoint and validation.exists():
                         native_check=json.loads(validation.read_text());receipt.update(status='PASSED' if native_check.get('status')=='PASSED' else 'FAILED',native_state_validation=native_check);put(root/'resume_compatibility.json',receipt)
@@ -114,10 +160,10 @@ def run(a):
                     try:process.wait(timeout=10)
                     except subprocess.TimeoutExpired:process.kill();process.wait()
                 raise
-            code=process.wait();entry.update(exit_code=code,ended_UTC=utc());put(root/'production_manifest.json',manifest);index(root,segments)
+            code=process.wait();entry.update(exit_code=code,ended_UTC=utc());put(root/'production_manifest.json',manifest);index(root,manifest['segments'])
         if segment==0 and code==86:
             latest=json.loads((output/'checkpoint.latest.json').read_text());checkpoint=Path(latest['file']);accepted=row(output/'equilibria.csv')
-            if latest['version']!=4 or latest['fingerprint']!=fingerprint or not accepted:raise RuntimeError('First equilibrium did not publish its compatible complete physical checkpoint')
+            if latest['version']!=identity['checkpoint_schema'] or latest['fingerprint']!=fingerprint or not accepted:raise RuntimeError('First equilibrium did not publish its compatible complete physical checkpoint')
             receipt={'recorded_UTC':utc(),'checkpoint':str(checkpoint),'checkpoint_sha256':sha(checkpoint),'accepted_equilibrium':accepted,'fingerprint':fingerprint,'native_FNV_verification_required_on_load':True,'no_loading_or_material_history_reset':True}
             put(root/'checkpoint_handoff.json',receipt);print('CONTINUING_COMPLETE_STATE',checkpoint,flush=True);continue
         if code!=0:raise RuntimeError('Physical capsule native exit '+str(code)+'; see '+str(log_path))
@@ -131,7 +177,7 @@ def run(a):
 if __name__=='__main__':
     p=argparse.ArgumentParser()
     for option in ['source','binary','config','cells','bank','output-root','benchmark-root','preflight','benchmark-manifest','benchmark-binary','preflight-manifest']:p.add_argument('--'+option,required=True)
-    p.add_argument('--status-file');p.add_argument('--resume-checkpoint');p.add_argument('--resume-manifest');a=p.parse_args()
+    p.add_argument('--status-file');p.add_argument('--resume-checkpoint');p.add_argument('--resume-manifest');p.add_argument('--resume-accepted-step',type=int);p.add_argument('--column-tied-interface',action='store_true');a=p.parse_args()
     try:run(a)
     except BaseException as error:
         root=Path(a.output_root);root.mkdir(parents=True,exist_ok=True);put(root/'owner_progress.json',{'recorded_UTC':utc(),'status':'FAILED','capsule_running':False,'error':str(error),'traceback':traceback.format_exc()})

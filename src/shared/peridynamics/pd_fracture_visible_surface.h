@@ -21,7 +21,7 @@ class VisibleCrackSurface : public ReferenceSolidSurface
     enum class AnchorOwnership { MaterialNode, ReferencePoint };
     enum class TransferOrder { PreservePolynomial, AllowAffinePositionTransfer };
     StdVec<int> row_order;
-    size_t affine_points=0,inactive_points=0,position_fallback_points=0;
+    size_t affine_points=0,inactive_points=0,position_fallback_points=0,extended_position_fallback_points=0;
     Real maximum_value_error=0,maximum_weight_l1=0;
     VisibleCrackSurface(SolidForcePort&p,const StdVec<Vecd>&targets,
                         const StdVec<size_t>&target_anchors,
@@ -43,9 +43,16 @@ class VisibleCrackSurface : public ReferenceSolidSurface
         if(ownership_==AnchorOwnership::ReferencePoint&&!side_normals_.empty())throw std::invalid_argument("An explicitly sided crack trace requires fixed material-node ownership");
         for(size_t q=0;q<targets.size();++q)if(!targets[q].allFinite()||anchors_[q]>=p.count)throw std::invalid_argument("Invalid crack-trace target/material anchor");
         for(size_t q=0;q<side_normals_.size();++q)if(!side_normals_[q].allFinite()||std::abs(side_normals_[q].norm()-1)>1e-8||(p.reference[anchors_[q]]-targets[q]).dot(side_normals_[q])<=0)throw std::invalid_argument("Crack trace side does not contain its material anchor");
+        // The recovery radius is the already configured solid PD horizon.
+        // Only affine position transfer uses it if the nominal trace lacks
+        // sufficient same-side data. Quadratic fits keep their original radius.
+        search_radius_=support_;
+        if(transfer_order_==TransferOrder::AllowAffinePositionTransfer)
+            search_radius_=std::max(support_,r.getSPHBody().getSPHAdaptation().getKernel()->CutOffRadius());
         std::unordered_map<Cell,StdVec<size_t>,Hash>cells;
         for(size_t j=0;j<p.count;++j)cells[cell(p.reference[j])].push_back(j);
         candidate_.resize(targets.size());affected_.resize(p.count);
+        if(search_radius_>support_)horizon_candidate_.resize(targets.size());
         rows.resize(targets.size());row_order.assign(targets.size(),0);fit_info_.resize(targets.size());
         for(size_t q=0;q<targets.size();++q)
         {
@@ -57,14 +64,21 @@ class VisibleCrackSurface : public ReferenceSolidSurface
             for(int a=-1;a<=1;++a)for(int b=-1;b<=1;++b)for(int c=-1;c<=1;++c)
             {
                 auto it=cells.find(Cell{center[0]+a,center[1]+b,center[2]+c});if(it==cells.end())continue;
-                for(size_t j:it->second)if((p.reference[j]-targets[q]).squaredNorm()<support_*support_)candidate_[q].push_back(j);
+                for(size_t j:it->second){
+                    Real distance2=(p.reference[j]-targets[q]).squaredNorm();
+                    if(distance2<support_*support_)candidate_[q].push_back(j);
+                    if(!horizon_candidate_.empty()&&distance2<search_radius_*search_radius_)
+                        horizon_candidate_[q].push_back(j);
+                }
             }
             std::sort(candidate_[q].begin(),candidate_[q].end());
             candidate_[q].erase(std::unique(candidate_[q].begin(),candidate_[q].end()),candidate_[q].end());
             if(candidate_[q].empty())throw std::runtime_error("No material support for a crack trace");
-            for(size_t j:candidate_[q])affected_[j].push_back(q);
+            if(!horizon_candidate_.empty())std::sort(horizon_candidate_[q].begin(),horizon_candidate_[q].end());
+            const auto&affected_support=horizon_candidate_.empty()?candidate_[q]:horizon_candidate_[q];
+            for(size_t j:affected_support)affected_[j].push_back(q);
         }
-        reference_.registerTraceSupport(support_);
+        reference_.registerTraceSupport(search_radius_);
         rebuildAll();
     }
     size_t materialAnchor(size_t q)const{ensureCurrent();return fit_info_.at(q).anchor;}
@@ -102,22 +116,22 @@ class VisibleCrackSurface : public ReferenceSolidSurface
     using Cell=std::array<long long,3>;
     struct Hash
     {size_t operator()(const Cell&a)const{size_t h=0;for(long long v:a)h^=std::hash<long long>{}(v)+0x9e3779b9+(h<<6)+(h>>2);return h;}};
-    struct FitInfo {int order=0;size_t anchor=~size_t(0);bool position_fallback=false;Real affine=0,polynomial=0,value=0,condition=0,l1=0;};
+    struct FitInfo {int order=0;size_t anchor=~size_t(0);bool position_fallback=false,extended_fallback=false;Real affine=0,polynomial=0,value=0,condition=0,l1=0;};
     solid_dynamics::PDLayeredFractureReference&reference_;
     StdVec<size_t>anchors_;
     StdVec<Vecd>original_targets_,side_normals_,transfer_values_,transfer_velocity_values_;
-    Real dp_,support_;
+    Real dp_,support_,search_radius_;
     AnchorOwnership ownership_;
     TransferOrder transfer_order_;
     size_t version_=~size_t(0),generation_=0;bool transfer_pending_=false;
-    StdVec<StdVec<size_t>>candidate_,affected_;
+    StdVec<StdVec<size_t>>candidate_,horizon_candidate_,affected_;
     StdVec<FitInfo>fit_info_;
     Cell cell(const Vecd&x)const
     {
         Cell result;
         for(size_t d=0;d<3;++d)
         {
-            Real v=std::floor(x[d]/support_);
+            Real v=std::floor(x[d]/search_radius_);
             if(!std::isfinite(v)||v<=Real(std::numeric_limits<long long>::lowest()+1)||v>=Real(std::numeric_limits<long long>::max()-1))
                 throw std::invalid_argument("Crack trace coordinates exceed spatial-hash index range");
             result[d]=static_cast<long long>(v);
@@ -214,20 +228,20 @@ class VisibleCrackSurface : public ReferenceSolidSurface
         if(info.affine>1e-8||info.polynomial>1e-8)
             throw std::runtime_error("State transfer lost crack-trace polynomial consistency");
     }
-    void buildRow(size_t q,Row&row,FitInfo&info)const
+    void buildWithSupport(size_t q, size_t anchor, const StdVec<size_t>&candidates,
+                          bool affine_only, Row&row, FitInfo&info)const
     {
-        size_t anchor=resolveAnchor(q);info.anchor=anchor;
         if(!reference_.visibleReference(reference_.X[anchor],points[q]))
             throw std::runtime_error("Crack trace target lies across a crack from its own material anchor");
         // Geometric visibility and local LIVE connectivity are both needed:
         // severBondPair() may legitimately record topology before an explicit
         // surface is available. Never average a disconnected opposite side.
         StdVec<unsigned char>member(port.count,0),connected(port.count,0);
-        for(size_t j:candidate_[q])if(onSide(q,j))member[j]=1;
+        for(size_t j:candidates)if(onSide(q,j))member[j]=1;
         StdVec<size_t>queue{anchor};connected[anchor]=1;
         for(size_t k=0;k<queue.size();++k){size_t i=queue[k];const auto&nb=reference_.neighbors(i);for(size_t n=0;n<nb.current_size_;++n){size_t j=nb.j_[n];if(reference_.live(i,n)&&member[j]&&!connected[j]&&reference_.visible(i,j)){connected[j]=1;queue.push_back(j);}}}
         StdVec<size_t>nodes;StdVec<Real>weight;Real total=0;Matd covariance=Matd::Zero();
-        for(size_t j:candidate_[q])
+        for(size_t j:candidates)
         {
             if(!onSide(q,j)||!connected[j]||!reference_.visible(anchor,j)||!reference_.visibleReference(points[q],reference_.X[j]))continue;
             Vecd z=(port.reference[j]-points[q])/dp_;Real w=std::exp(-z.squaredNorm())*port.volume[j]/std::pow(dp_,3);
@@ -238,26 +252,42 @@ class VisibleCrackSurface : public ReferenceSolidSurface
             throw std::runtime_error("No visible one-sided material support; the interface was not silently released");
         for(Real&w:weight)w/=total;
         Matd L=layered_detail::whitening(covariance/total,1);
-        bool accepted=reproduction_order==2&&fit<10>(q,nodes,weight,L,row,info);
-        if(!accepted)accepted=fit<4>(q,nodes,weight,L,row,info);
-        if(!accepted)throw std::runtime_error("One-sided crack trace value functional is unresolved at target "+std::to_string(q)+" (anchor "+std::to_string(anchor)+"); no bonding constraint or material was removed to bypass fit failure");
-        try{
+        if(affine_only){
+            if(!fit<4>(q,nodes,weight,L,row,info))
+                throw UnresolvedReconstruction("Affine value functional is unresolved in one-sided support");
+            transferRow(q,nodes,weight,L,row,info);
+        }else{
+            bool accepted=reproduction_order==2&&fit<10>(q,nodes,weight,L,row,info);
+            if(!accepted)accepted=fit<4>(q,nodes,weight,L,row,info);
+            if(!accepted)throw std::runtime_error("One-sided crack trace value functional is unresolved at target "+std::to_string(q)+" (anchor "+std::to_string(anchor)+")");
             try{transferRow(q,nodes,weight,L,row,info);}
             catch(const UnresolvedReconstruction&){
                 if(transfer_order_!=TransferOrder::AllowAffinePositionTransfer||info.order!=2||
                     !transfer_velocity_values_.empty()||!fit<4>(q,nodes,weight,L,row,info))throw;
-                // The support, physical trace point and position tolerance
-                // are identical. Only the unsupported quadratic moments go.
                 transferRow(q,nodes,weight,L,row,info);
                 info.position_fallback=true;
             }
-        }catch(const std::exception&e){
-            throw std::runtime_error("Surface transfer point "+std::to_string(q)+": "+e.what());
         }
         // Check the committed row against current visibility, independently of
         // polynomial reproduction. No weight clipping or post-normalization.
         for(size_t j:row.index)if(!onSide(q,j)||!connected[j]||!reference_.visible(anchor,j)||!reference_.visibleReference(points[q],reference_.X[j]))
             throw std::runtime_error("A crack trace interpolation row crosses its recorded crack geometry");
+    }
+    void buildRow(size_t q,Row&row,FitInfo&info)const
+    {
+        const size_t anchor=resolveAnchor(q);info.anchor=anchor;
+        try{
+            try{buildWithSupport(q,anchor,candidate_[q],false,row,info);}
+            catch(const UnresolvedReconstruction&){
+                if(horizon_candidate_.empty()||transfer_values_.empty()||
+                    !transfer_velocity_values_.empty()||horizon_candidate_[q]==candidate_[q])throw;
+                buildWithSupport(q,anchor,horizon_candidate_[q],true,row,info);
+                info.position_fallback=true;
+                info.extended_fallback=true;
+            }
+        }catch(const std::exception&e){
+            throw std::runtime_error("Surface transfer point "+std::to_string(q)+": "+e.what());
+        }
     }
     void rebuild(const StdVec<size_t>&ids)
     {
@@ -265,11 +295,12 @@ class VisibleCrackSurface : public ReferenceSolidSurface
         StdVec<Row>next(ids.size());StdVec<FitInfo>info(ids.size());
         for(size_t k=0;k<ids.size();++k)buildRow(ids[k],next[k],info[k]);
         for(size_t k=0;k<ids.size();++k){rows[ids[k]]=std::move(next[k]);fit_info_[ids[k]]=info[k];row_order[ids[k]]=info[k].order;}
-        affine_points=inactive_points=position_fallback_points=0;affine_error=polynomial_error=largest_condition_number=maximum_value_error=maximum_weight_l1=0;
+        affine_points=inactive_points=position_fallback_points=extended_position_fallback_points=0;affine_error=polynomial_error=largest_condition_number=maximum_value_error=maximum_weight_l1=0;
         for(const auto&f:fit_info_)
         {
             if(f.order==0)throw std::logic_error("A crack trace row has no accepted material value functional");
             position_fallback_points+=f.position_fallback;
+            extended_position_fallback_points+=f.extended_fallback;
             affine_points+=f.order==1;affine_error=std::max(affine_error,f.affine);polynomial_error=std::max(polynomial_error,f.polynomial);
             largest_condition_number=std::max(largest_condition_number,f.condition);maximum_value_error=std::max(maximum_value_error,f.value);maximum_weight_l1=std::max(maximum_weight_l1,f.l1);
         }

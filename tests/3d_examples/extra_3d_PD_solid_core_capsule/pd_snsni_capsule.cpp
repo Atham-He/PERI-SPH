@@ -153,8 +153,8 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells)
     };
     auto forceAt=[&](const Field&d,const Field&v,Real compression,bool commit){setPositions(d,v);Field cd(d.begin(),d.begin()+cn);cb.evaluate(cd,o.core_rho,o.cfl);if(commit)cb.commit();else cb.discard();assembleShellAndConstraints(compression);};
     auto recoverable=[&](){return sb.energy()+growth.stored+growth.contact_energy+tie->energy+contact.energy;};
-    size_t stage=1,checks=0;Real stage_time=0,elapsed=0,Wp=0,Wcore=0,Wd=0,Walgorithmic=0,interface_switch_work=0;bool onset=false,fully_failed=false;
-    auto compression=[&](Real t){Real a=std::clamp(t/o.ramp_duration,Real(0),Real(1));return o.diameter*o.strain*(Real(stage-1)+.5*(1-std::cos(Pi*a)))/o.load_steps;};
+    size_t stage=1,checks=0;Real stage_time=0,elapsed=0,Wp=0,Wcore=0,Wd=0,Walgorithmic=0,interface_switch_work=0;bool onset=false,fully_failed=false,column_hold=false;
+    auto compression=[&](Real t){Real a=column_hold?0:std::clamp(t/o.ramp_duration,Real(0),Real(1));return o.diameter*o.strain*(Real(stage-1)+.5*(1-std::cos(Pi*a)))/o.load_steps;};
     forceAt(time.displacement,time.velocity,0,false);Real U0=recoverable(),K0=time.kinetic();
     std::ofstream parameters(out/"parameters.json");parameters<<std::setprecision(17)<<"{\"core_backend\":\"SNSNI_RKPM_DPC_unchanged\",\"shell_backend\":\"layered_NOSB_PD_live_reconstruction\",\"shell_constitutive\":\"unchanged_finite_volume_Biot\",\"fracture_representation\":\"strength_triggered_extrinsic_cohesive_true_bonds\",\"cohesive_integrator\":\"explicit_bulk_half_kicks_implicit_objective_surface_drift\",\"mixed_mode_assumption\":\"equal_strength_and_Gc\",\"candidate_geometry\":\"through_thickness_radial_Voronoi_facets\",\"E_Pa\":"<<o.shell_E<<",\"nu\":"<<o.shell_nu<<",\"ft_Pa\":"<<o.fracture_stress<<",\"Gc_J_m2\":"<<o.fracture_energy<<",\"delta_f_m\":"<<growth.delta_f<<",\"core_particles\":"<<cn<<",\"shell_particles\":"<<sn<<",\"candidate_facets\":"<<bank.size()<<",\"shell_mass_kg\":"<<shell_mass<<",\"interface_K_Pa_per_m\":"<<Ktie<<",\"platen_and_crack_contact_K_Pa_per_m\":"<<Kcontact<<",\"core_parameters_changed\":false,\"source_hash\":"<<std::quoted(CAPSULE_SOURCE_SHA256)<<"}\n";parameters.close();
     if(o.preflight_only){Field d(count),v(count);Matd A=Matd::Identity();A(0,0)=.998;A(1,1)=1.001;A(2,2)=.999;for(size_t j=0;j<count;++j){d[j]=(A-Matd::Identity())*X[j];if(j<cn)d[j]+=Vecd(5e-8*rc/.0005,0,0);v[j]=Vecd(.2*std::sin(37*X[j][0]/R),-.1,.3*X[j][2]/R);}forceAt(d,v,.004*2*R,false);
@@ -164,7 +164,7 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells)
     std::ofstream progress(out/"progress.csv"),eq(out/"equilibria.csv"),events(out/"fracture_events.csv");
     const char*header="step,stage,elapsed_s,strain,compression_m,dt_s,upper_N,lower_N,force_residual,plate_imbalance,kinetic_ratio,core_min_J,shell_min_J,broken_bond_pairs,crack_facets,failed_cohesive_quadrature,max_crack_gap_m,cohesive_stored_J,fracture_work_J,shell_stored_J,interface_energy_J,contact_energy_J,crack_contact_energy_J,max_penetration_m,platen_work_J,core_internal_work_J,damping_loss_J,cohesive_algorithmic_loss_J,stabilizer_transfer_loss_J,insertion_defect_J,mechanical_budget_J\n";
     progress<<std::setprecision(17)<<header;eq<<std::setprecision(17)<<header;events<<std::setprecision(17)<<"event,step,stage,strain,candidate,strength_ratio,broken_bond_pairs,max_gap_m\n";
-    std::ofstream surface_audit(out/"surface_reconstruction_events.csv");surface_audit<<std::setprecision(17)<<"step,stage,strain,candidate,inner_reassigned_points,outer_reassigned_points,maximum_affine_error,maximum_polynomial_error,maximum_trace_l1,insertion_energy_fraction\n";
+    std::ofstream surface_audit(out/"surface_reconstruction_events.csv");surface_audit<<std::setprecision(17)<<"step,stage,strain,candidate,inner_reassigned_points,outer_reassigned_points,maximum_affine_error,maximum_polynomial_error,maximum_trace_l1,insertion_energy_fraction,core_dt_s,shell_dt_s,stabilizer_dt_s,tie_dt_s,platen_dt_s,crack_contact_dt_s\n";
 std::vector<std::pair<Real,std::string>>frame_index;
     auto snapshot=[&](const std::string&tag,Real u){Field cpos(cr.cells.size()),cd(time.displacement.begin(),time.displacement.begin()+cn);StdVec<Real>pressure(cr.cells.size()),J(cr.cells.size()),alpha(cr.cells.size());
         for(size_t l=0;l<cr.cells.size();++l){cpos[l]=cr.cells[l].center+cr.value(l,cd);pressure[l]=cb.pending[l].material.p;J[l]=cb.F[l].determinant();alpha[l]=cb.history[l].alpha;}vtkPoints(out/"vtp"/("core_"+tag+".vtp"),cpos,{}, {},pressure,J,alpha,{},{});
@@ -192,7 +192,7 @@ std::vector<std::pair<Real,std::string>>frame_index;
     using CrackArchive=FractureTopologyCheckpoint;std::vector<uint64_t>point_ids(sn);for(size_t j=0;j<sn;++j)point_ids[j]=j;
     auto transfer=[&](recovery::Archive&a){
         if((a.reading?recovery::checkpoint.read_version:recovery::checkpoint.schema_version)==5){
-            std::string model="fixed_column_trace";a.fields(model,interface_switch_work);
+            std::string model="fixed_column_trace";a.fields(model,interface_switch_work,column_hold);
             if(model!="fixed_column_trace"||!use_column_interface||!std::isfinite(interface_switch_work))
                 throw std::runtime_error("Invalid fixed-column checkpoint interface");
             if(a.reading)installColumnInterface();
@@ -240,8 +240,11 @@ std::vector<std::pair<Real,std::string>>frame_index;
                 imbalance+=f.squaredNorm();redistribution+=(bulk_force[j]-expected[j]).squaredNorm();
             }
             imbalance=std::sqrt(imbalance)/std::max(reaction,Real(1e-30));
-            const bool passed=std::isfinite(imbalance)&&imbalance<=o.force_tolerance&&energy_fraction<.005&&
+            const bool passed=std::isfinite(imbalance)&&energy_fraction<.005&&
                 std::abs(reaction-old_reaction)<=1e-10*std::max(old_reaction,Real(1e-30));
+            // The old state is still the starting state. A change of nodal
+            // load distribution can require relaxation at the same load.
+            column_hold=passed&&imbalance>o.force_tolerance;
             std::ofstream audit(out/"column_interface_handoff.json");audit<<std::setprecision(17)
                 <<"{\"status\":\""<<(passed?"PASSED":"FAILED")<<"\",\"step\":"<<time.steps<<",\"strain\":"<<u/o.diameter
                 <<",\"old_tie_energy_J\":"<<old_energy<<",\"new_tie_energy_J\":"<<tie->energy
@@ -249,8 +252,10 @@ std::vector<std::pair<Real,std::string>>frame_index;
                 <<",\"old_tie_dt_s\":"<<old_dt<<",\"new_tie_dt_s\":"<<tie->stable_dt
                 <<",\"old_reaction_N\":"<<old_reaction<<",\"new_reaction_N\":"<<reaction
                 <<",\"nodal_force_change_l2_N\":"<<std::sqrt(redistribution)<<",\"force_residual\":"<<imbalance
-                <<",\"force_tolerance\":"<<o.force_tolerance<<",\"virtual_points\":"<<column_areas.size()<<"}\n";
-            if(!passed)throw std::runtime_error("Fixed-column interface handoff exceeds the force or work acceptance bound");
+                <<",\"force_tolerance\":"<<o.force_tolerance<<",\"virtual_points\":"<<column_areas.size()
+                <<",\"hold_at_original_displacement\":"<<(column_hold?"true":"false")<<"}\n";
+            if(!passed)throw std::runtime_error("Fixed-column interface handoff exceeds the reaction or work acceptance bound");
+            if(column_hold)std::cout<<"FIXED_COLUMN_REEQUILIBRATION_STARTED strain="<<u/o.diameter<<" residual="<<imbalance<<std::endl;
         }
         cohesive_force=growth.cohesiveForces(growth.positions());snapshot("resumed",compression(stage_time));
         std::ofstream receipt(out/"resume_validation.json");receipt<<std::setprecision(17)<<"{\"status\":\"PASSED\",\"step\":"<<time.steps<<",\"strain\":"<<compression(stage_time)/o.diameter<<",\"force_relative_error\":"<<error/std::max(scale,Real(1e-20))<<",\"core_commits\":"<<cb.commits<<",\"kinetic_energy_J\":"<<time.kinetic()<<",\"loading_history_reset\":false}\n";}
@@ -261,7 +266,7 @@ std::vector<std::pair<Real,std::string>>frame_index;
             Real ratio=growth.strengthRatio(k);size_t prior_core_commits=cb.commits;bool inserted=growth.insert(k,false,refresh,eventEnergy,prepareTransfer,rollbackTransfer);if(cb.commits!=prior_core_commits)throw std::runtime_error("Topology event advanced frozen core material history");
             if(!inserted&&!growth.last_candidate_unresolved){snapshot("stopped_before_rejected_crack",compression(stage_time));save();throw std::runtime_error("Capsule physical insertion rejected: "+growth.last_rejection);}
             if(inserted){onset=true;cohesive_force=growth.cohesiveForces(growth.positions());events<<"new_cohesive_crack"<<','<<time.steps<<','<<stage<<','<<compression(stage_time)/o.diameter<<','<<bank[k].id<<','<<ratio<<','<<sr.physical_broken_bonds<<','<<growth.max_gap<<'\n';events.flush();
-                surface_audit<<time.steps<<','<<stage<<','<<compression(stage_time)/o.diameter<<','<<bank[k].id<<','<<(si?si->reassignedPoints():0)<<','<<so.reassignedPoints()<<','<<std::max(si?si->affine_error:Real(0),so.affine_error)<<','<<std::max(si?si->polynomial_error:Real(0),so.polynomial_error)<<','<<std::max(si?si->maximum_weight_l1:Real(0),so.maximum_weight_l1)<<','<<growth.last_insertion.fraction<<'\n';surface_audit.flush();}
+                surface_audit<<time.steps<<','<<stage<<','<<compression(stage_time)/o.diameter<<','<<bank[k].id<<','<<(si?si->reassignedPoints():0)<<','<<so.reassignedPoints()<<','<<std::max(si?si->affine_error:Real(0),so.affine_error)<<','<<std::max(si?si->polynomial_error:Real(0),so.polynomial_error)<<','<<std::max(si?si->maximum_weight_l1:Real(0),so.maximum_weight_l1)<<','<<growth.last_insertion.fraction<<','<<core_dt<<','<<sb.finiteStrainTimeStep()<<','<<sb.stabilizer_dt<<','<<tie->stable_dt<<','<<contact.stable_dt<<','<<growth.contact_dt<<'\n';surface_audit.flush();}
             else{events<<"unresolved_geometric_facet_no_material_cut"<<','<<time.steps<<','<<stage<<','<<compression(stage_time)/o.diameter<<','<<bank[k].id<<','<<ratio<<','<<sr.physical_broken_bonds<<','<<growth.max_gap<<'\n';events.flush();}
         }}
         // A cascade changes topology at one fixed physical time. Preserve
@@ -269,7 +274,7 @@ std::vector<std::pair<Real,std::string>>frame_index;
         // redundant full-core/shell files at the same timestamp.
         if(growth.insertion_events!=prior_cracks)snapshot("crack_"+std::to_string(growth.insertion_events),compression(stage_time));
         Real shell_dt=sb.finiteStrainTimeStep();Real rate=1/(core_dt*core_dt)+1/(shell_dt*shell_dt)+1/(sb.stabilizer_dt*sb.stabilizer_dt)+1/(tie->stable_dt*tie->stable_dt)+1/(contact.stable_dt*contact.stable_dt);
-        if(std::isfinite(growth.contact_dt))rate+=1/(growth.contact_dt*growth.contact_dt);Real dt=std::min({o.max_dt,1/std::sqrt(rate),cb.acoustic_dt,radial_dt});if(stage_time<o.ramp_duration)dt=std::min(dt,o.ramp_duration-stage_time);
+        if(std::isfinite(growth.contact_dt))rate+=1/(growth.contact_dt*growth.contact_dt);Real dt=std::min({o.max_dt,1/std::sqrt(rate),cb.acoustic_dt,radial_dt});if(!column_hold&&stage_time<o.ramp_duration)dt=std::min(dt,o.ramp_duration-stage_time);
         if(!std::isfinite(dt)||dt<1e-15||time.steps>=o.max_steps)throw std::runtime_error("Coupled physical time/count bound exhausted");
         Field old_d=time.displacement,old_internal=internal,old_shell(sx,sx+sn),vhalf=time.velocity,qfree(sn);Real oldReaction=.5*(contact.upper+contact.lower),old_u=compression(stage_time),oldK=time.kinetic(),factor=std::exp(-.5*o.damping_rate*dt),psiold=growth.stored;
         Real dampedK=0;for(size_t j=0;j<count;++j){vhalf[j]*=factor;dampedK+=.5*mass[j]*vhalf[j].squaredNorm();vhalf[j]+=.5*dt*bulk_force[j]/mass[j];}Wd+=oldK-dampedK;
@@ -283,7 +288,24 @@ std::vector<std::pair<Real,std::string>>frame_index;
         if(!fully_failed&&growth.failed_quadrature){fully_failed=true;events<<"first_full_cohesive_failure"<<','<<time.steps<<','<<stage<<','<<u/o.diameter<<",0,0,"<<sr.physical_broken_bonds<<','<<growth.max_gap<<'\n';events.flush();snapshot("first_full_failure",u);}
         if(time.steps%200==0){Real residual=0,minc=1,mins=1,newK=time.kinetic();for(size_t j=0;j<count;++j){Vecd f=bulk_force[j];if(j>=cn)f+=cohesive_force[j-cn];residual+=f.squaredNorm();}residual=std::sqrt(residual)/std::max(mean,Real(1e-20));for(const auto&F:cb.F)minc=std::min(minc,F.determinant());for(size_t j=0;j<sn;++j)mins=std::min(mins,sF[j].determinant());Real imbalance=std::abs(contact.upper-contact.lower)/std::max(mean,Real(1e-20)),kr=newK/std::max(mean*u,Real(1e-30));Real budget=Wp+interface_switch_work-Wcore-(recoverable()-U0)-(growth.dissipated-growth.initial_dissipation)-(newK-K0)-Wd-Walgorithmic-growth.stabilizer_transfer_loss+growth.insertion_defect;
             auto row=[&](std::ostream&f){f<<time.steps<<','<<stage<<','<<elapsed<<','<<u/o.diameter<<','<<u<<','<<dt<<','<<contact.upper<<','<<contact.lower<<','<<residual<<','<<imbalance<<','<<kr<<','<<minc<<','<<mins<<','<<sr.physical_broken_bonds<<','<<growth.patches.size()<<','<<growth.failed_quadrature<<','<<growth.max_gap<<','<<growth.stored<<','<<growth.dissipated-growth.initial_dissipation<<','<<sb.energy()<<','<<tie->energy<<','<<contact.energy<<','<<growth.contact_energy<<','<<std::max(contact.max_penetration,growth.max_penetration)<<','<<Wp<<','<<Wcore<<','<<Wd<<','<<Walgorithmic<<','<<growth.stabilizer_transfer_loss<<','<<growth.insertion_defect<<','<<budget<<'\n';f.flush();};row(progress);if(time.steps%1000==0)std::cout<<"PROGRESS step="<<time.steps<<" stage="<<stage<<" strain="<<u/o.diameter<<" force="<<mean<<" residual="<<residual<<" cracks="<<growth.patches.size()<<" gap="<<growth.max_gap<<" dt="<<dt<<std::endl;
-            bool good=stage_time>=o.ramp_duration&&mean>1e-10&&residual<=o.force_tolerance&&imbalance<=o.balance_tolerance&&kr<=o.kinetic_tolerance;checks=good?checks+1:0;if(checks>=3){row(eq);snapshot(std::to_string(stage),u);std::cout<<"ACCEPTED stage="<<stage<<" force="<<mean<<" cracks="<<growth.patches.size()<<std::endl;++stage;stage_time=0;checks=0;}}
+            bool good=(column_hold||stage_time>=o.ramp_duration)&&mean>1e-10&&residual<=o.force_tolerance&&imbalance<=o.balance_tolerance&&kr<=o.kinetic_tolerance;
+            checks=good?checks+1:0;
+            if(checks>=3){
+                if(column_hold){
+                    auto file=out/"column_reequilibration.json";
+                    std::ofstream report(file);report<<std::setprecision(17)
+                        <<"{\"status\":\"PASSED\",\"step\":"<<time.steps<<",\"strain\":"<<u/o.diameter
+                        <<",\"hold_elapsed_s\":"<<stage_time<<",\"reaction_N\":"<<mean<<",\"force_residual\":"<<residual
+                        <<",\"kinetic_ratio\":"<<kr<<",\"dt_s\":"<<dt<<",\"crack_facets\":"<<growth.patches.size()<<"}\n";
+                    snapshot("column_rebalanced",u);column_hold=false;stage_time=0;checks=0;
+                    std::cout<<"FIXED_COLUMN_REEQUILIBRATION_ACCEPTED force="<<mean<<" dt="<<dt<<std::endl;save();
+                }else{
+                    row(eq);snapshot(std::to_string(stage),u);
+                    std::cout<<"ACCEPTED stage="<<stage<<" force="<<mean<<" cracks="<<growth.patches.size()<<std::endl;
+                    ++stage;stage_time=0;checks=0;
+                }
+            }
+        }
         if(stage_time>o.max_stage_duration)throw std::runtime_error("Physical capsule stage did not equilibrate");if(time.steps%200==0&&recovery::checkpoint.due(time.steps,stage!=prior_stage))save();if(recovery::checkpoint.stop_step&&time.steps>=recovery::checkpoint.stop_step){save();return 86;}if(recovery::checkpoint.stop_after_equilibrium&&stage!=prior_stage){save();return 86;}
     }
     save();std::ofstream summary(out/"summary.json");summary<<"{\"status\":\"COMPLETE_PHYSICAL_FRACTURE_MECHANICAL_HISTORY\",\"accepted_points\":"<<o.load_steps<<",\"steps\":"<<time.steps<<",\"automatic_crack_facets\":"<<growth.patches.size()<<",\"broken_bond_pairs\":"<<sr.physical_broken_bonds<<",\"full_cohesive_failure\":"<<(fully_failed?"true":"false")<<",\"parameters_changed\":false}\n";return 0;

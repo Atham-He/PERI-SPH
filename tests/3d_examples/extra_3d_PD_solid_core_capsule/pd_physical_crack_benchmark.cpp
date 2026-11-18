@@ -116,7 +116,8 @@ int main(int argc,char**argv){bool published=false;try{
   {
    auto saved=ref.captureTopology();StdVec<Vecd>saved_x(s.x,s.x+count),saved_v(s.v,s.v+count);
    ref.restoreTopology(intact_topology);bulk.rebuild();
-   for(size_t i=0;i<count;++i){const auto&x=s.x0[i];s.x[i]=x+Vecd(.002*x[0]+.002*x[0]*x[1]/(nx*dp),-.001*x[1],.001*x[2]);s.v[i].setZero();bulk.evaluate(i);}
+   for(size_t i=0;i<count;++i){const auto&x=s.x0[i];s.x[i]=x+Vecd(.002*x[0]+.002*x[0]*x[1]/(nx*dp),-.001*x[1],.001*x[2]);s.v[i].setZero();}
+   for(size_t i=0;i<count;++i)bulk.evaluate(i);
    StdVec<Vecd>boundary={Vecd(-.05*dp,-.3*dp,t/2),Vecd(-.05*dp,.3*dp,t/2),Vecd(.05*dp,-.3*dp,t/2),Vecd(.05*dp,.3*dp,t/2)};
    StdVec<size_t>wrong_owner;for(const auto&q:boundary)wrong_owner.push_back(anchors({q},q[0]>0?-1:1)[0]);
    VisibleCrackSurface owned(port,boundary,wrong_owner,ref,dp,3,2,{},{},{},VisibleCrackSurface::AnchorOwnership::ReferencePoint);

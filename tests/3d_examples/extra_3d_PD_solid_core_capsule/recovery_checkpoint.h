@@ -1,5 +1,6 @@
 #pragma once
 // Persistence only. No constitutive, force, loading or timestep changes.
+#include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -60,6 +61,7 @@ template<class C>void contact(Archive&a,C&c){
 class Control {
     std::chrono::steady_clock::time_point last=std::chrono::steady_clock::now();
     uint64_t serial=0;
+    std::chrono::seconds wall_interval{std::chrono::minutes(10)};
     static void durable(const fs::path&p){int fd=::open(p.c_str(),O_RDONLY);if(fd<0)throw std::runtime_error("Checkpoint fsync open failed");int code=::fsync(fd);::close(fd);if(code)throw std::runtime_error("Checkpoint fsync failed");}
  public:
     std::string resume,fingerprint;
@@ -70,10 +72,22 @@ class Control {
         else if(s.rfind("--resume-state=",0)==0)resume=s.substr(15);
         else if(s.rfind("--checkpoint-fingerprint=",0)==0)fingerprint=s.substr(25);
         else if(s.rfind("--checkpoint-stop-step=",0)==0)stop_step=std::stoull(s.substr(23));
+        else if(s.rfind("--checkpoint-wall-seconds=",0)==0){
+            const auto*first=s.data()+sizeof("--checkpoint-wall-seconds=")-1;
+            const auto*last=s.data()+s.size();
+            std::chrono::seconds::rep seconds=0;
+            auto parsed=std::from_chars(first,last,seconds);
+            if(parsed.ec!=std::errc{}||parsed.ptr!=last||seconds<=0)
+                throw std::invalid_argument("Checkpoint wall interval must be a positive integer in seconds");
+            wall_interval=std::chrono::seconds(seconds);
+        }
         else return false;return true;
     }
     bool enabled()const{return !fingerprint.empty();}
-    bool due(size_t step,bool accepted=false)const{return enabled()&&(accepted||(stop_step&&step>=stop_step)||std::chrono::steady_clock::now()-last>=std::chrono::minutes(10));}
+    bool due(size_t step,bool accepted=false)const{
+        auto elapsed=std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()-last);
+        return enabled()&&(accepted||(stop_step&&step>=stop_step)||elapsed>=wall_interval);
+    }
     template<class Transfer>void save(const fs::path&out,const std::vector<std::string>&csv,size_t step,Transfer&&transfer){
         if(!enabled())return;
         auto slot=serial++%2;auto target=out/("checkpoint_"+std::to_string(slot)+".bin"),temp=fs::path(target.string()+".tmp");

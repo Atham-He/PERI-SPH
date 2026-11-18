@@ -137,6 +137,7 @@ def run(a):
         if output.exists() and any(output.iterdir()):raise RuntimeError('Production output segment already contains results')
         cmd=[str(binary),'--config='+str(cfg),'--snsni-cells='+str(cache),'--fracture-facets='+str(bank),'--output='+str(output),'--checkpoint-fingerprint='+fingerprint]
         if a.column_tied_interface:cmd.append('--column-tied-interface')
+        if a.checkpoint_wall_seconds is not None:cmd.append('--checkpoint-wall-seconds='+str(a.checkpoint_wall_seconds))
         if checkpoint is None:cmd.append('--checkpoint-stop-after-equilibrium')
         else:cmd.append('--resume-state='+str(checkpoint))
         log_path=root/('native_segment_'+str(segment)+'.log')
@@ -179,7 +180,11 @@ def run(a):
 if __name__=='__main__':
     p=argparse.ArgumentParser()
     for option in ['source','binary','config','cells','bank','output-root','benchmark-root','preflight','benchmark-manifest','benchmark-binary','preflight-manifest']:p.add_argument('--'+option,required=True)
-    p.add_argument('--status-file');p.add_argument('--resume-checkpoint');p.add_argument('--resume-manifest');p.add_argument('--resume-accepted-step',type=int);p.add_argument('--column-tied-interface',action='store_true');a=p.parse_args()
+    p.add_argument('--status-file');p.add_argument('--resume-checkpoint');p.add_argument('--resume-manifest');p.add_argument('--resume-accepted-step',type=int);p.add_argument('--column-tied-interface',action='store_true')
+    p.add_argument('--checkpoint-wall-seconds',type=int,help='minimum wall seconds between periodic checkpoints (default: 600)')
+    a=p.parse_args()
+    if a.checkpoint_wall_seconds is not None and a.checkpoint_wall_seconds<=0:
+        p.error('--checkpoint-wall-seconds requires a positive integer')
     try:run(a)
     except BaseException as error:
         root=Path(a.output_root);root.mkdir(parents=True,exist_ok=True);put(root/'owner_progress.json',{'recorded_UTC':utc(),'status':'FAILED','capsule_running':False,'error':str(error),'traceback':traceback.format_exc()})

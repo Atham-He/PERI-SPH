@@ -167,22 +167,28 @@ class ReferenceSolidSurface
 
     /** Absolute row-sum bound of sqrt(K) B M^-1 B^T sqrt(K). */
     static Real stableBound(const ReferenceSolidSurface &a,const ReferenceSolidSurface *b,
-                            const StdVec<Real> &stiffness,Real safety=.2)
+                            const StdVec<Real> &stiffness,Real safety=.2,
+                            const StdVec<size_t>* included_rows=nullptr)
     {
         a.ensureCurrent();if(b)b->ensureCurrent();
         if(stiffness.size()!=a.rows.size() || (b && b->rows.size()!=a.rows.size()))
             throw std::invalid_argument("Surface constraint dimensions disagree");
+        const size_t row_count=included_rows?included_rows->size():stiffness.size();
+        if(row_count==0)return std::numeric_limits<Real>::infinity();
         StdVec<Real> sa(a.port.count,0),sb(b ? b->port.count:0,0);
-        for(size_t i=0;i<stiffness.size();++i)
+        for(size_t q=0;q<row_count;++q)
         {
+            const size_t i=included_rows?included_rows->at(q):q;
+            if(i>=stiffness.size())throw std::invalid_argument("Invalid active surface row");
             if(!std::isfinite(stiffness[i]) || stiffness[i]<=0)throw std::invalid_argument("Positive constraint stiffness required");
             Real k=std::sqrt(stiffness[i]);const auto &r=a.rows[i];
             for(size_t j=0;j<r.index.size();++j)sa[r.index[j]]+=k*std::abs(r.weight[j]);
             if(b){const auto &s=b->rows[i];for(size_t j=0;j<s.index.size();++j)sb[s.index[j]]+=k*std::abs(s.weight[j]);}
         }
         Real largest=0;
-        for(size_t i=0;i<stiffness.size();++i)
+        for(size_t q=0;q<row_count;++q)
         {
+            const size_t i=included_rows?(*included_rows)[q]:q;
             Real rate=0,k=std::sqrt(stiffness[i]);const auto &r=a.rows[i];
             for(size_t j=0;j<r.index.size();++j)rate+=k*std::abs(r.weight[j])*sa[r.index[j]]/a.port.mass[r.index[j]];
             if(b){const auto &s=b->rows[i];for(size_t j=0;j<s.index.size();++j)rate+=k*std::abs(s.weight[j])*sb[s.index[j]]/b->port.mass[s.index[j]];}

@@ -95,6 +95,8 @@ def run(a):
     for name,path in [('binary_sha256',binary),('config_sha256',cfg),('DPC_table_sha256',material),('core_cache_sha256',cache),('crack_bank_sha256',bank)]:
         if preflight_manifest.get(name)!=sha(path):raise RuntimeError('Coupled preflight identity mismatch: '+name)
     if preflight_manifest.get('exit_code')!=0:raise RuntimeError('Coupled preflight did not exit successfully')
+    if a.local_platen_step_bound and '--local-platen-step-bound' not in preflight_manifest.get('argv',[]):
+        raise RuntimeError('Local platen step restriction requires a matched coupled preflight')
     for receipt in [benchmark_manifest,preflight_manifest]:
         hashes=receipt.get('verified_source_files_sha256',{})
         if not hashes:raise RuntimeError('Verification receipt has no source identity')
@@ -137,6 +139,7 @@ def run(a):
         if output.exists() and any(output.iterdir()):raise RuntimeError('Production output segment already contains results')
         cmd=[str(binary),'--config='+str(cfg),'--snsni-cells='+str(cache),'--fracture-facets='+str(bank),'--output='+str(output),'--checkpoint-fingerprint='+fingerprint]
         if a.column_tied_interface:cmd.append('--column-tied-interface')
+        if a.local_platen_step_bound:cmd.append('--local-platen-step-bound')
         if a.checkpoint_wall_seconds is not None:cmd.append('--checkpoint-wall-seconds='+str(a.checkpoint_wall_seconds))
         if checkpoint is None:cmd.append('--checkpoint-stop-after-equilibrium')
         else:cmd.append('--resume-state='+str(checkpoint))
@@ -182,6 +185,7 @@ if __name__=='__main__':
     for option in ['source','binary','config','cells','bank','output-root','benchmark-root','preflight','benchmark-manifest','benchmark-binary','preflight-manifest']:p.add_argument('--'+option,required=True)
     p.add_argument('--status-file');p.add_argument('--resume-checkpoint');p.add_argument('--resume-manifest');p.add_argument('--resume-accepted-step',type=int);p.add_argument('--column-tied-interface',action='store_true')
     p.add_argument('--checkpoint-wall-seconds',type=int,help='minimum wall seconds between periodic checkpoints (default: 600)')
+    p.add_argument('--local-platen-step-bound',action='store_true',help='check the platen step limit using the potentially contacting traces')
     a=p.parse_args()
     if a.checkpoint_wall_seconds is not None and a.checkpoint_wall_seconds<=0:
         p.error('--checkpoint-wall-seconds requires a positive integer')

@@ -14,7 +14,7 @@ using namespace SPH::solid_dynamics;
 using namespace SPH::peridynamics;
 using Field=StdVec<Vecd>;
 std::string fracture_bank_input;
-bool use_column_interface=false,column_handoff_only=false;
+bool use_column_interface=false,column_handoff_only=false,local_platen_step_bound=false;
 
 class SnsniCoupledSurface:public ReferenceSolidSurface
 {
@@ -263,6 +263,42 @@ std::vector<std::pair<Real,std::string>>frame_index;
         std::ofstream receipt(out/"resume_validation.json");receipt<<std::setprecision(17)<<"{\"status\":\"PASSED\",\"step\":"<<time.steps<<",\"strain\":"<<compression(stage_time)/o.diameter<<",\"force_relative_error\":"<<error/std::max(scale,Real(1e-20))<<",\"core_commits\":"<<cb.commits<<",\"kinetic_energy_J\":"<<time.kinetic()<<",\"loading_history_reset\":false}\n";}
     save();
     if(column_handoff_only)return 0;
+
+    StdVec<size_t> bounded_rows;
+    Real platen_bound=std::numeric_limits<Real>::infinity();
+    size_t bound_version=~size_t(0);
+    auto boundRows=[&](const Field* trial,Real trial_u){
+        StdVec<size_t> rows;
+        const Real top=R-.5*trial_u,bottom=-top;
+        StdVec<Real> trial_z;
+        if(trial){
+            trial_z.resize(sn);
+            for(size_t j=0;j<sn;++j)trial_z[j]=sX[j][2]+(*trial)[cn+j][2];
+        }
+        for(size_t i=0;i<so.rows.size();++i){
+            const auto&r=so.rows[i];
+            if(r.index.empty())continue;
+            const Real old_z=contact.position[i][2];
+            Real z=old_z,margin=0;
+            if(trial){
+                z=0;
+                Real magnitude=std::abs(old_z)+std::abs(top);
+                for(size_t a=0;a<r.index.size();++a){
+                    const Real value=r.weight[a]*trial_z[r.index[a]];
+                    z+=value;
+                    magnitude+=std::abs(value);
+                }
+                margin=(2*r.index.size()+4)*std::numeric_limits<Real>::epsilon()*magnitude;
+            }
+            if(!std::isfinite(z)||!std::isfinite(margin))throw std::runtime_error("Invalid platen trial geometry");
+            if(std::min(old_z,z)-margin<=bottom||std::max(old_z,z)+margin>=top)rows.push_back(i);
+        }
+        if(bound_version!=so.mappingVersion()||rows!=bounded_rows){
+            platen_bound=ReferenceSolidSurface::stableBound(so,nullptr,contact.stiffness,.2,&rows);
+            bounded_rows=std::move(rows);bound_version=so.mappingVersion();
+        }
+        return platen_bound;
+    };
     while(stage<=o.load_steps){size_t prior_stage=stage,prior_cracks=growth.insertion_events;
         if(time.steps%50==0){for(size_t event=0;event<bank.size();++event){size_t k=growth.select();if(k==bank.size())break;
             Real ratio=growth.strengthRatio(k);size_t prior_core_commits=cb.commits;bool inserted=growth.insert(k,false,refresh,eventEnergy,prepareTransfer,rollbackTransfer);if(cb.commits!=prior_core_commits)throw std::runtime_error("Topology event advanced frozen core material history");
@@ -275,13 +311,47 @@ std::vector<std::pair<Real,std::string>>frame_index;
         // every event in CSV and publish its final state once, avoiding many
         // redundant full-core/shell files at the same timestamp.
         if(growth.insertion_events!=prior_cracks)snapshot("crack_"+std::to_string(growth.insertion_events),compression(stage_time));
-        Real shell_dt=sb.finiteStrainTimeStep();Real rate=1/(core_dt*core_dt)+1/(shell_dt*shell_dt)+1/(sb.stabilizer_dt*sb.stabilizer_dt)+1/(tie->stable_dt*tie->stable_dt)+1/(contact.stable_dt*contact.stable_dt);
-        if(std::isfinite(growth.contact_dt))rate+=1/(growth.contact_dt*growth.contact_dt);Real dt=std::min({o.max_dt,1/std::sqrt(rate),cb.acoustic_dt,radial_dt});if(!column_hold&&stage_time<o.ramp_duration)dt=std::min(dt,o.ramp_duration-stage_time);
-        if(!std::isfinite(dt)||dt<1e-15||time.steps>=o.max_steps)throw std::runtime_error("Coupled physical time/count bound exhausted");
-        Field old_d=time.displacement,old_internal=internal,old_shell(sx,sx+sn),vhalf=time.velocity,qfree(sn);Real oldReaction=.5*(contact.upper+contact.lower),old_u=compression(stage_time),oldK=time.kinetic(),factor=std::exp(-.5*o.damping_rate*dt),psiold=growth.stored;
-        Real dampedK=0;for(size_t j=0;j<count;++j){vhalf[j]*=factor;dampedK+=.5*mass[j]*vhalf[j].squaredNorm();vhalf[j]+=.5*dt*bulk_force[j]/mass[j];}Wd+=oldK-dampedK;
-        Field next_d=old_d;for(size_t j=0;j<count;++j)next_d[j]+=dt*vhalf[j];for(size_t j=0;j<sn;++j)qfree[j]=sX[j]+next_d[cn+j];
-        auto cohesive=growth.drift(qfree,old_shell,inverse_shell_mass,dt);cohesive_force=cohesive.force;
+        const Real shell_dt=sb.finiteStrainTimeStep();
+        auto allowedStep=[&](Real platen_dt){
+            Real rate=1/(core_dt*core_dt)+1/(shell_dt*shell_dt)+1/(sb.stabilizer_dt*sb.stabilizer_dt)
+                +1/(tie->stable_dt*tie->stable_dt)+1/(platen_dt*platen_dt);
+            if(std::isfinite(growth.contact_dt))rate+=1/(growth.contact_dt*growth.contact_dt);
+            Real bounded=std::min({o.max_dt,1/std::sqrt(rate),cb.acoustic_dt,radial_dt});
+            return (!column_hold&&stage_time<o.ramp_duration)?std::min(bounded,o.ramp_duration-stage_time):bounded;
+        };
+        const Real all_rows_dt=allowedStep(contact.stable_dt),old_u=compression(stage_time);
+        Real dt=local_platen_step_bound?allowedStep(boundRows(nullptr,old_u)):all_rows_dt;
+
+        Field old_d=time.displacement,old_internal=internal,old_shell(sx,sx+sn),vhalf,qfree(sn),next_d;
+        const Real oldReaction=.5*(contact.upper+contact.lower),oldK=time.kinetic(),psiold=growth.stored;
+        Real dampedK=0,factor=1;
+        CohesiveSurfaceEvolution::Result cohesive;
+        for(size_t retry=0;;++retry){
+            if(!std::isfinite(dt)||dt<1e-15||time.steps>=o.max_steps)
+                throw std::runtime_error("Coupled physical time/count bound exhausted");
+            factor=std::exp(-.5*o.damping_rate*dt);
+            vhalf=time.velocity;dampedK=0;
+            for(size_t j=0;j<count;++j){vhalf[j]*=factor;dampedK+=.5*mass[j]*vhalf[j].squaredNorm();vhalf[j]+=.5*dt*bulk_force[j]/mass[j];}
+            next_d=old_d;
+            for(size_t j=0;j<count;++j)next_d[j]+=dt*vhalf[j];
+            for(size_t j=0;j<sn;++j)qfree[j]=sX[j]+next_d[cn+j];
+            try{
+                cohesive=growth.trialDrift(qfree,old_shell,inverse_shell_mass,dt);
+            }catch(const std::runtime_error&){
+                if(dt<=all_rows_dt)throw;
+                dt=all_rows_dt;continue;
+            }
+            if(dt<=all_rows_dt)break;
+            // The drift follows a chord between the two trace positions,
+            // and the planes move inwards. Include all rows that can touch
+            // either plane in this step. Reject before committing histories.
+            for(size_t j=0;j<sn;++j)next_d[cn+j]=cohesive.positions[j]-sX[j];
+            const Real checked_dt=allowedStep(boundRows(&next_d,compression(stage_time+dt)));
+            if(dt<=checked_dt)break;
+            dt=retry>=2?std::min(all_rows_dt,checked_dt):checked_dt;
+        }
+        growth.acceptDrift(cohesive);cohesive_force=cohesive.force;
+        Wd+=oldK-dampedK;
         Real velocity_defect=0,surface_work=0;for(size_t j=0;j<sn;++j){next_d[cn+j]=cohesive.positions[j]-sX[j];Vecd after=vhalf[cn+j]+dt*cohesive.force[j]/sm[j];velocity_defect+=.5*sm[j]*(after-vhalf[cn+j]).squaredNorm();surface_work-=cohesive.force[j].dot(cohesive.positions[j]-old_shell[j]);vhalf[cn+j]=after;}
         Walgorithmic+=velocity_defect+surface_work-(cohesive.stored-psiold)-cohesive.dissipation_increment;
         time.displacement=next_d;forceAt(time.displacement,vhalf,compression(stage_time+dt),true);
@@ -315,11 +385,13 @@ std::vector<std::pair<Real,std::string>>frame_index;
 
 int main(int argc,char**argv)
 {
-    try{recovery::checkpoint.schema_version=4;std::string cells;std::vector<char*>args{argv[0]};for(int i=1;i<argc;++i){std::string a=argv[i];if(a.rfind("--snsni-cells=",0)==0)cells=a.substr(14);else if(a.rfind("--fracture-facets=",0)==0)fracture_bank_input=a.substr(18);else if(a=="--column-tied-interface")use_column_interface=true;else if(a=="--column-interface-handoff-only")column_handoff_only=true;else if(recovery::checkpoint.take(a)){}else args.push_back(argv[i]);}
+    try{recovery::checkpoint.schema_version=4;std::string cells;std::vector<char*>args{argv[0]};for(int i=1;i<argc;++i){std::string a=argv[i];if(a.rfind("--snsni-cells=",0)==0)cells=a.substr(14);else if(a.rfind("--fracture-facets=",0)==0)fracture_bank_input=a.substr(18);else if(a=="--column-tied-interface")use_column_interface=true;else if(a=="--column-interface-handoff-only")column_handoff_only=true;else if(a=="--local-platen-step-bound")local_platen_step_bound=true;else if(recovery::checkpoint.take(a)){}else args.push_back(argv[i]);}
         if(use_column_interface){recovery::checkpoint.schema_version=5;recovery::checkpoint.compatible_read_version=4;}
         if(column_handoff_only&&(!use_column_interface||recovery::checkpoint.resume.empty()))
             throw std::invalid_argument("Column handoff audit requires the fixed-column interface and an accepted checkpoint");
         if(cells.empty())throw std::invalid_argument("--snsni-cells is required");HybridOptions options;options.parseHybrid(int(args.size()),args.data());
+        if(local_platen_step_bound&&options.plate_friction!=0)
+            throw std::invalid_argument("Local platen step bound requires frictionless analytic planes");
         tbb::task_arena arena(int(options.threads));return arena.execute([&]{return runSnsniCapsule(options,cells);});
     }catch(const std::exception&e){std::cerr<<"COUPLED_ERROR "<<e.what()<<std::endl;return 1;}
 }

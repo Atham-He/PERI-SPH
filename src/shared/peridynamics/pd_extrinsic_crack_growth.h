@@ -149,9 +149,25 @@ class ExtrinsicCrackGrowth {
         contact_network->apply();contact_energy=contact_network->energy;max_penetration=contact_network->max_penetration;contact_dt=contact_network->stable_dt;
     }
 
-    CohesiveSurfaceEvolution::Result drift(const Field&qfree,const Field&qold,const Field&inverse_mass,Real dt){
-        CohesiveSurfaceEvolution model(ft,Gc,quadrature());auto r=model.solve(qfree,qold,history,inverse_mass,dt);history=r.history;last_traction=r.traction;stored=r.stored;dissipated=r.dissipated;max_gap=0;failed_quadrature=0;
-        for(size_t k=0;k<r.history.size();++k){failed_quadrature+=r.history[k].kappa>=delta_f;max_gap=std::max(max_gap,model.kinematics(k,r.positions).normal_gap);}return r;
+    CohesiveSurfaceEvolution::Result trialDrift(const Field&qfree,const Field&qold,const Field&inverse_mass,Real dt)const
+    {
+        CohesiveSurfaceEvolution model(ft,Gc,quadrature());
+        return model.solve(qfree,qold,history,inverse_mass,dt);
+    }
+    void acceptDrift(const CohesiveSurfaceEvolution::Result&r)
+    {
+        history=r.history;last_traction=r.traction;stored=r.stored;dissipated=r.dissipated;max_gap=0;failed_quadrature=0;
+        CohesiveSurfaceEvolution model(ft,Gc,quadrature());
+        for(size_t k=0;k<r.history.size();++k){
+            failed_quadrature+=r.history[k].kappa>=delta_f;
+            max_gap=std::max(max_gap,model.kinematics(k,r.positions).normal_gap);
+        }
+    }
+    CohesiveSurfaceEvolution::Result drift(const Field&qfree,const Field&qold,const Field&inverse_mass,Real dt)
+    {
+        auto result=trialDrift(qfree,qold,inverse_mass,dt);
+        acceptDrift(result);
+        return result;
     }
 };
 }

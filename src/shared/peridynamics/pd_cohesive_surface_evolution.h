@@ -7,11 +7,12 @@
 #include <iomanip>
 #include <cstdlib>
 #include <sstream>
+#include <type_traits>
 
 namespace SPH::peridynamics::cohesive_geometry_detail {
 template<size_t N>struct Jet {
     Real v=0;std::array<Real,N>d{};Jet(Real a=0):v(a){}
-    static Jet variable(Real a,size_t i){Jet r(a);r.d[i]=1;return r;}
+    static Jet variable(Real a,size_t i){Jet r(a);if constexpr(N>0)r.d[i]=1;return r;}
 };
 template<size_t N>Jet<N>operator+(const Jet<N>&a,const Jet<N>&b){Jet<N>r(a.v+b.v);for(size_t i=0;i<N;++i)r.d[i]=a.d[i]+b.d[i];return r;}
 template<size_t N>Jet<N>operator-(const Jet<N>&a,const Jet<N>&b){Jet<N>r(a.v-b.v);for(size_t i=0;i<N;++i)r.d[i]=a.d[i]-b.d[i];return r;}
@@ -42,7 +43,8 @@ class CohesiveSurfaceEvolution {
         // plus, matching minus, then three minus-face vertices for its normal.
         std::array<TracePoint,5> trace;Real area=0;
     };
-    struct Geometry {Vecd jump=Vecd::Zero(),normal=Vecd::Zero();Real normal_gap=0;bool normal_derivative_active=true;CohesiveInterfaceIMEX::Facet linear;};
+    struct Kinematics {Vecd jump=Vecd::Zero(),normal=Vecd::Zero();Real normal_gap=0;bool normal_derivative_active=true;};
+    struct Geometry : Kinematics {CohesiveInterfaceIMEX::Facet linear;};
     struct Result {
         Field positions,force,jump,traction;std::vector<History>history;
         Real stored=0,dissipated=0,dissipation_increment=0;
@@ -56,8 +58,13 @@ class CohesiveSurfaceEvolution {
         if(!std::isfinite(ft)||!std::isfinite(Gc)||std::min(ft,Gc)<=0)throw std::invalid_argument("Invalid extrinsic cohesive inputs");
         for(const auto&a:q){if(!std::isfinite(a.area)||a.area<=0)throw std::invalid_argument("Invalid cohesive reference area");for(const auto&t:a.trace)if(!t.surface||t.point>=t.surface->rows.size())throw std::invalid_argument("Invalid cohesive geometry trace");}
     }
-    Geometry geometry(size_t k,const Field&q,Real zero_opening_tolerance=0)const {
-        using J=cohesive_geometry_detail::Jet<15>;
+  private:
+    // Position and gap checks share the force geometry, but do not need its
+    // automatic derivatives or a per-node linearization.
+    template<bool AssembleLinear>
+    auto evaluateGeometry(size_t k,const Field&q,Real zero_opening_tolerance)const {
+        using J=cohesive_geometry_detail::Jet<AssembleLinear?15:0>;
+        using Evaluation=std::conditional_t<AssembleLinear,Geometry,Kinematics>;
         const auto&facet=quadrature.at(k);std::array<std::array<J,3>,5>a;
         for(size_t j=0;j<5;++j){const auto&t=facet.trace[j];t.surface->ensureCurrent();Vecd x=Vecd::Zero();const auto&row=t.surface->rows[t.point];
             for(size_t n=0;n<row.index.size();++n){if(row.index[n]>=q.size())throw std::invalid_argument("Cohesive geometry node dimensions");x+=row.weight[n]*q[row.index[n]];}
@@ -72,15 +79,27 @@ class CohesiveSurfaceEvolution {
         Real raw_norm=0;for(size_t d=0;d<3;++d)raw_norm+=jump[d].v*jump[d].v;
         bool normal_active=gn.v>=0||(gn.v>=-zero_opening_tolerance&&std::sqrt(raw_norm)<=zero_opening_tolerance);
         for(size_t d=0;d<3;++d)effective[d]=normal_active?jump[d]:jump[d]-gn*n[d];
-        Geometry g;g.normal_gap=gn.v;g.normal_derivative_active=normal_active;g.linear.reference_area=facet.area;std::map<size_t,Matd>nodes;
+        Evaluation g;g.normal_gap=gn.v;g.normal_derivative_active=normal_active;
         for(size_t d=0;d<3;++d){g.jump[d]=effective[d].v;g.normal[d]=n[d].v;}
-        for(size_t j=0;j<5;++j){Matd derivative;for(size_t d=0;d<3;++d)for(size_t e=0;e<3;++e)derivative(d,e)=effective[d].d[3*j+e];const auto&t=facet.trace[j];const auto&row=t.surface->rows[t.point];
-            for(size_t b=0;b<row.index.size();++b)nodes.try_emplace(row.index[b],Matd::Zero()).first->second+=row.weight[b]*derivative;
+        if constexpr(AssembleLinear){
+            g.linear.reference_area=facet.area;
+            std::map<size_t,Matd>nodes;
+            for(size_t j=0;j<5;++j){
+                Matd derivative;
+                for(size_t d=0;d<3;++d)for(size_t e=0;e<3;++e)derivative(d,e)=effective[d].d[3*j+e];
+                const auto&t=facet.trace[j];const auto&row=t.surface->rows[t.point];
+                for(size_t b=0;b<row.index.size();++b)nodes.try_emplace(row.index[b],Matd::Zero()).first->second+=row.weight[b]*derivative;
+            }
+            g.linear.jump_offset=g.jump;
+            for(const auto&entry:nodes){g.linear.entries.push_back({entry.first,0,entry.second});g.linear.jump_offset-=entry.second*q[entry.first];}
         }
-        g.linear.jump_offset=g.jump;
-        for(const auto&entry:nodes){g.linear.entries.push_back({entry.first,0,entry.second});g.linear.jump_offset-=entry.second*q[entry.first];}
         return g;
     }
+  public:
+    Geometry geometry(size_t k,const Field&q,Real zero_opening_tolerance=0)const
+    {return evaluateGeometry<true>(k,q,zero_opening_tolerance);}
+    Kinematics kinematics(size_t k,const Field&q,Real zero_opening_tolerance=0)const
+    {return evaluateGeometry<false>(k,q,zero_opening_tolerance);}
     Real stored(const Vecd&jump,Real kappa)const {return kappa>0&&kappa<delta_f?.5*ft*(1/kappa-1/delta_f)*jump.squaredNorm():0;}
     Real dissipation(Real kappa)const{return .5*ft*std::min(kappa,delta_f);}
     Result solve(const Field&qfree,const Field&qold,const std::vector<History>&old,const Field&inverse_mass,Real dt)const {
@@ -89,7 +108,7 @@ class CohesiveSurfaceEvolution {
         const Real tolerance=absolute_tolerance+relative_tolerance*delta_f;
         std::vector<Real> old_trace_roundoff(old.size(),0);
         for(size_t k=0;k<old.size();++k){
-            previous_jump[k]=geometry(k,qold).jump;
+            previous_jump[k]=kinematics(k,qold).jump;
             const Real kappa=old[k].kappa;
             if(kappa==0&&previous_jump[k].norm()<=tolerance){previous_jump[k].setZero();continue;}
             const Real opening=previous_jump[k].stableNorm();
@@ -114,11 +133,11 @@ class CohesiveSurfaceEvolution {
             Field projected_previous=previous_jump;for(size_t k=0;k<old.size();++k)projected_previous[k]=linear[k].projector*projected_previous[k];
             try{inner=solver.solve(qfree,projected_previous,old,dt,warm,theta,old_trace_roundoff);}catch(...){dumpFailure();throw;}result.dual_iterations+=inner.iterations;
             Real change=0,geometry_error=0;for(size_t i=0;i<iterate.size();++i)change=std::max(change,(inner.positions[i]-iterate[i]).norm());
-            for(size_t k=0;k<old.size();++k)geometry_error=std::max(geometry_error,(geometry(k,inner.positions).jump-inner.jump[k]).norm());
+            for(size_t k=0;k<old.size();++k)geometry_error=std::max(geometry_error,(kinematics(k,inner.positions).jump-inner.jump[k]).norm());
             last_change=change;last_geometry_error=geometry_error;
-            if(std::getenv("PERI_COHESIVE_AUDIT_FILE")){audit<<"OUTER "<<outer<<" change "<<change<<" geometry "<<geometry_error<<" innerKKT "<<inner.projected_opening_residual<<'\n';for(size_t k=0;k<old.size();++k){auto g=geometry(k,inner.positions);audit<<k<<" gn "<<g.normal_gap<<" jump "<<g.jump.transpose()<<" traction "<<inner.traction[k].transpose()<<" kappa "<<old[k].kappa<<'\n';}}
+            if(std::getenv("PERI_COHESIVE_AUDIT_FILE")){audit<<"OUTER "<<outer<<" change "<<change<<" geometry "<<geometry_error<<" innerKKT "<<inner.projected_opening_residual<<'\n';for(size_t k=0;k<old.size();++k){auto g=kinematics(k,inner.positions);audit<<k<<" gn "<<g.normal_gap<<" jump "<<g.jump.transpose()<<" traction "<<inner.traction[k].transpose()<<" kappa "<<old[k].kappa<<'\n';}}
             iterate=inner.positions;warm=inner.dual;result.outer_iterations=outer;
-            Real law_error=0;for(size_t k=0;k<old.size();++k){auto g=geometry(k,iterate,old[k].kappa==0?tolerance:0);Real r=g.jump.norm(),kap=std::max(old[k].kappa,r);Vecd physical=inner.traction[k];
+            Real law_error=0;for(size_t k=0;k<old.size();++k){auto g=kinematics(k,iterate,old[k].kappa==0?tolerance:0);Real r=g.jump.norm(),kap=std::max(old[k].kappa,r);Vecd physical=inner.traction[k];
                 if(kap>=delta_f)physical.setZero();else if(!(old[k].kappa==0&&r<=tolerance)&&kap>0)physical=ft*(1/kap-1/delta_f)*g.jump;
                 law_error=std::max(law_error,(physical-inner.traction[k]).norm()/ft);}
             if(std::getenv("PERI_COHESIVE_AUDIT_FILE"))audit<<"LAW_ERROR "<<law_error<<" inner_precision "<<inner_precision<<'\n';

@@ -64,7 +64,7 @@ class ExtrinsicCrackGrowth {
         return q;
     }
     void statistics(const Field&q){stored=dissipated=max_gap=0;failed_quadrature=0;CohesiveSurfaceEvolution model(ft,Gc,quadrature());
-        for(size_t k=0;k<history.size();++k){auto g=model.geometry(k,q);Real A=model.quadrature[k].area;stored+=A*model.stored(g.jump,history[k].kappa);dissipated+=A*model.dissipation(history[k].kappa);max_gap=std::max(max_gap,std::max(g.normal_gap,Real(0)));failed_quadrature+=history[k].kappa>=delta_f;}}
+        for(size_t k=0;k<history.size();++k){auto g=model.kinematics(k,q);Real A=model.quadrature[k].area;stored+=A*model.stored(g.jump,history[k].kappa);dissipated+=A*model.dissipation(history[k].kappa);max_gap=std::max(max_gap,std::max(g.normal_gap,Real(0)));failed_quadrature+=history[k].kappa>=delta_f;}}
     Real strengthRatio(size_t k)const {const auto&c=candidates[k];Real maximum=0;for(auto ij:c.stress_pairs){Matd P=.5*(bulk.P[ij.first]+bulk.P[ij.second]),F=.5*(bulk.F[ij.first]+bulk.F[ij.second]);Vecd n=F.determinant()*F.inverse().transpose()*c.normal;if(!n.allFinite()||n.norm()==0)throw std::runtime_error("Invalid current crack initiation normal");n.normalize();Vecd T=P*c.normal;Real normal=T.dot(n);if(normal>0)maximum=std::max(maximum,T.norm()/ft);}return maximum;}
     size_t select()const {size_t best=candidates.size();Real ratio=1;for(size_t k=0;k<candidates.size();++k)if(!active[k]){Real r=strengthRatio(k);if(r>=ratio){ratio=r;best=k;}}return best;}
     Patch makePatch(size_t k,const StdVec<Vecd>&minus_values={},const StdVec<Vecd>&plus_values={},const StdVec<Vecd>&minus_velocity={},const StdVec<Vecd>&plus_velocity={}){
@@ -123,11 +123,11 @@ class ExtrinsicCrackGrowth {
             reference.updateAfterFailure();bulk.rebuild();rebuildTraces();
             patches.push_back(makePatch(k,common,common));for(size_t i=0;i<c.point.size();++i){history.push_back({precrack?delta_f:0});last_traction.push_back(Vecd::Zero());}
             refresh();for(size_t q=0;q<4;++q)last_insertion.maximum_birth_velocity_jump=std::max(last_insertion.maximum_birth_velocity_jump,(patches.back().plus->velocity(q)-patches.back().minus->velocity(q)).norm());CohesiveSurfaceEvolution model(ft,Gc,quadrature());
-            for(size_t j=0;j<history.size();++j){Real r=model.geometry(j,q).jump.norm();if(history[j].kappa<delta_f&&r>history[j].kappa+4e-14)throw std::runtime_error("New/reconstructed cohesive surface has an artificial birth opening");}
+            for(size_t j=0;j<history.size();++j){Real r=model.kinematics(j,q).jump.norm();if(history[j].kappa<delta_f&&r>history[j].kappa+4e-14)throw std::runtime_error("New/reconstructed cohesive surface has an artificial birth opening");}
             statistics(q);Real after=totalEnergy(),newD=dissipated-oldD,newHG=bulk.stabilizationEnergy();
             Real total_defect=after-oldEnergy+(precrack?0:newD),defect=total_defect-(newHG-oldHG),fraction=std::abs(defect)/(Gc*A);
             last_insertion.area=A;last_insertion.new_energy=after;last_insertion.new_bulk=bulk.energy();last_insertion.new_cohesive=stored;last_insertion.new_contact=contact_energy;last_insertion.new_stabilizer=newHG;last_insertion.total_defect=total_defect;last_insertion.new_dissipation=newD;last_insertion.defect=defect;last_insertion.fraction=fraction;
-            for(size_t j=old_history.size();j<history.size();++j)last_insertion.maximum_birth_gap=std::max(last_insertion.maximum_birth_gap,model.geometry(j,q).jump.norm());
+            for(size_t j=old_history.size();j<history.size();++j)last_insertion.maximum_birth_gap=std::max(last_insertion.maximum_birth_gap,model.kinematics(j,q).jump.norm());
             if(!precrack&&newHG>oldHG+1e-10*Gc*A)throw std::runtime_error("Removing live LS stabilization increased its energy");
             if(!precrack&&fraction>maximum_insertion_fraction)throw std::runtime_error("Physical crack insertion energy defect exceeds its unchanged numerical acceptance bound (fraction="+std::to_string(fraction)+")");
             active[k]=1;++insertion_events;if(precrack)initial_dissipation+=newD;else{insertion_defect+=defect;stabilizer_transfer_loss+=oldHG-newHG;max_insertion_fraction=std::max(max_insertion_fraction,fraction);}return true;
@@ -151,7 +151,7 @@ class ExtrinsicCrackGrowth {
 
     CohesiveSurfaceEvolution::Result drift(const Field&qfree,const Field&qold,const Field&inverse_mass,Real dt){
         CohesiveSurfaceEvolution model(ft,Gc,quadrature());auto r=model.solve(qfree,qold,history,inverse_mass,dt);history=r.history;last_traction=r.traction;stored=r.stored;dissipated=r.dissipated;max_gap=0;failed_quadrature=0;
-        for(size_t k=0;k<r.history.size();++k){failed_quadrature+=r.history[k].kappa>=delta_f;max_gap=std::max(max_gap,model.geometry(k,r.positions).normal_gap);}return r;
+        for(size_t k=0;k<r.history.size();++k){failed_quadrature+=r.history[k].kappa>=delta_f;max_gap=std::max(max_gap,model.kinematics(k,r.positions).normal_gap);}return r;
     }
 };
 }

@@ -80,6 +80,10 @@ class CohesiveInterfaceIMEX
         Vecd traction_halfspace_normal=Vecd::Zero(); // optional t.n >= 0, within projector range
     };
     struct History {Real kappa=0;};
+    static Real historyRoundoff(Real failure_opening,Real kappa)
+    {
+        return 256*std::numeric_limits<Real>::epsilon()*std::max(failure_opening,kappa);
+    }
     struct Options
     {
         size_t max_iterations=20000;
@@ -163,11 +167,13 @@ class CohesiveInterfaceIMEX
 
     Result solve(const std::vector<Vecd>&qfree,const std::vector<Vecd>&old_jump,
         const std::vector<History>&old_history,Real dt,
-        const std::vector<Vecd>&warm_dual={},const std::vector<Vecd>&softening_evaluation={})const
+        const std::vector<Vecd>&warm_dual={},const std::vector<Vecd>&softening_evaluation={},
+        const std::vector<Real>&old_trace_roundoff={})const
     {
         requireNodes(qfree);const size_t count=facets_.size();
         if(old_jump.size()!=count||old_history.size()!=count||(!warm_dual.empty()&&warm_dual.size()!=count)||
-           (!softening_evaluation.empty()&&softening_evaluation.size()!=count)||!std::isfinite(dt)||dt<=0||!std::isfinite(dt*dt))
+           (!softening_evaluation.empty()&&softening_evaluation.size()!=count)||
+           (!old_trace_roundoff.empty()&&old_trace_roundoff.size()!=count)||!std::isfinite(dt)||dt<=0||!std::isfinite(dt*dt))
             throw std::invalid_argument("Invalid cohesive solve state/time step");
         Result result;result.positions=qfree;result.jump=applyB(qfree,true);result.history=old_history;
         result.dual.assign(count,Vecd::Zero());result.softening_traction.assign(count,Vecd::Zero());
@@ -185,7 +191,10 @@ class CohesiveInterfaceIMEX
             // must not create cohesive compression or extra fracture history.
             projected_old_jump[k]=f.projector*old_jump[k];
             Real old_r=projected_old_jump[k].stableNorm();
-            if(kap<delta_f&&old_r>kap+256*std::numeric_limits<Real>::epsilon()*std::max(delta_f,kap))
+            const Real trace_roundoff=old_trace_roundoff.empty()?0:old_trace_roundoff[k];
+            if(!std::isfinite(trace_roundoff)||trace_roundoff<0)
+                throw std::invalid_argument("Invalid old cohesive trace roundoff bound");
+            if(kap<delta_f&&old_r-kap>historyRoundoff(delta_f,kap)+trace_roundoff)
                 throw std::invalid_argument("Old cohesive maximum opening is smaller than its old jump");
             if(kap>=delta_f)continue;active[k]=true;++result.active_facets;
             compliance[k]=kap/strength;s[k]=sqrt_area[k]*result.jump[k];

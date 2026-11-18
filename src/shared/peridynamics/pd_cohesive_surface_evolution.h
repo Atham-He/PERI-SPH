@@ -87,9 +87,17 @@ class CohesiveSurfaceEvolution {
         if(qfree.size()!=qold.size()||qold.size()!=inverse_mass.size()||old.size()!=quadrature.size())throw std::invalid_argument("Cohesive evolution dimensions");
         Result result;result.positions=qfree;Field iterate=qfree,previous_jump(old.size()),warm;
         const Real tolerance=absolute_tolerance+relative_tolerance*delta_f;
-        for(size_t k=0;k<old.size();++k){previous_jump[k]=geometry(k,qold).jump;
-            if(old[k].kappa==0&&previous_jump[k].norm()<=tolerance)previous_jump[k].setZero();
-            if(previous_jump[k].norm()>old[k].kappa+tolerance&&old[k].kappa<delta_f)throw std::runtime_error("Cohesive committed history below previous opening");}
+        std::vector<Real> old_trace_roundoff(old.size(),0);
+        for(size_t k=0;k<old.size();++k){
+            previous_jump[k]=geometry(k,qold).jump;
+            const Real kappa=old[k].kappa;
+            if(kappa==0&&previous_jump[k].norm()<=tolerance){previous_jump[k].setZero();continue;}
+            const Real opening=previous_jump[k].stableNorm();
+            if(kappa>=delta_f||opening<=kappa)continue;
+            old_trace_roundoff[k]=openingTraceRoundoff(k,qold);
+            if(opening-kappa>CohesiveInterfaceIMEX::historyRoundoff(delta_f,kappa)+old_trace_roundoff[k])
+                throw std::runtime_error("Cohesive committed history below previous opening beyond trace roundoff");
+        }
         CohesiveInterfaceIMEX::Result inner;std::ostringstream audit; audit<<std::setprecision(17);Real last_change=0,last_geometry_error=0,inner_precision=1;
         auto dumpFailure=[&](){if(const char*path=std::getenv("PERI_COHESIVE_AUDIT_FILE")){std::ofstream f(path);f<<std::setprecision(17)<<"COHESIVE_REPLAY_V1 "<<qfree.size()<<' '<<old.size()<<' '<<ft<<' '<<Gc<<' '<<dt<<'\n';for(size_t i=0;i<qfree.size();++i)f<<qfree[i].transpose()<<' '<<qold[i].transpose()<<' '<<inverse_mass[i].transpose()<<'\n';for(size_t k=0;k<old.size();++k){f<<quadrature[k].area<<' '<<old[k].kappa<<'\n';for(const auto&v:quadrature[k].trace){const auto&r=v.surface->rows[v.point];f<<r.index.size();for(size_t j=0;j<r.index.size();++j)f<<' '<<r.index[j]<<' '<<r.weight[j];f<<'\n';}}f<<audit.str();}};
         for(size_t outer=1;outer<=max_outer_iterations;++outer){std::vector<CohesiveInterfaceIMEX::Facet>linear;Field theta;
@@ -104,7 +112,7 @@ class CohesiveSurfaceEvolution {
             CohesiveInterfaceIMEX::Options options;options.absolute_opening_tolerance=absolute_tolerance*.05*inner_precision;options.relative_tolerance=relative_tolerance*.05*inner_precision;
             CohesiveInterfaceIMEX solver(ft,Gc,inverse_mass,linear,options);
             Field projected_previous=previous_jump;for(size_t k=0;k<old.size();++k)projected_previous[k]=linear[k].projector*projected_previous[k];
-            try{inner=solver.solve(qfree,projected_previous,old,dt,warm,theta);}catch(...){dumpFailure();throw;}result.dual_iterations+=inner.iterations;
+            try{inner=solver.solve(qfree,projected_previous,old,dt,warm,theta,old_trace_roundoff);}catch(...){dumpFailure();throw;}result.dual_iterations+=inner.iterations;
             Real change=0,geometry_error=0;for(size_t i=0;i<iterate.size();++i)change=std::max(change,(inner.positions[i]-iterate[i]).norm());
             for(size_t k=0;k<old.size();++k)geometry_error=std::max(geometry_error,(geometry(k,inner.positions).jump-inner.jump[k]).norm());
             last_change=change;last_geometry_error=geometry_error;
@@ -147,6 +155,28 @@ class CohesiveSurfaceEvolution {
         result.force_residual=resultant.norm()/std::max(force_scale,Real(1e-30));result.torque_residual=torque.norm()/std::max(force_scale*length,Real(1e-30));
         if(result.position_residual>8*tolerance||result.traction_residual>1e-5||result.dissipation_increment< -1e-20){dumpFailure();std::ostringstream message;message<<std::setprecision(17)<<"Cohesive physical force/history residual failed; history unchanged; position="<<result.position_residual<<" traction="<<result.traction_residual<<" dissipation="<<result.dissipation_increment;throw std::runtime_error(message.str());}
         return result;
+    }
+
+  private:
+    Real openingTraceRoundoff(size_t k,const Field&q)const
+    {
+        // Each position component is a signed dot product. Bound its rounding
+        // by gamma_(n+2) times the sum of absolute products. The two face
+        // positions can be much larger than their difference. The extra terms
+        // cover final subtraction and comparison with the saved opening. This
+        // bound is for validation only. No opening, energy or history is reset.
+        const Real unit_roundoff=std::numeric_limits<Real>::epsilon()/2;
+        Real bound=0;
+        for(size_t side=0;side<2;++side){
+            const auto&trace=quadrature[k].trace[side];
+            const auto&row=trace.surface->rows[trace.point];
+            Vecd magnitude=Vecd::Zero();
+            for(size_t a=0;a<row.index.size();++a)
+                magnitude+=std::abs(row.weight[a])*q[row.index[a]].cwiseAbs();
+            const Real gamma=(Real(row.index.size())+2)*unit_roundoff;
+            bound+=2*(gamma/(1-gamma))*magnitude.stableNorm();
+        }
+        return bound;
     }
 };
 }

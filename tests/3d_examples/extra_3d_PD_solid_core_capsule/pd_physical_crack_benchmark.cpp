@@ -256,7 +256,49 @@ int main(int argc,char**argv){bool published=false;try{
    ref.restoreTopology(saved_topology);bulk.rebuild();port.clear();
    if(!passed)throw std::runtime_error("Platen position, lever-arm or energy transfer acceptance failed");
   }
-   auto automatic_growth=runAutomaticGrowthBenchmark(out,ref,bulk,port,intact_topology,s.x0,s.mass,s.x,s.v,acc,E,nu,ft,Gc,dp,t,K,nx,ny);
+  {
+   // Same precracked slab. At a prescribed unload there is no physical history
+   // increment. Re-evaluating the previous trace may exceed its saved norm by
+   // a few ulps of the face coordinates, but a larger discrepancy is invalid.
+   StdVec<Vecd> saved_x(s.x,s.x+count),saved_v(s.v,s.v+count);
+   master.rebuildChanged();plus_corners.rebuildChanged();
+   minus_geometry.rebuild();plus_geometry.rebuild();
+   CohesiveSurfaceEvolution::Quadrature sample;
+   sample.area=areas[0];
+   sample.trace={CohesiveSurfaceEvolution::TracePoint{&plus_geometry,4},
+                 {&minus_geometry,4},{&minus_geometry,4},
+                 {&minus_geometry,minus_geometry.normalU(0)},
+                 {&minus_geometry,minus_geometry.normalV(0)}};
+   CohesiveSurfaceEvolution model(ft,Gc,{sample});
+   const Matd rotation=Eigen::AngleAxis<Real>(.37,Vecd(1,2,3).normalized()).toRotationMatrix();
+   const Real opening=2e-8,unloaded=.7*opening;
+   set(opening,0,rotation);const StdVec<Vecd> old_positions(s.x,s.x+count);
+   const Real measured=model.geometry(0,old_positions).jump.stableNorm();
+   const Real discrepancy=3.5e-19;
+   const std::vector<CohesiveSurfaceEvolution::History> history{{measured-discrepancy}};
+   set(unloaded,0,rotation);const StdVec<Vecd> prescribed(s.x,s.x+count),fixed(count,Vecd::Zero());
+   const auto outcome=model.solve(prescribed,old_positions,history,fixed,1e-11);
+   const Real kappa=history[0].kappa;
+   const Real expected_D=sample.area*(.5*ft*kappa);
+   const Real expected_U=sample.area*.5*ft*(1/kappa-1/model.delta_f)*unloaded*unloaded;
+   const Real energy_error=std::abs(outcome.stored/expected_U-1);
+   const Real history_change=std::abs(outcome.history[0].kappa-kappa);
+   const Real dissipation_error=std::abs(outcome.dissipated-expected_D);
+   bool true_excess_rejected=false;
+   try{model.solve(prescribed,old_positions,{{measured-1e-15}},fixed,1e-11);}
+   catch(const std::runtime_error&e){true_excess_rejected=std::string(e.what()).find("beyond trace roundoff")!=std::string::npos;}
+   const bool passed=outcome.converged&&history_change==0&&outcome.dissipation_increment==0&&
+       dissipation_error==0&&energy_error<1e-9&&true_excess_rejected;
+   std::ofstream report(out/"cohesive_history_roundoff_acceptance.json");
+   report<<std::setprecision(17)<<"{\"status\":\""<<(passed?"PASSED":"FAILED")
+         <<"\",\"same_specimen_particles\":"<<count<<",\"tested_history_roundoff_m\":"<<measured-kappa
+         <<",\"history_change_m\":"<<history_change<<",\"dissipation_increment_J\":"<<outcome.dissipation_increment
+         <<",\"dissipation_error_J\":"<<dissipation_error<<",\"stored_energy_relative_error\":"<<energy_error
+         <<",\"tested_true_history_excess_m\":1e-15,\"true_excess_rejected\":"<<(true_excess_rejected?"true":"false")<<"}\n";
+   for(size_t i=0;i<count;++i){s.x[i]=saved_x[i];s.v[i]=saved_v[i];}
+   if(!passed)throw std::runtime_error("Cohesive history comparison or energy failed the prescribed unload check");
+  }
+  auto automatic_growth=runAutomaticGrowthBenchmark(out,ref,bulk,port,intact_topology,s.x0,s.mass,s.x,s.v,acc,E,nu,ft,Gc,dp,t,K,nx,ny);
  if(automatic_growth.completed_only){std::ofstream report(out/"acceptance.json");report<<R"({"geometry_status":"PASSED","overall_status":"DYNAMIC_STAGE_COMPLETE_GC_PENDING","capsule_restart_allowed":false})"<<'\n';std::cout<<"COMPLETED_DYNAMIC_CHECKPOINT_SAVED"<<std::endl;return 86;}
   bool pass=geometry_pass&&automatic_growth.passed;
  std::ofstream report(out/"acceptance.json");report<<std::setprecision(17)<<"{\"geometry_status\":\""<<(geometry_pass?"PASSED":"FAILED")<<"\",\"overall_status\":\""<<(pass?"PASSED":"FAILED")<<"\",\"capsule_restart_allowed\":false,\"growth_insertion_status\":\""<<(automatic_growth.passed?"PASSED":"FAILED")<<"\",\"fracture_checkpoint_roundtrip_passed\":true,\"corrupt_or_incompatible_checkpoint_rejected\":true,\"topology_cache_guards_passed\":true,\"specimens\":1,\"physical_particles\":"<<count<<",\"disconnected_components\":"<<component_count<<",\"broken_bond_pairs\":"<<broken<<",\"live_damage_history_preserved\":"<<(damage_history_preserved?"true":"false")<<",\"live_damage_energy_over_E_volume\":"<<live_damage_energy<<",\"live_damage_force_over_E_area\":"<<live_damage_force<<",\"live_bonds_crossing_precrack\":"<<bad_bonds<<",\"maximum_visual_opening_m\":0.0006,\"sliding_m\":"<<2*dp<<",\"bulk_energy_over_E_volume\":"<<max_bulk<<",\"contact_force_error_over_E_area\":"<<max_contact_error<<",\"sliding_force_over_E_area\":"<<max_slip<<",\"gap_error_over_spacing\":"<<max_gap_error<<",\"force_energy_relative_error\":"<<max_fd<<",\"force_balance\":"<<max_balance<<",\"torque_balance\":"<<max_torque<<",\"outside_projections\":"<<outside<<",\"explicit_undamped_steps\":200,\"explicit_dt_s\":"<<dt<<",\"explicit_energy_relative_drift\":"<<drift<<",\"cohesive_Gc_J_m2\":"<<work<<",\"cohesive_Gc_relative_error\":"<<gc_error<<",\"cohesive_peak_relative_error\":"<<strength_error<<",\"growth_topology_insertion_tested\":true,\"material_parameters_changed\":false,\"particles_deleted\":0}\n";

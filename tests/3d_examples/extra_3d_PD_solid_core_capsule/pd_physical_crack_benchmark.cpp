@@ -280,7 +280,11 @@ int main(int argc,char**argv){bool published=false;try{
    const auto outcome=model.solve(prescribed,old_positions,history,fixed,1e-11);
    const Real kappa=history[0].kappa;
    const Real expected_D=sample.area*(.5*ft*kappa);
-   const Real expected_U=sample.area*.5*ft*(1/kappa-1/model.delta_f)*unloaded*unloaded;
+   // Separate the trace reproduction error at a small prescribed gap from
+   // the energy check on the actual discrete gap and unchanged history.
+   const Real computed_opening=model.geometry(0,prescribed).jump.stableNorm();
+   const Real opening_error=std::abs(computed_opening-unloaded);
+   const Real expected_U=sample.area*.5*ft*(1/kappa-1/model.delta_f)*computed_opening*computed_opening;
    const Real energy_error=std::abs(outcome.stored/expected_U-1);
    const Real history_change=std::abs(outcome.history[0].kappa-kappa);
    const Real dissipation_error=std::abs(outcome.dissipated-expected_D);
@@ -288,12 +292,13 @@ int main(int argc,char**argv){bool published=false;try{
    try{model.solve(prescribed,old_positions,{{measured-1e-15}},fixed,1e-11);}
    catch(const std::runtime_error&e){true_excess_rejected=std::string(e.what()).find("beyond trace roundoff")!=std::string::npos;}
    const bool passed=outcome.converged&&history_change==0&&outcome.dissipation_increment==0&&
-       dissipation_error==0&&energy_error<1e-9&&true_excess_rejected;
+       dissipation_error==0&&opening_error<2e-15&&energy_error<1e-12&&true_excess_rejected;
    std::ofstream report(out/"cohesive_history_roundoff_acceptance.json");
    report<<std::setprecision(17)<<"{\"status\":\""<<(passed?"PASSED":"FAILED")
          <<"\",\"same_specimen_particles\":"<<count<<",\"tested_history_roundoff_m\":"<<measured-kappa
          <<",\"history_change_m\":"<<history_change<<",\"dissipation_increment_J\":"<<outcome.dissipation_increment
-         <<",\"dissipation_error_J\":"<<dissipation_error<<",\"stored_energy_relative_error\":"<<energy_error
+         <<",\"dissipation_error_J\":"<<dissipation_error<<",\"prescribed_opening_error_m\":"<<opening_error
+         <<",\"stored_energy_relative_error\":"<<energy_error
          <<",\"tested_true_history_excess_m\":1e-15,\"true_excess_rejected\":"<<(true_excess_rejected?"true":"false")<<"}\n";
    for(size_t i=0;i<count;++i){s.x[i]=saved_x[i];s.v[i]=saved_v[i];}
    if(!passed)throw std::runtime_error("Cohesive history comparison or energy failed the prescribed unload check");

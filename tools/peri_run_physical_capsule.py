@@ -102,6 +102,12 @@ def run(a):
     values=dict(line.split('=',1) for line in cfg.read_text().splitlines() if line.strip() and not line.lstrip().startswith('#'))
     material=Path(values['dpc-table'].strip());identity={'source_commit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=source,text=True).strip(),'binary_sha256':sha(binary),'config_sha256':sha(cfg),'DPC_table_sha256':sha(material),'core_cache_sha256':sha(cache),'crack_bank_sha256':sha(bank),'checkpoint_schema':(5 if a.column_tied_interface else 4)+(2 if a.fracture_contact_only else 0)}
     if a.fracture_contact_only:identity['fracture_surface_law']='contact_only'
+    if a.affine_crack_contact:
+        if (not a.fracture_contact_only or preflight.get('affine_crack_contact') is not True
+                or '--affine-crack-contact' not in preflight_manifest.get('argv',[])):
+            raise RuntimeError('Affine crack contact requires a matched contact-only preflight')
+        identity['crack_contact_interpolation']='affine'
+        identity['checkpoint_schema']+=2
     # A PASSED file from an earlier executable/input cannot authorize a new run.
     for name,path in [('binary_sha256',binary),('config_sha256',cfg),('DPC_table_sha256',material),('core_cache_sha256',cache),('crack_bank_sha256',bank)]:
         if preflight_manifest.get(name)!=sha(path):raise RuntimeError('Coupled preflight identity mismatch: '+name)
@@ -154,6 +160,7 @@ def run(a):
         cmd=[str(binary),'--config='+str(cfg),'--snsni-cells='+str(cache),'--fracture-facets='+str(bank),'--output='+str(output),'--checkpoint-fingerprint='+fingerprint]
         if a.column_tied_interface:cmd.append('--column-tied-interface')
         if a.fracture_contact_only:cmd.append('--fracture-contact-only')
+        if a.affine_crack_contact:cmd.append('--affine-crack-contact')
         if a.local_platen_step_bound:cmd.append('--local-platen-step-bound')
         if a.checkpoint_wall_seconds is not None:cmd.append('--checkpoint-wall-seconds='+str(a.checkpoint_wall_seconds))
         if checkpoint is None:cmd.append('--checkpoint-stop-after-equilibrium')
@@ -168,8 +175,15 @@ def run(a):
             try:
                 while process.poll() is None:
                     state={'recorded_UTC':utc(),'status':'RUNNING','owner':owner,'native':native,'segment':segment,'output':str(output),'latest_progress':row(output/'progress.csv'),'latest_equilibrium':row(output/'equilibria.csv'),'source_commit':identity['source_commit'],'fingerprint':fingerprint,'capsule_running':True}
-                    put(root/'owner_progress.json',state);index(root,manifest['segments'])
+                    put(root/'owner_progress.json',state)
                     validation=output/'resume_validation.json'
+                    handoff=output/'affine_crack_contact_handoff.json'
+                    if a.affine_crack_contact and inherited and validation.exists() and handoff.exists():
+                        change=json.loads(handoff.read_text())
+                        if change['status']=='PASSED' and 'trajectory_end_s' not in inherited[-1]:
+                            inherited[-1]['trajectory_end_s']=change['elapsed_s']
+                            put(root/'production_manifest.json',manifest)
+                    index(root,manifest['segments'])
                     if a.resume_checkpoint and validation.exists():
                         native_check=json.loads(validation.read_text());receipt.update(status='PASSED' if native_check.get('status')=='PASSED' else 'FAILED',native_state_validation=native_check);put(root/'resume_compatibility.json',receipt)
                     if a.status_file:
@@ -201,6 +215,7 @@ if __name__=='__main__':
     p.add_argument('--status-file');p.add_argument('--resume-checkpoint');p.add_argument('--resume-manifest');p.add_argument('--resume-accepted-step',type=int);p.add_argument('--column-tied-interface',action='store_true')
     p.add_argument('--checkpoint-wall-seconds',type=int,help='minimum wall seconds between periodic checkpoints (default: 600)')
     p.add_argument('--fracture-contact-only',action='store_true')
+    p.add_argument('--affine-crack-contact',action='store_true')
     p.add_argument('--local-platen-step-bound',action='store_true',help='check the platen step limit using the potentially contacting traces')
     a=p.parse_args()
     if a.checkpoint_wall_seconds is not None and a.checkpoint_wall_seconds<=0:

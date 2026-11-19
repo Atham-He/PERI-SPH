@@ -47,6 +47,9 @@ class ExtrinsicCrackGrowth {
     Reference&reference;Bulk&bulk;SolidForcePort&port;
     Real ft,Gc,delta_f,spacing,contact_K;
     std::vector<Candidate>candidates;std::vector<Patch>patches;
+    bool affine_contact_traces=false;
+    // Only retained until the first subsequent topology rebuild.
+    StdVec<Vecd> affine_contact_transfer_positions;
     std::vector<History>history;Field last_traction;std::vector<unsigned char>active;
     Real maximum_insertion_fraction=.01,insertion_defect=0,max_insertion_fraction=0;
     Real stored=0,dissipated=0,initial_dissipation=0,contact_energy=0,stabilizer_transfer_loss=0;
@@ -97,8 +100,12 @@ class ExtrinsicCrackGrowth {
                 for(size_t j=0;j<port.count;++j)if(side*(reference.X[j]-x).dot(c.normal)>64*std::numeric_limits<Real>::epsilon()*spacing){Real d=(reference.X[j]-x).squaredNorm();if(d<best){best=d;owner=j;}}
                 if(owner==port.count)throw std::runtime_error("Missing physical crack-side owner");a.push_back(owner);}return a;};
             StdVec<Vecd>minus_normals(points.size(),-c.normal),plus_normals(points.size(),c.normal);
-            p.minus_material=std::make_unique<VisibleCrackSurface>(port,points,anchors(-1),reference,spacing,3.5,2,minus_normals,minus_values,minus_velocity);
-            p.plus_material=std::make_unique<VisibleCrackSurface>(port,points,anchors(1),reference,spacing,3.5,2,plus_normals,plus_values,plus_velocity);
+            const unsigned order=affine_contact_traces?1:2;
+            const auto*positions=affine_contact_traces?&affine_contact_transfer_positions:nullptr;
+            using Ownership=VisibleCrackSurface::AnchorOwnership;
+            using Transfer=VisibleCrackSurface::TransferOrder;
+            p.minus_material=std::make_unique<VisibleCrackSurface>(port,points,anchors(-1),reference,spacing,3.5,order,minus_normals,minus_values,minus_velocity,Ownership::MaterialNode,Transfer::PreservePolynomial,positions);
+            p.plus_material=std::make_unique<VisibleCrackSurface>(port,points,anchors(1),reference,spacing,3.5,order,plus_normals,plus_values,plus_velocity,Ownership::MaterialNode,Transfer::PreservePolynomial,positions);
             p.minus=std::make_unique<BilinearCrackSurface>(*p.minus_material,c.point);
             p.plus=std::make_unique<BilinearCrackSurface>(*p.plus_material,c.point);
         return p;
@@ -110,6 +117,24 @@ class ExtrinsicCrackGrowth {
         if(saved.size()!=expected)throw std::invalid_argument("Restored cohesive history dimensions");
         if(!reference.transfer_positions.empty()&&(minus_values.size()!=order.size()||plus_values.size()!=order.size()))throw std::invalid_argument("Missing persistent crack-trace transfer state");
         std::vector<Patch>next;for(size_t i=0;i<order.size();++i)next.push_back(makePatch(order[i],minus_values.empty()?StdVec<Vecd>{}:minus_values[i],plus_values.empty()?StdVec<Vecd>{}:plus_values[i],minus_velocity.empty()?StdVec<Vecd>{}:minus_velocity[i],plus_velocity.empty()?StdVec<Vecd>{}:plus_velocity[i]));patches=std::move(next);contact_network.reset();active=std::move(seen);history=saved;last_traction.assign(saved.size(),Vecd::Zero());statistics(positions());
+    }
+    void transferContactTracesToAffine()
+    {
+        if(!contactOnly()||affine_contact_traces)throw std::logic_error("Affine contact handoff requires contact-only legacy traces");
+        // Match the current face corners, rather than rewinding to the last
+        // topology event. Leave the bulk and all other trace targets intact.
+        affine_contact_transfer_positions=positions();
+        affine_contact_traces=true;
+        std::vector<Patch>rebuilt;
+        rebuilt.reserve(patches.size());
+        for(const auto&patch:patches){
+            Field minus(4),plus(4);
+            for(size_t q=0;q<4;++q){minus[q]=patch.minus->position(q);plus[q]=patch.plus->position(q);}
+            rebuilt.push_back(makePatch(patch.candidate,minus,plus));
+        }
+        contact_network.reset();
+        patches.swap(rebuilt);
+        statistics(affine_contact_transfer_positions);
     }
     static std::vector<Candidate>readBank(const std::string&file,const LayeredParticleGeometry&geometry){
         std::ifstream f(file);std::string magic;size_t count=0,columns=0;f>>magic>>count>>columns;
@@ -135,13 +160,16 @@ class ExtrinsicCrackGrowth {
         last_candidate_unresolved=false;const auto&c=candidates[k];auto topology=reference.captureTopology();auto old_history=history;auto old_traction=last_traction;size_t old_patch_count=patches.size();
         StdVec<StdVec<Vecd>>old_minus,old_plus,old_minus_velocity,old_plus_velocity;for(const auto&p:patches){old_minus.push_back(p.minus->transferValues());old_plus.push_back(p.plus->transferValues());old_minus_velocity.push_back(p.minus->transferVelocities());old_plus_velocity.push_back(p.plus->transferVelocities());}
         Real oldEnergy=totalEnergy(),oldD=dissipated,oldHG=bulk.stabilizationEnergy();last_insertion={};last_insertion.candidate=k;last_insertion.old_energy=oldEnergy;last_insertion.old_bulk=bulk.energy();last_insertion.old_cohesive=stored;last_insertion.old_contact=contact_energy;last_insertion.old_stabilizer=oldHG;Real A=0;for(Real a:c.area)A+=a;
+        auto old_contact_positions=affine_contact_transfer_positions;
         try{
             StdVec<Vecd>target(c.vertex.begin(),c.vertex.end());StdVec<size_t>owner;
             for(const auto&x:target){size_t nearest=port.count;Real best=std::numeric_limits<Real>::infinity();for(size_t j=0;j<port.count;++j){Real d=(reference.X[j]-x).squaredNorm();if(d<best){best=d;nearest=j;}}owner.push_back(nearest);}
             VisibleCrackSurface continuous(port,target,owner,reference,spacing,3.5,2);StdVec<Vecd>common(target.size());for(size_t q=0;q<common.size();++q)common[q]=continuous.position(q);
             auto q=positions();StdVec<Matd>F(bulk.F,bulk.F+port.count);
             for(auto&p:patches){p.minus->captureTransferValues();p.plus->captureTransferValues();}
-            if(prepare)prepare();reference.setTransferState(q,F,StdVec<Vecd>(port.velocity,port.velocity+port.count));
+            if(prepare)prepare();
+            affine_contact_transfer_positions.clear();
+            reference.setTransferState(q,F,StdVec<Vecd>(port.velocity,port.velocity+port.count));
             size_t cut=0;for(const auto&t:c.barrier)cut+=reference.cutTriangle(t[0],t[1],t[2],false);
             if(cut==0){last_candidate_unresolved=true;throw std::runtime_error("Geometric facet has no remaining material interactions at this resolution");}
             reference.updateAfterFailure();bulk.rebuild();rebuildTraces();
@@ -166,6 +194,7 @@ class ExtrinsicCrackGrowth {
             active[k]=1;++insertion_events;if(precrack)initial_dissipation+=newD;else{insertion_defect+=defect;stabilizer_transfer_loss+=oldHG-newHG;max_insertion_fraction=std::max(max_insertion_fraction,fraction);}return true;
         }catch(const std::exception&e){last_rejection=e.what();if(last_candidate_unresolved){++unresolved_candidates;active[k]=2;}else ++rejected_events;patches.resize(old_patch_count);history=std::move(old_history);last_traction=std::move(old_traction);
             for(size_t i=0;i<old_patch_count;++i){patches[i].minus->restoreTransferValues(old_minus[i],old_minus_velocity[i]);patches[i].plus->restoreTransferValues(old_plus[i],old_plus_velocity[i]);}
+            affine_contact_transfer_positions=std::move(old_contact_positions);
             if(rollback)rollback();reference.restoreTopology(topology);bulk.rebuild();rebuildTraces();refresh();statistics(positions());totalEnergy();return false;}
     }
     Field cohesiveForces(const Field&q)const {

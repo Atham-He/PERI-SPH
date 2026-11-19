@@ -92,6 +92,16 @@ Fracture parameters stay in the input. Gc scales the numerical topology energy
 check in this option. No cohesive traction, softening or prescribed Gc work
 enters the mechanical history.
 
+The capsule and production owner also accept `--affine-crack-contact`.
+This uses the existing affine, one-sided reconstruction for contact-only
+crack traces. A legacy contact-only restart first reproduces the saved
+force. It then transfers the current crack corners with the original
+support and verifies the opening, closure force, contact work and time-step
+bound at fixed particle positions. Only the crack traces use the handoff
+position field. Later cuts continue the ordinary topology transfer.
+`--affine-contact-handoff-only` inspects one saved state and exits before
+advancing the load.
+
 A cohesive checkpoint can initialize this option only while the shell is
 intact. Any cut or active cohesive history is rejected by the native reader.
 Checkpoints written in the contact-only mode can resume their own history.

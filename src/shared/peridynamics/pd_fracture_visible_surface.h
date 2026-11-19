@@ -27,9 +27,10 @@ class VisibleCrackSurface : public ReferenceSolidSurface
                         const StdVec<size_t>&target_anchors,
                         solid_dynamics::PDLayeredFractureReference&r,
                         Real spacing,Real support_ratio=2.5,unsigned order=2,const StdVec<Vecd>&side_normals={},const StdVec<Vecd>&transfer_values={},const StdVec<Vecd>&transfer_velocities={},AnchorOwnership ownership=AnchorOwnership::MaterialNode,
-                        TransferOrder transfer_order=TransferOrder::PreservePolynomial)
+                        TransferOrder transfer_order=TransferOrder::PreservePolynomial,
+                        const StdVec<Vecd>* position_transfer_field=nullptr)
       :ReferenceSolidSurface(p,targets,order,DeferredBuildTag{}),reference_(r),
-        anchors_(target_anchors),original_targets_(targets),side_normals_(side_normals),transfer_values_(transfer_values),transfer_velocity_values_(transfer_velocities),dp_(spacing),support_(spacing*support_ratio),ownership_(ownership),transfer_order_(transfer_order)
+        anchors_(target_anchors),original_targets_(targets),side_normals_(side_normals),transfer_values_(transfer_values),transfer_velocity_values_(transfer_velocities),dp_(spacing),support_(spacing*support_ratio),ownership_(ownership),transfer_order_(transfer_order),position_transfer_field_(position_transfer_field)
     {
         if(spacing<=0||support_ratio<=1||!std::isfinite(support_)||order<1||order>2)
             throw std::invalid_argument("Invalid one-sided crack trace support/order");
@@ -123,6 +124,7 @@ class VisibleCrackSurface : public ReferenceSolidSurface
     Real dp_,support_,search_radius_;
     AnchorOwnership ownership_;
     TransferOrder transfer_order_;
+    const StdVec<Vecd>* position_transfer_field_;
     size_t version_=~size_t(0),generation_=0;bool transfer_pending_=false;
     StdVec<StdVec<size_t>>candidate_,horizon_candidate_,affected_;
     StdVec<FitInfo>fit_info_;
@@ -195,7 +197,9 @@ class VisibleCrackSurface : public ReferenceSolidSurface
                      const Matd&L,Row&row,FitInfo&info)const
     {
         if(transfer_values_.empty())return;
-        if(reference_.transfer_positions.size()!=port.count)
+        const auto&positions=position_transfer_field_&&!position_transfer_field_->empty()
+            ?*position_transfer_field_:reference_.transfer_positions;
+        if(positions.size()!=port.count)
             throw std::runtime_error("Trace transfer has no matching continuous-state field");
         const size_t modes=info.order==2?10:4;
         const size_t fields=transfer_velocity_values_.empty()?3:6;
@@ -208,7 +212,7 @@ class VisibleCrackSurface : public ReferenceSolidSurface
             Vecd z=L*((port.reference[nodes[a]]-points[q])/dp_);
             if(modes==10)B.row(a)=basis<10>(z).transpose();
             else B.row(a)=basis<4>(z).transpose();
-            Y.block(a,0,1,3)=reference_.transfer_positions[nodes[a]].transpose();
+            Y.block(a,0,1,3)=positions[nodes[a]].transpose();
             if(fields==6)Y.block(a,3,1,3)=tau*reference_.transfer_velocity[nodes[a]].transpose();
             G(a,0)=row.weight[a];W[a]=weight[a];
         }

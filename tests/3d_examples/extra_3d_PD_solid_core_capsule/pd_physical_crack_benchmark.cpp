@@ -125,6 +125,7 @@ std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesy
     candidate.area=areas;
     candidate.stress_pairs={{anchors({Vecd::Zero()},-1).front(),anchors({Vecd::Zero()},1).front()}};
     Growth growth(ref,bulk,port,ft,Gc,dp,K,{candidate},Growth::SurfaceLaw::ContactOnly);
+    growth.affine_contact_traces=true;
     auto energy=[&](){
         for(size_t i=0;i<count;++i)bulk.evaluate(i);
         port.clear();growth.applyContact();

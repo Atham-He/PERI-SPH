@@ -49,19 +49,20 @@ def run(a):
         completed=Path(a.completed_state).resolve();origin=completed.parent;old=json.loads((origin/'process_identity.json').read_text())
         if old.get('exit_code')!=86:raise RuntimeError('Completed dynamic origin did not finish its dynamic stage')
         if old.get('physics_fingerprint')!=fingerprint:
-            previous_receipt=a.recheck_cohesive_history or a.recheck_cohesive_kinematics or a.recheck_platen_step_bound
+            previous_receipt=(a.recheck_cohesive_history or a.recheck_cohesive_kinematics or
+                              a.recheck_platen_step_bound or a.recheck_layered_gradient_transfer)
             if not a.recheck_platen_transfer and not previous_receipt:
                 raise RuntimeError('Completed dynamic origin is not compatible and accepted')
-            # A plate-only transfer repair leaves the default free fracture
-            # and crack-face operators intact. Retain the original dynamic
-            # evidence, then verify this executable against the exact saved
-            # forces, energy and cohesive state before the work/contact phase.
+            # For a scoped reconstruction change, first verify the exact
+            # saved forces, energy and cohesive state, then run work/contact.
             previous_path=Path(previous_receipt).resolve() if previous_receipt else origin.parent/'benchmark_process.json'
             previous=json.loads(previous_path.read_text())
             unchanged_except={'tests/3d_examples/extra_3d_PD_solid_core_capsule/pd_physical_crack_benchmark.cpp'}
             if a.recheck_cohesive_history:
                 unchanged_except.update({'src/shared/peridynamics/pd_cohesive_interface_imex.h',
                                          'src/shared/peridynamics/pd_cohesive_surface_evolution.h'})
+            elif a.recheck_layered_gradient_transfer:
+                unchanged_except={'src/shared/peridynamics/pd_layered_fracture_reference.h'}
             elif a.recheck_platen_step_bound:
                 unchanged_except={'src/shared/peridynamics/pd_extrinsic_crack_growth.h',
                                   'src/shared/peridynamics/pd_solid_reference_coupling.h'}
@@ -86,7 +87,8 @@ def run(a):
                             rechecked_platen_transfer=a.recheck_platen_transfer,
                             rechecked_cohesive_history=bool(a.recheck_cohesive_history),
                             rechecked_cohesive_kinematics=bool(a.recheck_cohesive_kinematics),
-                            rechecked_platen_step_bound=bool(a.recheck_platen_step_bound))
+                            rechecked_platen_step_bound=bool(a.recheck_platen_step_bound),
+                            rechecked_layered_gradient_transfer=bool(a.recheck_layered_gradient_transfer))
         manifest['resumed_dynamic_origin']=str(origin)
     else:
         origin=root/'benchmark_dynamic';stage=native('benchmark_dynamic',origin,{'PERI_GROWTH_STOP_AFTER_COMPLETED_DYNAMIC':'1'},86)
@@ -113,7 +115,9 @@ def run(a):
     manifest.update(status='PASSED',exit_code=0,ended_UTC=utc(),opening_protocol=protocol,surface_ownership=ownership,platen_transfer=platen,cohesive_history_roundoff=history);put(root/'benchmark_process.json',manifest);print('FORMAL_FRACTURE_ACCEPTANCE_PASSED',flush=True)
 
 if __name__=='__main__':
-    p=argparse.ArgumentParser();p.add_argument('--source',required=True);p.add_argument('--build',required=True);p.add_argument('--output-root',required=True);p.add_argument('--completed-state');scope=p.add_mutually_exclusive_group();scope.add_argument('--recheck-platen-transfer',action='store_true');scope.add_argument('--recheck-cohesive-history',metavar='PRIOR_ACCEPTANCE_MANIFEST');scope.add_argument('--recheck-cohesive-kinematics',metavar='PRIOR_ACCEPTANCE_MANIFEST');scope.add_argument('--recheck-platen-step-bound',metavar='PRIOR_ACCEPTANCE_MANIFEST');a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--source',required=True);p.add_argument('--build',required=True);p.add_argument('--output-root',required=True);p.add_argument('--completed-state');scope=p.add_mutually_exclusive_group();scope.add_argument('--recheck-platen-transfer',action='store_true');scope.add_argument('--recheck-cohesive-history',metavar='PRIOR_ACCEPTANCE_MANIFEST');scope.add_argument('--recheck-cohesive-kinematics',metavar='PRIOR_ACCEPTANCE_MANIFEST');scope.add_argument('--recheck-platen-step-bound',metavar='PRIOR_ACCEPTANCE_MANIFEST')
+    scope.add_argument('--recheck-layered-gradient-transfer',metavar='PRIOR_ACCEPTANCE_MANIFEST')
+    a=p.parse_args()
     try:run(a)
     except BaseException as error:
         root=Path(a.output_root);root.mkdir(parents=True,exist_ok=True);path=root/'benchmark_process.json';state=json.loads(path.read_text()) if path.exists() else {};state.update(status='FAILED',exit_code=1,error=str(error),traceback=traceback.format_exc(),recorded_UTC=utc());put(path,state);raise

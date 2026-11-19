@@ -77,20 +77,31 @@ def accepted_checkpoint(path, fingerprint, step):
 def run(a):
     root=Path(a.output_root).resolve();root.mkdir(parents=True,exist_ok=True)
     source=Path(a.source).resolve();binary=Path(a.binary).resolve();cfg=Path(a.config).resolve();cache=Path(a.cells).resolve();bank=Path(a.bank).resolve()
-    acceptance=json.loads((Path(a.benchmark_root)/'acceptance.json').read_text());growth=json.loads((Path(a.benchmark_root)/'automatic_growth_acceptance.json').read_text());preflight=json.loads(Path(a.preflight).read_text())
+    acceptance=json.loads((Path(a.benchmark_root)/'acceptance.json').read_text())
+    preflight=json.loads(Path(a.preflight).read_text())
     benchmark_manifest=json.loads(Path(a.benchmark_manifest).read_text());preflight_manifest=json.loads(Path(a.preflight_manifest).read_text())
-    ownership=json.loads((Path(a.benchmark_root)/'surface_ownership_acceptance.json').read_text())
-    platen=json.loads((Path(a.benchmark_root)/'platen_transfer_acceptance.json').read_text())
-    history=json.loads((Path(a.benchmark_root)/'cohesive_history_roundoff_acceptance.json').read_text())
-    if acceptance.get('overall_status')!='PASSED' or any(x.get('status')!='PASSED' for x in [growth,ownership,platen,history,preflight]):raise RuntimeError('Physical growth, history, transfer or coupled-driver gate is not PASSED')
-    if benchmark_manifest.get('exit_code')!=0 or benchmark_manifest.get('diagnostic_replay') is not False:raise RuntimeError('Formal benchmark did not exit successfully or was a diagnostic replay')
-    if a.column_tied_interface:
-        column=json.loads((Path(a.benchmark_root)/'column_interface_acceptance.json').read_text())
-        if column.get('status')!='PASSED' or '--column-tied-interface' not in preflight_manifest.get('argv',[]):
-            raise RuntimeError('Fixed-column benchmark or matched coupled preflight has not passed')
+    if acceptance.get('overall_status')!='PASSED' or preflight.get('status')!='PASSED':
+        raise RuntimeError('Physical fracture or coupled-driver acceptance failed')
+    if a.fracture_contact_only:
+        if (acceptance.get('surface_law')!='contact_only' or benchmark_manifest.get('fracture_contact_only') is not True
+                or preflight.get('fracture_contact_only') is not True
+                or '--fracture-contact-only' not in preflight_manifest.get('argv',[])):
+            raise RuntimeError('Contact-only fracture requires a matched benchmark and preflight')
+    else:
+        for name in ('automatic_growth','surface_ownership','platen_transfer','cohesive_history_roundoff'):
+            gate=json.loads((Path(a.benchmark_root)/(name+'_acceptance.json')).read_text())
+            if gate.get('status')!='PASSED':raise RuntimeError('Physical fracture gate failed: '+name)
+        if a.column_tied_interface:
+            column=json.loads((Path(a.benchmark_root)/'column_interface_acceptance.json').read_text())
+            if column.get('status')!='PASSED':raise RuntimeError('Fixed-column fracture benchmark failed')
+    if benchmark_manifest.get('exit_code')!=0 or benchmark_manifest.get('diagnostic_replay') is not False:
+        raise RuntimeError('Formal benchmark did not exit successfully or was a diagnostic replay')
+    if a.column_tied_interface and '--column-tied-interface' not in preflight_manifest.get('argv',[]):
+        raise RuntimeError('Fixed-column interface requires a matched coupled preflight')
     if subprocess.check_output(['git','status','--porcelain'],cwd=source,text=True).strip():raise RuntimeError('Pin a clean canonical source before the production history')
     values=dict(line.split('=',1) for line in cfg.read_text().splitlines() if line.strip() and not line.lstrip().startswith('#'))
-    material=Path(values['dpc-table'].strip());identity={'source_commit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=source,text=True).strip(),'binary_sha256':sha(binary),'config_sha256':sha(cfg),'DPC_table_sha256':sha(material),'core_cache_sha256':sha(cache),'crack_bank_sha256':sha(bank),'checkpoint_schema':5 if a.column_tied_interface else 4}
+    material=Path(values['dpc-table'].strip());identity={'source_commit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=source,text=True).strip(),'binary_sha256':sha(binary),'config_sha256':sha(cfg),'DPC_table_sha256':sha(material),'core_cache_sha256':sha(cache),'crack_bank_sha256':sha(bank),'checkpoint_schema':(5 if a.column_tied_interface else 4)+(2 if a.fracture_contact_only else 0)}
+    if a.fracture_contact_only:identity['fracture_surface_law']='contact_only'
     # A PASSED file from an earlier executable/input cannot authorize a new run.
     for name,path in [('binary_sha256',binary),('config_sha256',cfg),('DPC_table_sha256',material),('core_cache_sha256',cache),('crack_bank_sha256',bank)]:
         if preflight_manifest.get(name)!=sha(path):raise RuntimeError('Coupled preflight identity mismatch: '+name)
@@ -116,7 +127,10 @@ def run(a):
         else:
             latest=json.loads((checkpoint.parent/'checkpoint.latest.json').read_text())
             if latest['fingerprint']!=previous['fingerprint'] or Path(latest['file']).resolve()!=checkpoint:raise RuntimeError('Continuation checkpoint differs from its original manifest')
-        if latest['version']!=previous['identity']['checkpoint_schema'] or (latest['version']!=identity['checkpoint_schema'] and not (a.resume_accepted_step and latest['version']==4)):
+        allowed_versions={identity['checkpoint_schema']}
+        if a.resume_accepted_step and not a.fracture_contact_only:allowed_versions.add(4)
+        if a.fracture_contact_only:allowed_versions.add(identity['checkpoint_schema']-2)
+        if latest['version']!=previous['identity']['checkpoint_schema'] or latest['version'] not in allowed_versions:
             raise RuntimeError('Continuation checkpoint schema differs from its permitted source')
         for name in ['config_sha256','DPC_table_sha256','core_cache_sha256','crack_bank_sha256']:
             if identity[name]!=previous['identity'][name]:raise RuntimeError('Continuation would change a frozen physical input: '+name)
@@ -139,6 +153,7 @@ def run(a):
         if output.exists() and any(output.iterdir()):raise RuntimeError('Production output segment already contains results')
         cmd=[str(binary),'--config='+str(cfg),'--snsni-cells='+str(cache),'--fracture-facets='+str(bank),'--output='+str(output),'--checkpoint-fingerprint='+fingerprint]
         if a.column_tied_interface:cmd.append('--column-tied-interface')
+        if a.fracture_contact_only:cmd.append('--fracture-contact-only')
         if a.local_platen_step_bound:cmd.append('--local-platen-step-bound')
         if a.checkpoint_wall_seconds is not None:cmd.append('--checkpoint-wall-seconds='+str(a.checkpoint_wall_seconds))
         if checkpoint is None:cmd.append('--checkpoint-stop-after-equilibrium')
@@ -185,6 +200,7 @@ if __name__=='__main__':
     for option in ['source','binary','config','cells','bank','output-root','benchmark-root','preflight','benchmark-manifest','benchmark-binary','preflight-manifest']:p.add_argument('--'+option,required=True)
     p.add_argument('--status-file');p.add_argument('--resume-checkpoint');p.add_argument('--resume-manifest');p.add_argument('--resume-accepted-step',type=int);p.add_argument('--column-tied-interface',action='store_true')
     p.add_argument('--checkpoint-wall-seconds',type=int,help='minimum wall seconds between periodic checkpoints (default: 600)')
+    p.add_argument('--fracture-contact-only',action='store_true')
     p.add_argument('--local-platen-step-bound',action='store_true',help='check the platen step limit using the potentially contacting traces')
     a=p.parse_args()
     if a.checkpoint_wall_seconds is not None and a.checkpoint_wall_seconds<=0:

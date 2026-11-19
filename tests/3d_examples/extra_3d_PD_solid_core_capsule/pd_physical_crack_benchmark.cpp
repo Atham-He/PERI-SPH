@@ -22,7 +22,9 @@ void writeCloud(const std::filesystem::path&p,const StdVec<Vecd>&x,const StdVec<
 void writeFace(const std::filesystem::path&p,const StdVec<Vecd>&x){std::ofstream f(p);f<<std::setprecision(17)<<"<VTKFile type=\"PolyData\" version=\"0.1\" byte_order=\"LittleEndian\"><PolyData><Piece NumberOfPoints=\"4\" NumberOfPolys=\"2\"><Points><DataArray type=\"Float64\" NumberOfComponents=\"3\" format=\"ascii\">";for(const auto&a:x)f<<a.transpose()<<' ';f<<"</DataArray></Points><Polys><DataArray type=\"Int64\" Name=\"connectivity\" format=\"ascii\">0 1 2 0 2 3</DataArray><DataArray type=\"Int64\" Name=\"offsets\" format=\"ascii\">3 6</DataArray></Polys></Piece></PolyData></VTKFile>\n";}
 #include "pd_automatic_growth_benchmark.h"
 int main(int argc,char**argv){bool published=false;try{
- if(argc!=2)throw std::invalid_argument("Output directory required");std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesystem::is_empty(out))throw std::runtime_error("Benchmark output must be new or empty");std::filesystem::create_directories(out/"frames");
+ const bool contact_only=argc==3&&std::string(argv[2])=="--fracture-contact-only";
+ if(argc!=2&&!contact_only)throw std::invalid_argument("Output directory and optional --fracture-contact-only required");
+std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesystem::is_empty(out))throw std::runtime_error("Benchmark output must be new or empty");std::filesystem::create_directories(out/"frames");
  {std::ofstream pending(out/"acceptance.json");pending<<"{\"geometry_status\":\"RUNNING\",\"capsule_restart_allowed\":false}\n";if(!pending)throw std::runtime_error("Cannot publish precrack acceptance start");published=true;}
  const Real E=2.151e9,nu=.3,ft=46.4e6,Gc=100,dp=25e-6,t=5e-6,K=2.8491556e15;const int nx=16,ny=16;
  SPHSystem system(BoundingBoxd(Vecd::Constant(-.002),Vecd::Constant(.002)),dp,8);PDBody body(system,makeShared<DefaultShape>("RealPrecrackedNOSBLayer"));body.defineAdaptation<PDAdaptation>(1.5075,1);body.defineMatterMaterial<HughesWingetSolid>(1200,E,nu);body.generateParticles<BaseParticles,PhysicalCrackSlab>(dp,t,nx,ny);
@@ -111,6 +113,51 @@ int main(int argc,char**argv){bool published=false;try{
  bool geometry_pass=checkpoint_roundtrip&&topology_guards&&component_count==2&&bad_bonds==0&&broken>0&&max_bulk<1e-12&&max_contact_error<1e-9&&max_slip<1e-10&&max_gap_error<1e-9&&max_fd<1e-5&&max_balance<1e-10&&max_torque<1e-9&&outside==0&&drift<1e-3&&gc_error<1e-5&&strength_error<1e-10&&fully_failed_traction==0&&damage_history_preserved&&live_damage_energy<1e-12&&live_damage_force<1e-10;
  {std::ofstream stage(out/"precrack_stage_acceptance.json");stage<<std::setprecision(17)<<"{\"status\":\""<<(geometry_pass?"PASSED":"FAILED")<<"\",\"broken_bond_pairs\":"<<broken<<",\"force_energy_relative_error\":"<<max_fd<<",\"force_balance\":"<<max_balance<<",\"torque_balance\":"<<max_torque<<",\"explicit_energy_relative_drift\":"<<drift<<"}\n";}
  if(!geometry_pass)throw std::runtime_error("Precrack geometry/energy acceptance failed");
+ if(contact_only){
+    ref.restoreTopology(intact_topology);bulk.rebuild();
+    using Growth=ExtrinsicCrackGrowth;
+    Growth::Candidate candidate;
+    candidate.vertex={master_points[0],master_points[1],master_points[2],master_points[3]};
+    candidate.normal=Vecd::UnitX();
+    candidate.barrier={{candidate.vertex[0],candidate.vertex[1],candidate.vertex[2]},
+                       {candidate.vertex[0],candidate.vertex[2],candidate.vertex[3]}};
+    candidate.point=slave_points;
+    candidate.area=areas;
+    candidate.stress_pairs={{anchors({Vecd::Zero()},-1).front(),anchors({Vecd::Zero()},1).front()}};
+    Growth growth(ref,bulk,port,ft,Gc,dp,K,{candidate},Growth::SurfaceLaw::ContactOnly);
+    auto energy=[&](){
+        for(size_t i=0;i<count;++i)bulk.evaluate(i);
+        port.clear();growth.applyContact();
+        return bulk.energy()+growth.contact_energy;
+    };
+    set(0,0,Matd::Identity());energy();
+    if(growth.select()!=growth.candidates.size())throw std::runtime_error("Contact-only fracture triggered at zero load");
+    for(size_t i=0;i<count;++i)s.x[i][0]*=1+1.1*ft/E;
+    energy();
+    if(growth.select()!=0||!growth.insert(0,false,[](){},energy))
+        throw std::runtime_error("Contact-only strength-triggered cut failed: "+growth.last_rejection);
+    size_t live_crossing=0;
+    for(size_t i=0;i<count;++i)for(size_t n=0;n<ref.rows[i].size();++n)
+        live_crossing+=ref.live(i,n)&&s.x0[i][0]*s.x0[ref.rows[i][n].j][0]<0;
+    set(20e-6,2*dp,Matd::Identity());energy();
+    growth.statistics(growth.positions());
+    Real open_gap=growth.max_gap,open_contact=growth.contact_energy,maximum_cohesive_force=0;
+    for(const auto&force:growth.cohesiveForces(growth.positions()))
+        maximum_cohesive_force=std::max(maximum_cohesive_force,force.norm());
+    set(-2e-9,0,Matd::Identity());energy();
+    Real closed_force=growth.contact_network->normal_force_sum,expected_closed_force=K*area*2e-9;
+    bool pass=live_crossing==0&&ref.physical_broken_bonds==broken&&std::abs(open_gap-20e-6)<1e-9*dp&&
+        open_contact==0&&maximum_cohesive_force==0&&growth.stored==0&&growth.dissipated==0&&
+        std::abs(closed_force/expected_closed_force-1)<1e-8&&std::isfinite(growth.contact_dt);
+    std::ofstream report(out/"acceptance.json");
+    report<<std::setprecision(17)<<"{\"overall_status\":\""<<(pass?"PASSED":"FAILED")
+        <<"\",\"surface_law\":\"contact_only\",\"broken_bond_pairs\":"<<ref.physical_broken_bonds
+        <<",\"live_crossing_bonds\":"<<live_crossing<<",\"maximum_normal_opening_m\":"<<open_gap
+        <<",\"open_contact_energy_J\":"<<open_contact<<",\"maximum_cohesive_force_N\":"<<maximum_cohesive_force
+        <<",\"closure_normal_force_N\":"<<closed_force<<",\"expected_closure_normal_force_N\":"<<expected_closed_force
+        <<",\"cohesive_fracture_work_J\":"<<growth.dissipated<<",\"insertion_defect_J\":"<<growth.insertion_defect<<"}\n";
+    return pass?0:2;
+ }
   // Reproduce the capsule's failed boundary-owner update on THIS same slab.
   // A reference boundary point can be across a new crack from its original
   // nearest-node search anchor. Fixed crack-side ownership must still reject it.

@@ -81,6 +81,22 @@ reports cohesive force work, irreversible Gc work and time-integration loss
 separately. Contact retains the original absolute penalty stiffness and contributes
 to the physical-mass time-step bound. This is not implicit integration of the bulk.
 
+## Contact-only fracture option
+
+Use `--fracture-contact-only` on the capsule, slab verification runner and
+capsule owner. The same tensile strength test and candidate geometry sever the
+reciprocal bonds. The surviving NOSB gradient, stabilizer and one-sided traces
+rebuild with the same topology update. The physical-mass integrator advances
+explicitly and uses the existing frictionless compression-only crack contact.
+Fracture parameters stay in the input. Gc scales the numerical topology energy
+check in this option. No cohesive traction, softening or prescribed Gc work
+enters the mechanical history.
+
+A cohesive checkpoint can initialize this option only while the shell is
+intact. Any cut or active cohesive history is rejected by the native reader.
+Checkpoints written in the contact-only mode can resume their own history.
+`MaximumNormalOpening_m` measures the reconstructed gap between two faces.
+
 ## Candidate geometry and limits
 
 Capsule cracks are restricted to an explicitly declared radial surface bank;

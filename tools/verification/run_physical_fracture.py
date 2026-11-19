@@ -28,12 +28,12 @@ def run(a):
     for k in list(env):
         if k.startswith('PERI_GROWTH_'):del env[k]
     env['PERI_GROWTH_PHYSICS_FINGERPRINT']=fingerprint
-    def native(name,output,changes,expected):
+    def native(name,output,changes,expected,extra_args=()):
         if output.exists() and any(output.iterdir()):raise RuntimeError('Verification output is not fresh: '+str(output))
         if sha(binary)!=manifest['binary_sha256'] or any(sha(source/p)!=d for p,d in hashes.items()):raise RuntimeError('Pinned verification source or executable changed')
         runtime=root/('runtime_'+name);runtime.mkdir(exist_ok=True);log_path=root/(name+'.log');settings=env.copy();settings.update(changes);settings['PERI_COHESIVE_AUDIT_FILE']=str(root/(name+'_cohesive_failure.txt'));settings['PERI_TRANSFER_AUDIT_FILE']=str(root/(name+'_transfer_failure.txt'))
         with log_path.open('w') as log:
-            process=subprocess.Popen([str(binary),str(output)],cwd=runtime,env=settings,stdout=log,stderr=subprocess.STDOUT)
+            process=subprocess.Popen([str(binary),str(output),*extra_args],cwd=runtime,env=settings,stdout=log,stderr=subprocess.STDOUT)
             stage={'name':name,'output':str(output),'log':str(log_path),'started_UTC':utc(),**identity(process.pid)};manifest['stages'].append(stage);manifest.update(status='RUNNING_'+name.upper(),pid=stage['pid'],start_ticks=stage['start_ticks'],started_UTC=stage['started_UTC']);put(root/'benchmark_process.json',manifest);print('STARTED',name,process.pid,flush=True)
             try:code=process.wait()
             except BaseException:
@@ -45,6 +45,20 @@ def run(a):
         stage.update(exit_code=code,ended_UTC=utc());put(output/'process_identity.json',dict(manifest,exit_code=code));put(root/'benchmark_process.json',manifest);print('EXIT',name,code,flush=True)
         if code!=expected:raise RuntimeError(name+' native exit '+str(code)+'; see '+str(log_path))
         return stage
+    if a.fracture_contact_only:
+        if a.completed_state or a.recheck_platen_transfer or any((a.recheck_cohesive_history,
+            a.recheck_cohesive_kinematics,a.recheck_platen_step_bound,a.recheck_layered_gradient_transfer)):
+            raise RuntimeError('The contact-only benchmark uses the original specimen directly')
+        output=root/'benchmark'
+        manifest.update(protocol='same slab: strength-triggered bond deletion, free opening and unilateral closure',
+                        fracture_contact_only=True)
+        native('benchmark_contact_only',output,{},0,('--fracture-contact-only',))
+        acceptance=json.loads((output/'acceptance.json').read_text())
+        if acceptance.get('overall_status')!='PASSED' or acceptance.get('surface_law')!='contact_only':
+            raise RuntimeError('Contact-only crack benchmark failed acceptance')
+        manifest.update(status='PASSED',exit_code=0,ended_UTC=utc(),contact_only_acceptance=acceptance)
+        put(root/'benchmark_process.json',manifest)
+        return
     if a.completed_state:
         completed=Path(a.completed_state).resolve();origin=completed.parent;old=json.loads((origin/'process_identity.json').read_text())
         if old.get('exit_code')!=86:raise RuntimeError('Completed dynamic origin did not finish its dynamic stage')
@@ -117,6 +131,7 @@ def run(a):
 if __name__=='__main__':
     p=argparse.ArgumentParser();p.add_argument('--source',required=True);p.add_argument('--build',required=True);p.add_argument('--output-root',required=True);p.add_argument('--completed-state');scope=p.add_mutually_exclusive_group();scope.add_argument('--recheck-platen-transfer',action='store_true');scope.add_argument('--recheck-cohesive-history',metavar='PRIOR_ACCEPTANCE_MANIFEST');scope.add_argument('--recheck-cohesive-kinematics',metavar='PRIOR_ACCEPTANCE_MANIFEST');scope.add_argument('--recheck-platen-step-bound',metavar='PRIOR_ACCEPTANCE_MANIFEST')
     scope.add_argument('--recheck-layered-gradient-transfer',metavar='PRIOR_ACCEPTANCE_MANIFEST')
+    p.add_argument('--fracture-contact-only',action='store_true')
     a=p.parse_args()
     try:run(a)
     except BaseException as error:

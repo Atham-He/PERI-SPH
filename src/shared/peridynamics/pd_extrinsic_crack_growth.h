@@ -26,6 +26,9 @@ namespace SPH::peridynamics {
  */
 class ExtrinsicCrackGrowth {
  public:
+    enum class SurfaceLaw { Cohesive, ContactOnly };
+    const SurfaceLaw surface_law;
+    bool contactOnly() const { return surface_law == SurfaceLaw::ContactOnly; }
     using Reference=solid_dynamics::PDLayeredFractureReference;
     using Bulk=solid_dynamics::PDBrokenBondEnergy;
     using Field=std::vector<Vecd>;using History=CohesiveInterfaceIMEX::History;
@@ -51,8 +54,9 @@ class ExtrinsicCrackGrowth {
     size_t insertion_events=0,rejected_events=0,failed_quadrature=0,unresolved_candidates=0;bool last_candidate_unresolved=false;
     std::string last_rejection;
     struct InsertionAudit {size_t candidate=0;Real area=0,old_energy=0,new_energy=0,old_bulk=0,new_bulk=0,old_cohesive=0,new_cohesive=0,old_contact=0,new_contact=0,new_dissipation=0,maximum_birth_gap=0,maximum_birth_velocity_jump=0,defect=0,fraction=0,old_stabilizer=0,new_stabilizer=0,total_defect=0;} last_insertion;
-    ExtrinsicCrackGrowth(Reference&r,Bulk&b,SolidForcePort&p,Real strength,Real energy,Real dp,Real K,const std::vector<Candidate>&bank)
-      :reference(r),bulk(b),port(p),ft(strength),Gc(energy),delta_f(2*energy/strength),spacing(dp),contact_K(K),candidates(bank),active(bank.size(),0){
+    ExtrinsicCrackGrowth(Reference&r,Bulk&b,SolidForcePort&p,Real strength,Real energy,Real dp,Real K,const std::vector<Candidate>&bank,
+                         SurfaceLaw law=SurfaceLaw::Cohesive)
+      :surface_law(law),reference(r),bulk(b),port(p),ft(strength),Gc(energy),delta_f(2*energy/strength),spacing(dp),contact_K(K),candidates(bank),active(bank.size(),0){
         if(std::min({ft,Gc,spacing,contact_K})<=0)throw std::invalid_argument("Invalid extrinsic fracture inputs");
         for(const auto&c:bank){if(c.point.empty()||c.point.size()!=c.area.size()||c.barrier.empty()||c.stress_pairs.empty()||std::abs(c.normal.norm()-1)>1e-8)throw std::invalid_argument("Invalid crack candidate bank");for(auto ij:c.stress_pairs)if(ij.first>=port.count||ij.second>=port.count)throw std::invalid_argument("Crack strength sample index");}
     }
@@ -63,7 +67,27 @@ class ExtrinsicCrackGrowth {
         for(const auto&p:patches){const auto&c=candidates[p.candidate];for(size_t k=0;k<c.point.size();++k){CohesiveSurfaceEvolution::Quadrature a;a.area=c.area[k];a.trace={CohesiveSurfaceEvolution::TracePoint{p.plus.get(),4+k},{p.minus.get(),4+k},{p.minus.get(),4+k},{p.minus.get(),p.minus->normalU(k)},{p.minus.get(),p.minus->normalV(k)}};q.push_back(a);}}
         return q;
     }
-    void statistics(const Field&q){stored=dissipated=max_gap=0;failed_quadrature=0;CohesiveSurfaceEvolution model(ft,Gc,quadrature());
+    static Real maximumNormalOpening(const Patch&patch)
+    {
+        Real opening=0;
+        const auto&minus=*patch.minus;
+        const auto&plus=*patch.plus;
+        for(size_t i=0;i<minus.natural.size();++i){
+            const Vecd x=minus.position(4+i);
+            const Vecd normal=(minus.position(minus.normalU(i))-x).cross(minus.position(minus.normalV(i))-x);
+            const Real length=normal.norm();
+            if(!std::isfinite(length)||length<=0)throw std::runtime_error("Crack face normal lost geometric rank");
+            opening=std::max(opening,(plus.position(4+i)-x).dot(normal)/length);
+        }
+        return opening;
+    }
+    void statistics(const Field&q){stored=dissipated=max_gap=0;failed_quadrature=0;
+        if(contactOnly()){
+            for(const auto&patch:patches)max_gap=std::max(max_gap,maximumNormalOpening(patch));
+            failed_quadrature=history.size();
+            return;
+        }
+        CohesiveSurfaceEvolution model(ft,Gc,quadrature());
         for(size_t k=0;k<history.size();++k){auto g=model.kinematics(k,q);Real A=model.quadrature[k].area;stored+=A*model.stored(g.jump,history[k].kappa);dissipated+=A*model.dissipation(history[k].kappa);max_gap=std::max(max_gap,std::max(g.normal_gap,Real(0)));failed_quadrature+=history[k].kappa>=delta_f;}}
     Real strengthRatio(size_t k)const {const auto&c=candidates[k];Real maximum=0;for(auto ij:c.stress_pairs){Matd P=.5*(bulk.P[ij.first]+bulk.P[ij.second]),F=.5*(bulk.F[ij.first]+bulk.F[ij.second]);Vecd n=F.determinant()*F.inverse().transpose()*c.normal;if(!n.allFinite()||n.norm()==0)throw std::runtime_error("Invalid current crack initiation normal");n.normalize();Vecd T=P*c.normal;Real normal=T.dot(n);if(normal>0)maximum=std::max(maximum,T.norm()/ft);}return maximum;}
     size_t select()const {size_t best=candidates.size();Real ratio=1;for(size_t k=0;k<candidates.size();++k)if(!active[k]){Real r=strengthRatio(k);if(r>=ratio){ratio=r;best=k;}}return best;}
@@ -121,13 +145,22 @@ class ExtrinsicCrackGrowth {
             size_t cut=0;for(const auto&t:c.barrier)cut+=reference.cutTriangle(t[0],t[1],t[2],false);
             if(cut==0){last_candidate_unresolved=true;throw std::runtime_error("Geometric facet has no remaining material interactions at this resolution");}
             reference.updateAfterFailure();bulk.rebuild();rebuildTraces();
-            patches.push_back(makePatch(k,common,common));for(size_t i=0;i<c.point.size();++i){history.push_back({precrack?delta_f:0});last_traction.push_back(Vecd::Zero());}
-            refresh();for(size_t q=0;q<4;++q)last_insertion.maximum_birth_velocity_jump=std::max(last_insertion.maximum_birth_velocity_jump,(patches.back().plus->velocity(q)-patches.back().minus->velocity(q)).norm());CohesiveSurfaceEvolution model(ft,Gc,quadrature());
-            for(size_t j=0;j<history.size();++j){Real r=model.kinematics(j,q).jump.norm();if(history[j].kappa<delta_f&&r>history[j].kappa+4e-14)throw std::runtime_error("New/reconstructed cohesive surface has an artificial birth opening");}
+            patches.push_back(makePatch(k,common,common));for(size_t i=0;i<c.point.size();++i){history.push_back({precrack&&!contactOnly()?delta_f:0});last_traction.push_back(Vecd::Zero());}
+            refresh();for(size_t q=0;q<4;++q)last_insertion.maximum_birth_velocity_jump=std::max(last_insertion.maximum_birth_velocity_jump,(patches.back().plus->velocity(q)-patches.back().minus->velocity(q)).norm());
+            if(contactOnly()){
+                for(size_t j=0;j<c.point.size();++j)
+                    last_insertion.maximum_birth_gap=std::max(last_insertion.maximum_birth_gap,
+                        (patches.back().plus->position(4+j)-patches.back().minus->position(4+j)).norm());
+                if(last_insertion.maximum_birth_gap>4e-14)throw std::runtime_error("New crack surface has an artificial birth opening");
+            }else{
+                CohesiveSurfaceEvolution model(ft,Gc,quadrature());
+                for(size_t j=0;j<history.size();++j){Real r=model.kinematics(j,q).jump.norm();if(history[j].kappa<delta_f&&r>history[j].kappa+4e-14)throw std::runtime_error("New/reconstructed cohesive surface has an artificial birth opening");}
+                for(size_t j=old_history.size();j<history.size();++j)last_insertion.maximum_birth_gap=std::max(last_insertion.maximum_birth_gap,model.kinematics(j,q).jump.norm());
+            }
             statistics(q);Real after=totalEnergy(),newD=dissipated-oldD,newHG=bulk.stabilizationEnergy();
             Real total_defect=after-oldEnergy+(precrack?0:newD),defect=total_defect-(newHG-oldHG),fraction=std::abs(defect)/(Gc*A);
             last_insertion.area=A;last_insertion.new_energy=after;last_insertion.new_bulk=bulk.energy();last_insertion.new_cohesive=stored;last_insertion.new_contact=contact_energy;last_insertion.new_stabilizer=newHG;last_insertion.total_defect=total_defect;last_insertion.new_dissipation=newD;last_insertion.defect=defect;last_insertion.fraction=fraction;
-            for(size_t j=old_history.size();j<history.size();++j)last_insertion.maximum_birth_gap=std::max(last_insertion.maximum_birth_gap,model.kinematics(j,q).jump.norm());
+            // Gc is an audit scale only when the crack carries no cohesive traction.
             if(!precrack&&newHG>oldHG+1e-10*Gc*A)throw std::runtime_error("Removing live LS stabilization increased its energy");
             if(!precrack&&fraction>maximum_insertion_fraction)throw std::runtime_error("Physical crack insertion energy defect exceeds its unchanged numerical acceptance bound (fraction="+std::to_string(fraction)+")");
             active[k]=1;++insertion_events;if(precrack)initial_dissipation+=newD;else{insertion_defect+=defect;stabilizer_transfer_loss+=oldHG-newHG;max_insertion_fraction=std::max(max_insertion_fraction,fraction);}return true;
@@ -136,7 +169,9 @@ class ExtrinsicCrackGrowth {
             if(rollback)rollback();reference.restoreTopology(topology);bulk.rebuild();rebuildTraces();refresh();statistics(positions());totalEnergy();return false;}
     }
     Field cohesiveForces(const Field&q)const {
-        Field f(q.size(),Vecd::Zero());CohesiveSurfaceEvolution model(ft,Gc,quadrature());
+        Field f(q.size(),Vecd::Zero());
+        if(contactOnly())return f;
+        CohesiveSurfaceEvolution model(ft,Gc,quadrature());
         for(size_t k=0;k<history.size();++k){Real kap=history[k].kappa;auto g=model.geometry(k,q,kap==0?model.absolute_tolerance+model.relative_tolerance*delta_f:0);Vecd t=Vecd::Zero();if(kap>0&&kap<delta_f)t=ft*(1/kap-1/delta_f)*g.jump;else if(kap==0&&k<last_traction.size())t=last_traction[k];for(const auto&e:g.linear.entries)f[e.node]-=model.quadrature[k].area*e.block().transpose()*t;}
         return f;
     }
@@ -151,6 +186,7 @@ class ExtrinsicCrackGrowth {
 
     CohesiveSurfaceEvolution::Result trialDrift(const Field&qfree,const Field&qold,const Field&inverse_mass,Real dt)const
     {
+        if(contactOnly())throw std::logic_error("Contact-only cracks use the explicit bulk drift");
         CohesiveSurfaceEvolution model(ft,Gc,quadrature());
         return model.solve(qfree,qold,history,inverse_mass,dt);
     }

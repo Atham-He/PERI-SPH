@@ -44,7 +44,14 @@ def index(root,segments):
         except (ET.ParseError,OSError):continue
     xml=ET.Element('VTKFile',type='Collection',version='0.1');collection=ET.SubElement(xml,'Collection')
     for t,f in sorted(frames.items()):ET.SubElement(collection,'DataSet',timestep=format(t,'.17g'),file=os.path.relpath(f,root).replace(os.sep,'/'))
-    tmp=root/'capsule.pvd.tmp';ET.ElementTree(xml).write(tmp,encoding='utf-8',xml_declaration=True);tmp.replace(root/'capsule.pvd')
+    tmp=root/'capsule.pvd.tmp'
+    ET.ElementTree(xml).write(tmp,encoding='utf-8',xml_declaration=True)
+    try:
+        tmp.replace(root/'capsule.pvd')
+    except PermissionError:
+        # Windows viewers can hold the old index open without delete sharing.
+        # Leave its readable frame list in place and retry on the next refresh.
+        print('Trajectory index is locked; the capsule continues running',flush=True)
 
 def accepted_checkpoint(path, fingerprint, step):
     """Identify a retained slot at a completed stage without altering its bytes.

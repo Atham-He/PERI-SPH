@@ -108,7 +108,10 @@ quadrature. An affine crack-contact checkpoint first restores its original
 forces. The trace is then rebuilt to preserve the current physical
 interface points and their penalty forces. The handoff records the change
 in nodal force distribution, the total energy, the measured opening and
-the stable step. `--inner-interface-handoff-only` restores and checks the
+the stable step. If the redistribution leaves an unbalanced force above
+the configured equilibrium tolerance, the continuation holds the saved
+platen displacement until the usual force and kinetic criteria pass,
+then continues the ramp from the saved ramp time. `--inner-interface-handoff-only` restores and checks the
 same saved loading state without advancing it.
 
 A cohesive checkpoint can initialize this option only while the shell is

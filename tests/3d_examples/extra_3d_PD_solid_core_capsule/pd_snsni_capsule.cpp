@@ -174,8 +174,8 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells)
     };
     auto forceAt=[&](const Field&d,const Field&v,Real compression,bool commit){setPositions(d,v);Field cd(d.begin(),d.begin()+cn);cb.evaluate(cd,o.core_rho,o.cfl);if(commit)cb.commit();else cb.discard();assembleShellAndConstraints(compression);};
     auto recoverable=[&](){return sb.energy()+growth.stored+growth.contact_energy+tie->energy+contact.energy;};
-    size_t stage=1,checks=0;Real stage_time=0,elapsed=0,Wp=0,Wcore=0,Wd=0,Walgorithmic=0,interface_switch_work=0;bool onset=false,fully_failed=false,column_hold=false;
-    auto compression=[&](Real t){Real a=column_hold?0:std::clamp(t/o.ramp_duration,Real(0),Real(1));return o.diameter*o.strain*(Real(stage-1)+.5*(1-std::cos(Pi*a)))/o.load_steps;};
+    size_t stage=1,checks=0;Real stage_time=0,elapsed=0,Wp=0,Wcore=0,Wd=0,Walgorithmic=0,interface_switch_work=0,inner_hold_elapsed=0;bool onset=false,fully_failed=false,column_hold=false,inner_hold=false;
+    auto compression=[&](Real t){Real a=column_hold?0:std::clamp((inner_hold?stage_time:t)/o.ramp_duration,Real(0),Real(1));return o.diameter*o.strain*(Real(stage-1)+.5*(1-std::cos(Pi*a)))/o.load_steps;};
     forceAt(time.displacement,time.velocity,0,false);Real U0=recoverable(),K0=time.kinetic();
     std::ofstream parameters(out/"parameters.json");parameters<<std::setprecision(17)<<"{\"core_backend\":\"SNSNI_RKPM_DPC_unchanged\",\"shell_backend\":\"layered_NOSB_PD_live_reconstruction\",\"shell_constitutive\":\"unchanged_finite_volume_Biot\",\"fracture_representation\":"<<std::quoted(fracture_contact_only?"strength_triggered_bond_deletion_contact_only":"strength_triggered_extrinsic_cohesive_true_bonds")<<",\"cohesive_integrator\":"<<std::quoted(fracture_contact_only?"disabled":"explicit_bulk_half_kicks_implicit_objective_surface_drift")<<",\"Gc_used_for_surface_softening\":"<<(fracture_contact_only?"false":"true")<<",\"mixed_mode_assumption\":"<<std::quoted(fracture_contact_only?"equal_strength":"equal_strength_and_Gc")<<",\"candidate_geometry\":\"through_thickness_radial_Voronoi_facets\",\"E_Pa\":"<<o.shell_E<<",\"nu\":"<<o.shell_nu<<",\"ft_Pa\":"<<o.fracture_stress<<",\"Gc_J_m2\":"<<o.fracture_energy<<",\"delta_f_m\":"<<growth.delta_f<<",\"core_particles\":"<<cn<<",\"shell_particles\":"<<sn<<",\"candidate_facets\":"<<bank.size()<<",\"shell_mass_kg\":"<<shell_mass<<",\"interface_K_Pa_per_m\":"<<Ktie<<",\"platen_and_crack_contact_K_Pa_per_m\":"<<Kcontact<<",\"core_parameters_changed\":false,\"source_hash\":"<<std::quoted(CAPSULE_SOURCE_SHA256)<<"}\n";parameters.close();
     if(o.preflight_only){Field d(count),v(count);Matd A=Matd::Identity();A(0,0)=.998;A(1,1)=1.001;A(2,2)=.999;for(size_t j=0;j<count;++j){d[j]=(A-Matd::Identity())*X[j];if(j<cn)d[j]+=Vecd(5e-8*rc/.0005,0,0);v[j]=Vecd(.2*std::sin(37*X[j][0]/R),-.1,.3*X[j][2]/R);}forceAt(d,v,.004*2*R,false);
@@ -267,7 +267,9 @@ std::vector<std::pair<Real,std::string>>frame_index;
             growth.affine_contact_traces=true;
         }
         if(version>=10){
-            a.value(inner_affine_positions);
+            a.fields(inner_affine_positions,inner_hold,inner_hold_elapsed);
+            if(!std::isfinite(inner_hold_elapsed)||inner_hold_elapsed<0)
+                throw std::runtime_error("Invalid affine inner-interface hold clock");
             if(!affine_inner_interface||(!inner_affine_positions.empty()&&inner_affine_positions.size()!=sn)||
                 std::any_of(inner_affine_positions.begin(),inner_affine_positions.end(),[](const Vecd&q){return !q.allFinite();}))
                 throw std::runtime_error("Invalid affine core-shell checkpoint transfer state");
@@ -467,7 +469,11 @@ std::vector<std::pair<Real,std::string>>frame_index;
             const Real old_step=stableStep(old_dt),new_step=stableStep(tie->stable_dt);
             const bool pass=position_change<=1e-12&&std::abs(growth.max_gap-crack_gap)<=1e-12&&force_error<=.01&&
                 energy_error<=.01&&reaction_error<=.01&&tie->force_residual<=1e-8&&tie->torque_residual<=1e-8&&
-                tie->power_residual<=1e-8&&new_step>old_step&&new_residual<=o.force_tolerance&&cb.commits==old_commits;
+                tie->power_residual<=1e-8&&new_step>old_step&&std::isfinite(new_residual)&&cb.commits==old_commits;
+            // Reuse the usual fixed-displacement equilibration when the force
+            // map change leaves a transient. The saved ramp clock stays fixed.
+            inner_hold=pass&&new_residual>o.force_tolerance;
+            if(inner_hold)checks=0;
             std::ofstream audit(out/"affine_inner_interface_handoff.json");
             audit<<std::setprecision(17)<<"{\"status\":\""<<(pass?"PASSED":"FAILED")<<"\",\"step\":"<<time.steps
                 <<",\"strain\":"<<u/o.diameter<<",\"elapsed_s\":"<<elapsed<<",\"old_reaction_N\":"<<reaction
@@ -486,8 +492,10 @@ std::vector<std::pair<Real,std::string>>frame_index;
                 <<",\"inner_horizon_fallback_rows\":"<<si->extended_position_fallback_points
                 <<",\"old_interface_dt_s\":"<<old_dt<<",\"new_interface_dt_s\":"<<tie->stable_dt
                 <<",\"old_combined_dt_s\":"<<old_step<<",\"new_combined_dt_s\":"<<new_step
+                <<",\"fixed_displacement_hold_required\":"<<(inner_hold?"true":"false")
                 <<",\"material_steps_advanced\":"<<cb.commits-old_commits<<"}\n";
             if(!pass)throw std::runtime_error("Affine core-shell handoff failed force, work, gap or time-step verification");
+            if(inner_hold)std::cout<<"AFFINE_INNER_REEQUILIBRATION_STARTED strain="<<u/o.diameter<<" residual="<<new_residual<<std::endl;
             for(size_t j=0;j<count;++j)time.acceleration[j]=bulk_force[j]/mass[j];
         }
         cohesive_force=growth.cohesiveForces(growth.positions());snapshot("resumed",compression(stage_time));
@@ -514,7 +522,7 @@ std::vector<std::pair<Real,std::string>>frame_index;
                 +1/(tie->stable_dt*tie->stable_dt)+1/(platen_dt*platen_dt);
             if(std::isfinite(growth.contact_dt))rate+=1/(growth.contact_dt*growth.contact_dt);
             Real bounded=std::min({o.max_dt,1/std::sqrt(rate),cb.acoustic_dt,radial_dt});
-            return (!column_hold&&stage_time<o.ramp_duration)?std::min(bounded,o.ramp_duration-stage_time):bounded;
+            return (!column_hold&&!inner_hold&&stage_time<o.ramp_duration)?std::min(bounded,o.ramp_duration-stage_time):bounded;
         };
         const Real all_rows_dt=allowedStep(contact.stable_dt),old_u=compression(stage_time);
         Real dt=local_platen_step_bound?allowedStep(boundRows(nullptr,old_u)):all_rows_dt;
@@ -558,22 +566,25 @@ std::vector<std::pair<Real,std::string>>frame_index;
         }
         time.displacement=next_d;forceAt(time.displacement,vhalf,compression(stage_time+dt),true);
         Real undampedK=0;for(size_t j=0;j<count;++j){time.velocity[j]=vhalf[j]+.5*dt*bulk_force[j]/mass[j];undampedK+=.5*mass[j]*time.velocity[j].squaredNorm();time.velocity[j]*=factor;time.acceleration[j]=(bulk_force[j]+(j>=cn?cohesive_force[j-cn]:Vecd::Zero()))/mass[j];}
-        Wd+=undampedK-time.kinetic();++time.steps;setPositions(time.displacement,time.velocity);Real u=compression(stage_time+dt),mean=.5*(contact.upper+contact.lower);Wp+=.5*(oldReaction+mean)*(u-old_u);for(size_t j=0;j<cn;++j)Wcore+=.5*(old_internal[j]+internal[j]).dot(time.displacement[j]-old_d[j]);stage_time+=dt;elapsed+=dt;
+        Wd+=undampedK-time.kinetic();++time.steps;setPositions(time.displacement,time.velocity);Real u=compression(stage_time+dt),mean=.5*(contact.upper+contact.lower);Wp+=.5*(oldReaction+mean)*(u-old_u);for(size_t j=0;j<cn;++j)Wcore+=.5*(old_internal[j]+internal[j]).dot(time.displacement[j]-old_d[j]);if(inner_hold)inner_hold_elapsed+=dt;else stage_time+=dt;elapsed+=dt;
         if(!fracture_contact_only||time.steps%200==0||(!fully_failed&&onset))growth.statistics(growth.positions());
         if(!fully_failed&&growth.failed_quadrature){fully_failed=true;events<<(fracture_contact_only?"first_contact_only_crack":"first_full_cohesive_failure")<<','<<time.steps<<','<<stage<<','<<u/o.diameter<<",0,0,"<<sr.physical_broken_bonds<<','<<growth.max_gap<<'\n';events.flush();snapshot("first_full_failure",u);}
         if(time.steps%200==0){Real residual=0,minc=1,mins=1,newK=time.kinetic();for(size_t j=0;j<count;++j){Vecd f=bulk_force[j];if(j>=cn)f+=cohesive_force[j-cn];residual+=f.squaredNorm();}residual=std::sqrt(residual)/std::max(mean,Real(1e-20));for(const auto&F:cb.F)minc=std::min(minc,F.determinant());for(size_t j=0;j<sn;++j)mins=std::min(mins,sF[j].determinant());Real imbalance=std::abs(contact.upper-contact.lower)/std::max(mean,Real(1e-20)),kr=newK/std::max(mean*u,Real(1e-30));Real budget=Wp+interface_switch_work-Wcore-(recoverable()-U0)-(growth.dissipated-growth.initial_dissipation)-(newK-K0)-Wd-Walgorithmic-growth.stabilizer_transfer_loss+growth.insertion_defect;
             auto row=[&](std::ostream&f){f<<time.steps<<','<<stage<<','<<elapsed<<','<<u/o.diameter<<','<<u<<','<<dt<<','<<contact.upper<<','<<contact.lower<<','<<residual<<','<<imbalance<<','<<kr<<','<<minc<<','<<mins<<','<<sr.physical_broken_bonds<<','<<growth.patches.size()<<','<<growth.failed_quadrature<<','<<growth.max_gap<<','<<growth.stored<<','<<growth.dissipated-growth.initial_dissipation<<','<<sb.energy()<<','<<tie->energy<<','<<contact.energy<<','<<growth.contact_energy<<','<<std::max(contact.max_penetration,growth.max_penetration)<<','<<Wp<<','<<Wcore<<','<<Wd<<','<<Walgorithmic<<','<<growth.stabilizer_transfer_loss<<','<<growth.insertion_defect<<','<<budget<<'\n';f.flush();};row(progress);if(time.steps%1000==0)std::cout<<"PROGRESS step="<<time.steps<<" stage="<<stage<<" strain="<<u/o.diameter<<" force="<<mean<<" residual="<<residual<<" cracks="<<growth.patches.size()<<" gap="<<growth.max_gap<<" dt="<<dt<<std::endl;
-            bool good=(column_hold||stage_time>=o.ramp_duration)&&mean>1e-10&&residual<=o.force_tolerance&&imbalance<=o.balance_tolerance&&kr<=o.kinetic_tolerance;
+            bool good=(column_hold||inner_hold||stage_time>=o.ramp_duration)&&mean>1e-10&&residual<=o.force_tolerance&&imbalance<=o.balance_tolerance&&kr<=o.kinetic_tolerance;
             checks=good?checks+1:0;
             if(checks>=3){
-                if(column_hold){
-                    auto file=out/"column_reequilibration.json";
+                if(column_hold||inner_hold){
+                    auto file=out/(inner_hold?"affine_inner_reequilibration.json":"column_reequilibration.json");
                     std::ofstream report(file);report<<std::setprecision(17)
                         <<"{\"status\":\"PASSED\",\"step\":"<<time.steps<<",\"strain\":"<<u/o.diameter
-                        <<",\"hold_elapsed_s\":"<<stage_time<<",\"reaction_N\":"<<mean<<",\"force_residual\":"<<residual
+                        <<",\"hold_elapsed_s\":"<<(inner_hold?inner_hold_elapsed:stage_time)<<",\"reaction_N\":"<<mean<<",\"force_residual\":"<<residual
                         <<",\"kinetic_ratio\":"<<kr<<",\"dt_s\":"<<dt<<",\"crack_facets\":"<<growth.patches.size()<<"}\n";
-                    snapshot("column_rebalanced",u);column_hold=false;stage_time=0;checks=0;
-                    std::cout<<"FIXED_COLUMN_REEQUILIBRATION_ACCEPTED force="<<mean<<" dt="<<dt<<std::endl;save();
+                    snapshot(inner_hold?"inner_rebalanced":"column_rebalanced",u);
+                    const char*event=inner_hold?"AFFINE_INNER_REEQUILIBRATION_ACCEPTED":"FIXED_COLUMN_REEQUILIBRATION_ACCEPTED";
+                    if(column_hold)stage_time=0;
+                    column_hold=inner_hold=false;inner_hold_elapsed=0;checks=0;
+                    std::cout<<event<<" force="<<mean<<" dt="<<dt<<std::endl;save();
                 }else{
                     row(eq);snapshot(std::to_string(stage),u);
                     std::cout<<"ACCEPTED stage="<<stage<<" force="<<mean<<" cracks="<<growth.patches.size()<<std::endl;
@@ -581,6 +592,7 @@ std::vector<std::pair<Real,std::string>>frame_index;
                 }
             }
         }
+        if(inner_hold&&inner_hold_elapsed>o.max_stage_duration){save();throw std::runtime_error("Affine inner-interface hold did not equilibrate");}
         if(stage_time>o.max_stage_duration)throw std::runtime_error("Physical capsule stage did not equilibrate");if(time.steps%200==0&&recovery::checkpoint.due(time.steps,stage!=prior_stage))save();if(recovery::checkpoint.stop_step&&time.steps>=recovery::checkpoint.stop_step){save();return 86;}if(recovery::checkpoint.stop_after_equilibrium&&stage!=prior_stage){save();return 86;}
     }
     save();std::ofstream summary(out/"summary.json");summary<<"{\"status\":\"COMPLETE_PHYSICAL_FRACTURE_MECHANICAL_HISTORY\",\"accepted_points\":"<<o.load_steps<<",\"steps\":"<<time.steps<<",\"automatic_crack_facets\":"<<growth.patches.size()<<",\"broken_bond_pairs\":"<<sr.physical_broken_bonds<<",\"fracture_contact_only\":"<<(fracture_contact_only?"true":"false")<<",\"maximum_current_crack_gap_m\":"<<growth.max_gap<<",\"full_cohesive_failure\":"<<(!fracture_contact_only&&fully_failed?"true":"false")<<",\"parameters_changed\":false}\n";return 0;

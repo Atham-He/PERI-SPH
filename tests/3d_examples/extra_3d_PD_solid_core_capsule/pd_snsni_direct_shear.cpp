@@ -66,7 +66,8 @@ int runDirectShear(const HybridOptions&o,const std::string&cells,const std::stri
     auto*cx=cp.getVariableDataByName<Vecd>("Position");auto*cv=cp.registerStateVariableData<Vecd>("Velocity");
     Field cX(cx,cx+cn);
     SnsniReference cr(cX,o.spacing,o.core_E/(2*(1+o.core_nu)),o.core_E*o.core_nu/((1+o.core_nu)*(1-2*o.core_nu)),o.core_rho,cells);
-    SnsniPlasticSolid cb(cr,dpc::Model::fromCSV(o.dpc_table,o.dpc_r0,o.dpc_shear_dilation,o.dpc_shear_hardening));
+    SnsniPlasticSolid cb(cr,dpc::Model::fromCSV(o.dpc_table,o.dpc_r0,o.dpc_shear_dilation,o.dpc_shear_hardening),
+                         execution.makeSpatialDerivatives());
     auto*cm=cp.getVariableDataByName<Real>("Mass");auto*cvol=cp.getVariableDataByName<Real>("VolumetricMeasure");
     for(size_t j=0;j<cn;++j){cm[j]=cr.mass[j];cvol[j]=cm[j]/o.core_rho;}
 
@@ -175,6 +176,7 @@ int runDirectShear(const HybridOptions&o,const std::string&cells,const std::stri
     std::ofstream parameters(out/"parameters.json");parameters<<std::setprecision(17)
       <<"{\"core_backend\":\"S-NSNI_RKPM_DPC\",\"shell_backend\":\"NOSB_PD_layered_volume\",\"sand_backend\":\"rotating_rigid_spheres_Hertz_linear_history_Coulomb\",\"core_particles\":"<<cn<<",\"shell_particles\":"<<sn<<",\"material_sites\":"<<cr.cells.size()<<",\"sand_grains\":"<<ng
       <<",\"execution_backend\":"<<std::quoted(execution.backendName())
+      <<",\"core_derivatives_backend\":"<<std::quoted(cb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")
       <<",\"bonded_interface_backend\":"<<std::quoted(execution.bondedInterfaceOnDevice()?"cuda_fp64":"cpu_fp64")
       <<",\"capsule_count\":1,\"capsule_mass_kg\":"<<capsule_mass<<",\"sand_mass_kg\":"<<grain_mass<<",\"capsule_mass_fraction\":"<<capsule_mass/(grain_mass+capsule_mass)<<",\"capsule_sand_mu\":0,\"initial_height_m\":"<<box.initial_height_m
       <<",\"initial_area_m2\":"<<box.length_x_m*box.length_y_m<<",\"normal_pressure_Pa\":"<<box.normal_pressure_Pa<<",\"normal_load_control\":\"massless_exact_piston_constant_nominal_force\",\"load_steps\":"<<box.normal_increments+box.shear_increments

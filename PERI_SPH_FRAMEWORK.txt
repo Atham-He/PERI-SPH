@@ -109,8 +109,11 @@ CUDA currently covers bonded solid interface assembly, bilinear crack
 projection, local crack forces and tangent bounds, and assembly of those
 crack quantities onto particles. Bonded interfaces and crack contact share
 the same sparse particle trace mapping. Crack geometry selection and the
-global time-step decision use the host solver. The case parameters.json
-records the backend selected for each phase. The material calibration,
+global time-step decision use the host solver. The shared spatial derivative
+operator also evaluates the deformation gradients of the live-bond NOSB-PD
+shell and the deformation gradients and displacement Hessians of the S-NSNI
+core. The material updates use the existing host implementation. The case
+parameters.json records the backend selected for each phase. The material calibration,
 contact law, and checkpoint schema use the same inputs for both backends.
 
 Build and regression

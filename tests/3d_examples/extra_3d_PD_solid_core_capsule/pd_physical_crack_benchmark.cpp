@@ -41,7 +41,7 @@ std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesy
  StdVec<StdVec<size_t>>columns(nc);StdVec<Vecd>directors(nc,Vecd::UnitZ());for(size_t c=0;c<nc;++c)for(size_t k=0;k<3;++k)columns[c].push_back(k*nc+c);ThicknessQuadrature rule(3);LayeredParticleGeometry geometry(p,columns,directors,rule.xi);PDLayeredFractureReference ref(inner,geometry);
  InteractionWithUpdate<NosbPDQuadraticSecondStep> second(inner,ref);InteractionDynamics<NosbPDQuadraticThirdStep> third(inner,ref);InteractionDynamics<ProjectedPairStabilization> unused_hg(inner,.5,.1);InteractionDynamics<PairNumericalDampingforPD> unused_damping(inner);
  system.initializeSystemCellLinkedLists();system.initializeSystemConfigurations();shape.exec();ref.initialize();auto intact_topology=ref.captureTopology();size_t broken=ref.cutPlane(Vecd::Zero(),Vecd::UnitX());if(!broken)throw std::runtime_error("Precrack cut no physical bonds");
- PDBrokenBondEnergy bulk(inner,ref,E,nu,.5,body.getSPHAdaptation().getKernel()->CutOffRadius());bulk.rebuild();State s(body);SolidForcePort port(body,SolidForcePort::Storage::PDAccelerationPrior);
+ PDBrokenBondEnergy bulk(inner,ref,E,nu,.5,body.getSPHAdaptation().getKernel()->CutOffRadius(),execution.makeSpatialDerivatives());bulk.rebuild();State s(body);SolidForcePort port(body,SolidForcePort::Storage::PDAccelerationPrior);
  auto*acc=p.getVariableDataByName<Vecd>("PDAcceleration");auto*bd=p.getVariableDataByName<Real>("BrokenBondFraction");StdVec<Vecd>master_points={Vecd(0,-ny*dp/2,-t/2),Vecd(0,ny*dp/2,-t/2),Vecd(0,ny*dp/2,t/2),Vecd(0,-ny*dp/2,t/2)},slave_points;StdVec<Real>areas;
  for(int j=0;j<8;++j)for(size_t k=0;k<3;++k){slave_points.push_back(Vecd(0,(j+.5-4)*dp,.5*t*rule.xi[k]));areas.push_back(dp*.5*t*rule.weight[k]);}
  auto anchors=[&](const StdVec<Vecd>&points,int side){StdVec<size_t>result;for(const auto&q:points){size_t a=count;Real best=std::numeric_limits<Real>::infinity();for(size_t i=0;i<count;++i)if((s.x0[i][0]>0?1:-1)==side){Real d=(s.x0[i]-q).squaredNorm();if(d<best){best=d;a=i;}}if(a==count)throw std::runtime_error("Missing crack-face owner");result.push_back(a);}return result;};
@@ -50,7 +50,7 @@ std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesy
  CrackSurfaceContactNetwork contact({{&minus_geometry,&areas,1,0},{&plus_geometry,&areas,-1,0}},K,dp,projection.get());
 
  Real volume=0,area=0;for(size_t i=0;i<count;++i)volume+=s.measure[i];for(Real a:areas)area+=a;
- auto evaluate=[&](){for(size_t i=0;i<count;++i)bulk.evaluate(i);port.clear();for(size_t i=0;i<count;++i){acc[i].setZero();bulk.forces(i);}master.ensureCurrent();slave.ensureCurrent();contact.apply();for(size_t i=0;i<count;++i)acc[i]+=port.external[i];return bulk.energy()+contact.energy;};
+ auto evaluate=[&](){bulk.evaluateAll();port.clear();for(size_t i=0;i<count;++i){acc[i].setZero();bulk.forces(i);}master.ensureCurrent();slave.ensureCurrent();contact.apply();for(size_t i=0;i<count;++i)acc[i]+=port.external[i];return bulk.energy()+contact.energy;};
  auto set=[&](Real gap,Real slide,const Matd&Q){for(size_t i=0;i<count;++i){Vecd jump=Vecd((s.x0[i][0]>0?.5:-.5)*gap,s.x0[i][0]>0?slide:0,0);s.x[i]=Q*(s.x0[i]+jump);s.v[i].setZero();}};
  StdVec<int>components(count,-1);int component_count=0;for(size_t start=0;start<count;++start)if(components[start]<0){StdVec<size_t>queue{start};components[start]=component_count;for(size_t k=0;k<queue.size();++k){size_t i=queue[k];for(size_t n=0;n<ref.rows[i].size();++n)if(ref.live(i,n)){size_t j=ref.rows[i][n].j;if(components[j]<0){components[j]=component_count;queue.push_back(j);}}}++component_count;}
  size_t bad_bonds=0;for(size_t i=0;i<count;++i)for(size_t n=0;n<ref.rows[i].size();++n){const auto&e=ref.rows[i][n];bad_bonds+=ref.live(i,n)&&(s.x0[i][0]*s.x0[e.j][0]<0);if(!ref.live(i,n)&&e.gradient.norm()!=0)throw std::runtime_error("A broken bond retains a material gradient");}
@@ -136,7 +136,7 @@ std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesy
     Growth growth(ref,bulk,port,ft,Gc,dp,K,{candidate},Growth::SurfaceLaw::ContactOnly,projection.get());
     growth.affine_contact_traces=true;
     auto energy=[&](){
-        for(size_t i=0;i<count;++i)bulk.evaluate(i);
+        bulk.evaluateAll();
         port.clear();growth.applyContact();
         return bulk.energy()+growth.contact_energy;
     };
@@ -174,6 +174,7 @@ std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesy
         <<",\"device_contact_evaluations\":"<<network.device_contact_evaluations
         <<",\"host_contact_fallbacks\":"<<network.host_contact_fallbacks
         <<",\"device_trace_pullback\":"<<(network.device_trace_pullback?"true":"false")
+        <<",\"shell_derivatives_backend\":"<<std::quoted(bulk.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")
         <<",\"cohesive_fracture_work_J\":"<<growth.dissipated<<",\"insertion_defect_J\":"<<growth.insertion_defect<<"}\n";
     return pass?0:2;
  }
@@ -184,7 +185,7 @@ std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesy
    auto saved=ref.captureTopology();StdVec<Vecd>saved_x(s.x,s.x+count),saved_v(s.v,s.v+count);
    ref.restoreTopology(intact_topology);bulk.rebuild();
    for(size_t i=0;i<count;++i){const auto&x=s.x0[i];s.x[i]=x+Vecd(.002*x[0]+.002*x[0]*x[1]/(nx*dp),-.001*x[1],.001*x[2]);s.v[i].setZero();}
-   for(size_t i=0;i<count;++i)bulk.evaluate(i);
+   bulk.evaluateAll();
    StdVec<Vecd>boundary={Vecd(-.05*dp,-.3*dp,t/2),Vecd(-.05*dp,.3*dp,t/2),Vecd(.05*dp,-.3*dp,t/2),Vecd(.05*dp,.3*dp,t/2)};
    StdVec<size_t>wrong_owner;for(const auto&q:boundary)wrong_owner.push_back(anchors({q},q[0]>0?-1:1)[0]);
    VisibleCrackSurface owned(port,boundary,wrong_owner,ref,dp,3,2,{},{},{},VisibleCrackSurface::AnchorOwnership::ReferencePoint);
@@ -199,7 +200,7 @@ std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesy
    bool fixed_rejected=must_reject([&](){fixed_owner.rebuildChanged();});
    Real transfer_error=0;size_t cross_entries=0;
    for(size_t q=0;q<boundary.size();++q){transfer_error=std::max(transfer_error,(owned.position(q)-before[q]).norm()/dp);if(boundary[q][0]*s.x0[owned.materialAnchor(q)][0]<=0)++cross_entries;for(size_t j:owned.rows[q].index)if(boundary[q][0]*s.x0[j][0]<=0||!ref.visibleReference(boundary[q],s.x0[j]))++cross_entries;}
-   for(size_t i=0;i<count;++i)bulk.evaluate(i);
+   bulk.evaluateAll();
    Real energy_error=std::abs(bulk.energy()+spring(false)-old_energy)/std::max(std::abs(old_energy),Real(1e-30)),hg_loss=old_hg-bulk.stabilizationEnergy();
    VisibleCrackSurface restored(port,boundary,wrong_owner,ref,dp,3,2,{},owned.transferValues(),{},VisibleCrackSurface::AnchorOwnership::ReferencePoint);
    Real restart_error=0;for(size_t q=0;q<boundary.size();++q){if(restored.materialAnchor(q)!=owned.materialAnchor(q)||restored.rows[q].index!=owned.rows[q].index)throw std::runtime_error("Boundary reference ownership did not restore deterministically");for(size_t a=0;a<owned.rows[q].weight.size();++a)restart_error=std::max(restart_error,std::abs(restored.rows[q].weight[a]-owned.rows[q].weight[a]));}
@@ -286,7 +287,7 @@ std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesy
    strict.captureTransferValues();platen.captureTransferValues();
    if(!ref.cutPlane(Vecd::Zero(),Vecd::UnitX()))throw std::runtime_error("Platen fixture did not cut slab");
    bulk.rebuild();
-   for(size_t i=0;i<count;++i)bulk.evaluate(i);
+   bulk.evaluateAll();
    ref.setTransferState(StdVec<Vecd>(s.x,s.x+count),StdVec<Matd>(bulk.F,bulk.F+count),StdVec<Vecd>(s.v,s.v+count));
    ref.updateAfterFailure();
    bool strict_unresolved=false;

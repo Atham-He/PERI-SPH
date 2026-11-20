@@ -47,4 +47,14 @@ std::unique_ptr<BondedInterfaceBatch> PeriExecution::makeBondedInterface() const
 #endif
     return nullptr;
 }
+
+std::unique_ptr<SpatialDerivativeBatch> PeriExecution::makeSpatialDerivatives() const
+{
+#if defined(PERI_SPH_HAS_CUDA)
+    if (mode_ == PeriExecutionMode::GPU)
+        return makeCudaSpatialDerivatives();
+#endif
+    return nullptr;
+}
+
 }

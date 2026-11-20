@@ -6,6 +6,7 @@
  */
 #include "pd_energy_crack_band.h"
 #include "pd_layered_fracture_reference.h"
+#include "pd_spatial_derivatives.h"
 namespace SPH::solid_dynamics {
 class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
   public:
@@ -15,17 +16,19 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
     StdVec<StdVec<Entry>> projection;StdVec<int>residual_order;
     Real stabilizer,stabilizer_dt=0,maximum_projection_error=0;size_t version=~size_t(0);
     Real *stored_density,*hg_density,*tangent_bound;Matd *F,*P,*stress;Vecd *internal,*hourglass;
-    PDBrokenBondEnergy(BaseInnerRelation&r,PDLayeredFractureReference&ref,Real E,Real nu,Real hg,Real horizon)
+    PDBrokenBondEnergy(BaseInnerRelation&r,PDLayeredFractureReference&ref,Real E,Real nu,Real hg,Real horizon,
+                       std::unique_ptr<peridynamics::SpatialDerivativeBatch> derivatives = nullptr)
       :LocalDynamics(r.getSPHBody()),DataDelegateInner(r),reference(ref),elastic(E,nu),
        x(particles_->getVariableDataByName<Vecd>("Position")),volume(particles_->getVariableDataByName<Real>("VolumetricMeasure")),
        mass(particles_->getVariableDataByName<Real>("Mass")),acc(particles_->getVariableDataByName<Vecd>("PDAcceleration")),
        F(particles_->getVariableDataByName<Matd>("DeformationGradient")),P(particles_->getVariableDataByName<Matd>("PDPK1")),
        stress(particles_->getVariableDataByName<Matd>("PDStress")),internal(particles_->getVariableDataByName<Vecd>("PDInternalForce")),
-       hourglass(particles_->getVariableDataByName<Vecd>("HourglassForce")) {
+       hourglass(particles_->getVariableDataByName<Vecd>("HourglassForce")), derivatives_(std::move(derivatives)) {
         if(hg<0||horizon<=0)throw std::invalid_argument("Invalid live-bond stabilizer");stabilizer=hg*elastic.K/(horizon*horizon);
         stored_density=particles_->registerStateVariableData<Real>("ShellStoredEnergyDensity");hg_density=particles_->registerStateVariableData<Real>("ShellStabilizationEnergyDensity");tangent_bound=particles_->registerStateVariableData<Real>("ShellTangentModulusBound");
     }
     void rebuild() {
+        derivative_stencil_current_ = false;
         if(reference.topologyPending())throw std::runtime_error("Rebuild the layered gradient before its live residual");
         using namespace peridynamics::layered_detail;size_t count=particles_->TotalRealParticles();projection.resize(count);residual_order.resize(count);maximum_projection_error=0;StdVec<Real>rate(count,0);
         for(size_t i=0;i<count;++i){
@@ -44,13 +47,43 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
         }
         Real largest=0;for(Real a:rate)largest=std::max(largest,a);stabilizer_dt=largest>0?.2/std::sqrt(largest):std::numeric_limits<Real>::infinity();version=reference.topology_version;
     }
-    void evaluate(size_t i) {
+    bool hasDeviceDerivatives() const noexcept { return derivatives_ != nullptr; }
+    void evaluate(size_t i) { evaluatePoint(i, nullptr); }
+
+    void evaluateAll()
+    {
+        if (version != reference.topology_version || reference.topologyPending())
+            throw std::runtime_error("Live elastic residual not rebuilt after bond topology change");
+        const size_t count = projection.size();
+        if (derivatives_)
+            evaluateDeviceDerivatives(count);
+        tbb::parallel_for(size_t(0), count, [&](size_t i)
+        {
+            evaluatePoint(i, derivatives_ ? &device_derivatives_[i] : nullptr);
+        });
+    }
+
+  private:
+    void evaluatePoint(size_t i, const peridynamics::SpatialDerivatives3 *derivatives)
+    {
         if(version!=reference.topology_version)throw std::runtime_error("Live elastic residual not rebuilt after bond topology change");reference.checkIntact(i);A39 A=A39::Zero();Matd f=Matd::Zero();
-        for(size_t n=0;n<reference.rows[i].size();++n){auto&e=reference.rows[i][n];Vecd y=x[e.j]-x[i];A+=y*projection[i][n].coefficient.transpose();f+=y*e.gradient.transpose();}
+        if (derivatives)
+            for (int a = 0; a < 3; ++a)
+                for (int b = 0; b < 3; ++b)
+                    f(a, b) = derivatives->gradient[a][b];
+        for(size_t n=0;n<reference.rows[i].size();++n)
+        {
+            const auto &e=reference.rows[i][n];
+            const Vecd y=x[e.j]-x[i];
+            A+=y*projection[i][n].coefficient.transpose();
+            if (!derivatives)
+                f+=y*e.gradient.transpose();
+        }
         F[i]=f;auto state=elastic.evaluate(f);P[i]=state.positive_P+state.negative_P;stress[i]=P[i]*f.transpose()/state.J;Real hg=0;
         for(size_t n=0;n<projection[i].size();++n){auto&e=projection[i][n];e.residual=x[reference.rows[i][n].j]-x[i]-A*e.basis;hg+=.5*stabilizer*e.weight*e.residual.squaredNorm();e.force=volume[i]*stabilizer*e.weight*e.residual;}
         hg_density[i]=hg;stored_density[i]=state.positive+state.negative+hg;tangent_bound[i]=elastic.tangentBound(state.principal_stretches,state.J,0);
     }
+  public:
     void forces(size_t i) {
         if(version!=reference.topology_version||reference.topologyPending())throw std::runtime_error("Live force assembly is stale after a fracture event");reference.checkIntact(i);
         Vecd f=Vecd::Zero(),h=Vecd::Zero();for(size_t n=0;n<reference.rows[i].size();++n){auto&e=reference.rows[i][n];f+=volume[i]*P[i]*e.gradient-volume[e.j]*P[e.j]*reference.rows[e.j][e.reverse].gradient;h+=projection[i][n].force-projection[e.j][e.reverse].force;}
@@ -59,6 +92,40 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
     Real energy()const{Real result=0;for(size_t i=0;i<projection.size();++i)result+=volume[i]*stored_density[i];return result;}
     Real stabilizationEnergy()const{Real result=0;for(size_t i=0;i<projection.size();++i)result+=volume[i]*hg_density[i];return result;}
     Real finiteStrainTimeStep()const{Real bound=3*elastic.K;for(size_t i=0;i<projection.size();++i)bound=std::max(bound,tangent_bound[i]);return reference.elastic_dt_bound*std::sqrt(3*elastic.K/bound);}
-  private:Vecd*x;Real*volume,*mass;Vecd*acc;
+  private:
+    Vecd*x;Real*volume,*mass;Vecd*acc;
+    std::unique_ptr<peridynamics::SpatialDerivativeBatch> derivatives_;
+    bool derivative_stencil_current_ = false;
+    std::vector<peridynamics::ParticleVector3> device_field_;
+    std::vector<peridynamics::SpatialDerivatives3> device_derivatives_;
+
+    void evaluateDeviceDerivatives(size_t count)
+    {
+        if (!derivative_stencil_current_)
+        {
+            peridynamics::SpatialDerivativeMap map{};
+            map.particle_count = count;
+            map.offsets.push_back(0);
+            for (size_t i = 0; i < count; ++i)
+            {
+                map.origins.push_back(i);
+                for (const auto &e : reference.rows[i])
+                {
+                    map.neighbors.push_back(e.j);
+                    map.gradients.push_back({{e.gradient[0], e.gradient[1], e.gradient[2]}});
+                }
+                map.offsets.push_back(map.neighbors.size());
+            }
+            derivatives_->configure(map);
+            derivative_stencil_current_ = true;
+        }
+
+        device_field_.resize(count);
+        for (size_t i = 0; i < count; ++i)
+            device_field_[i] = {{x[i][0], x[i][1], x[i][2]}};
+        derivatives_->evaluate(device_field_, device_derivatives_);
+        if (device_derivatives_.size() != count)
+            throw std::logic_error("Spatial derivative backend returned an incomplete live PD field");
+    }
 };
 }

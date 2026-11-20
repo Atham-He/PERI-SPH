@@ -7,6 +7,7 @@
 #pragma once
 #include "solid_snsni_reference.h"
 #include "dpc_snsni_adapter.h"
+#include "pd_spatial_derivatives.h"
 namespace SPH::solid_dynamics
 {
 class SnsniPlasticSolid
@@ -26,7 +27,9 @@ class SnsniPlasticSolid
     size_t evaluations=0,commits=0;
     bool pending_commit=false;
     Real linear_frequency_bound_squared=0,acoustic_dt=0;
-    SnsniPlasticSolid(SnsniReference&r,const dpc::Model&m):reference(r),model(m)
+    SnsniPlasticSolid(SnsniReference&r,const dpc::Model&m,
+                      std::unique_ptr<peridynamics::SpatialDerivativeBatch> derivatives = nullptr)
+      : reference(r), model(m), derivatives_(std::move(derivatives))
     {
         const size_t n=r.cells.size();history.resize(n);pending.resize(n);F.resize(n);inverseF.resize(n);correction.resize(n);force_gradient.resize(n);displacement_hessian.resize(n);force_hessian.resize(n);accumulated_plastic_work.assign(n,0);sampling_gradient.resize(n);
         StdVec<Vecd> sites;StdVec<Real> volumes;
@@ -44,13 +47,34 @@ class SnsniPlasticSolid
                 for(int k=0;k<3;++k)rate[e.j]+=C*eig.eigenvalues()[k]*im*(e.hessian*eig.eigenvectors().col(k)).norm()*higher[k];}}
         linear_frequency_bound_squared=*std::max_element(rate.begin(),rate.end());
         if(!(linear_frequency_bound_squared>0))throw std::runtime_error("Invalid S-NSNI frequency bound");
+        if (derivatives_)
+            configureDerivatives();
     }
+    bool hasDeviceDerivatives() const noexcept { return derivatives_ != nullptr; }
     void evaluate(const Field&d,Real rho0,Real cfl)
     {
         if(pending_commit)throw std::logic_error("Commit or explicitly discard pending DPC history before the next evaluation");
         const size_t n=history.size();
-        tbb::parallel_for(size_t(0),n,[&](size_t l){auto&h=displacement_hessian[l];for(auto&a:h)a.setZero();F[l]=Matd::Identity();
-            for(const auto&e:reference.cells[l].rows){F[l]+=d[e.j]*e.gradient.transpose();for(int a=0;a<3;++a)h[a]+=d[e.j][a]*e.hessian;}
+        if (derivatives_)
+            evaluateDeviceDerivatives(d);
+        tbb::parallel_for(size_t(0),n,[&](size_t l){auto&h=displacement_hessian[l];
+            if (derivatives_)
+            {
+                const auto &cell = device_derivatives_[l];
+                for (int i = 0; i < 3; ++i)
+                    for (int j = 0; j < 3; ++j)
+                    {
+                        F[l](i, j) = cell.gradient[i][j];
+                        for (int a = 0; a < 3; ++a)
+                            h[a](i, j) = cell.hessian[a][i][j];
+                    }
+            }
+            else
+            {
+                for(auto&a:h)a.setZero();
+                F[l]=Matd::Identity();
+                for(const auto&e:reference.cells[l].rows){F[l]+=d[e.j]*e.gradient.transpose();for(int a=0;a<3;++a)h[a]+=d[e.j][a]*e.hessian;}
+            }
             if(!F[l].allFinite()||F[l].determinant()<=0)throw std::runtime_error("Invalid S-NSNI cell Jacobian, no deletion or clamping");inverseF[l]=F[l].inverse();
             Triple derivativeF,derivativeCp;for(auto&a:derivativeCp)a.setZero();Vecd derivativeKappa=Vecd::Zero();
             // Difference form enforces the derivative of a constant exactly;
@@ -94,6 +118,44 @@ class SnsniPlasticSolid
         ++commits;pending_commit=false;
     }
     void discard(){if(!pending_commit)throw std::logic_error("No pending S-NSNI state");pending_commit=false;}
+
+ private:
+    std::unique_ptr<peridynamics::SpatialDerivativeBatch> derivatives_;
+    std::vector<peridynamics::ParticleVector3> device_field_;
+    std::vector<peridynamics::SpatialDerivatives3> device_derivatives_;
+
+    void configureDerivatives()
+    {
+        peridynamics::SpatialDerivativeMap map{};
+        map.particle_count = reference.X.size();
+        map.offsets.push_back(0);
+        map.add_identity = true;
+        for (const auto &cell : reference.cells)
+        {
+            for (const auto &e : cell.rows)
+            {
+                map.neighbors.push_back(e.j);
+                map.gradients.push_back({{e.gradient[0], e.gradient[1], e.gradient[2]}});
+                peridynamics::ShapeHessian3 hessian{};
+                for (int i = 0; i < 3; ++i)
+                    for (int j = 0; j < 3; ++j)
+                        hessian.derivative[i][j] = e.hessian(i, j);
+                map.hessians.push_back(hessian);
+            }
+            map.offsets.push_back(map.neighbors.size());
+        }
+        derivatives_->configure(map);
+    }
+
+    void evaluateDeviceDerivatives(const Field &displacement)
+    {
+        device_field_.resize(displacement.size());
+        for (size_t i = 0; i < displacement.size(); ++i)
+            device_field_[i] = {{displacement[i][0], displacement[i][1], displacement[i][2]}};
+        derivatives_->evaluate(device_field_, device_derivatives_);
+        if (device_derivatives_.size() != history.size())
+            throw std::logic_error("Spatial derivative backend returned an incomplete S-NSNI cell field");
+    }
 };
 
 /** Explicit Newmark beta=0,gamma=1/2 (kick-drift-kick), constant lumped M.

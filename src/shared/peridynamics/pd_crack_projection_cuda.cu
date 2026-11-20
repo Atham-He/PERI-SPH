@@ -1,14 +1,16 @@
 #include "pd_crack_projection.h"
+#include "pd_cuda_buffer.cuh"
 
 #include <cuda_runtime.h>
 #include <cmath>
-#include <stdexcept>
-#include <string>
 
 namespace SPH::peridynamics
 {
 namespace
 {
+using cuda_detail::check;
+using cuda_detail::DeviceBuffer;
+
 // The double-precision solve follows BilinearCrackGeometry::closest,
 // including its stationarity, damping and rank checks.
 struct Vector3 {
@@ -74,39 +76,6 @@ __global__ void projectBatch(const CrackProjectionInput *in, CrackProjectionResu
     const std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i < n) out[i] = projectOne(in[i]);
 }
-
-void check(cudaError_t status, const char *operation)
-{
-    if (status != cudaSuccess)
-        throw std::runtime_error(std::string("CUDA crack projection ") + operation +
-                                 " failed: " + cudaGetErrorString(status));
-}
-
-template <class T>
-class DeviceBuffer
-{
-  public:
-    ~DeviceBuffer() { cudaFree(data_); }
-    DeviceBuffer() = default;
-    DeviceBuffer(const DeviceBuffer &) = delete;
-    DeviceBuffer &operator=(const DeviceBuffer &) = delete;
-
-    T *get() const { return data_; }
-    void reserve(std::size_t count)
-    {
-        if (count <= capacity_)
-            return;
-        check(cudaFree(data_), "buffer release");
-        data_ = nullptr;
-        capacity_ = 0;
-        check(cudaMalloc(&data_, count * sizeof(T)), "buffer allocation");
-        capacity_ = count;
-    }
-
-  private:
-    T *data_ = nullptr;
-    std::size_t capacity_ = 0;
-};
 
 class CudaCrackProjection final : public CrackProjectionBatch
 {

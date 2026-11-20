@@ -4,6 +4,7 @@
 
 #include "base_particles.hpp"
 #include "pd_coulomb_friction.h"
+#include "pd_bonded_interface_batch.h"
 #include "base_body.h"
 #include <Eigen/Cholesky>
 #include <Eigen/Eigenvalues>
@@ -203,6 +204,84 @@ class ReferenceSolidSurface
  * No fluid pressure, velocity overwrite or duplicate repulsion is added. */
 class BondedSolidInterface
 {
+    std::unique_ptr<BondedInterfaceBatch> backend_;
+    std::vector<BondedInterfaceNode> nodes_a_, nodes_b_;
+    std::vector<BondedInterfacePoint> points_;
+
+    static BondedTraceMap packTrace(const ReferenceSolidSurface &surface)
+    {
+        BondedTraceMap result{surface.port.count, {0}, {}};
+        for (const auto &row : surface.rows)
+        {
+            for (size_t k = 0; k < row.index.size(); ++k)
+                result.entries.push_back({row.index[k], row.weight[k]});
+            result.offsets.push_back(result.entries.size());
+        }
+        return result;
+    }
+
+    static void packState(const SolidForcePort &port, std::vector<BondedInterfaceNode> &nodes)
+    {
+        for (size_t i = 0; i < nodes.size(); ++i)
+        {
+            auto &node = nodes[i];
+            node.force_divisor = port.storage == SolidForcePort::Storage::ForcePrior ? 1.0 : port.mass[i];
+            for (int d = 0; d < 3; ++d)
+            {
+                node.position[d] = port.position[i][d];
+                node.velocity[d] = port.velocity[i][d];
+                node.external[d] = port.external[i][d];
+            }
+        }
+    }
+
+    static Vecd vector(const double *values)
+    {
+        return Vecd(values[0], values[1], values[2]);
+    }
+
+    void finishAudit(const Vecd &sum, const Vecd &torque, Real power, Real force_scale, Real power_scale)
+    {
+        force_residual = sum.norm() / std::max(force_scale, Real(1e-30));
+        torque_residual = torque.norm() / std::max(length_scale * force_scale, Real(1e-30));
+        power_residual = std::abs(power) / std::max(power_scale, Real(1e-30));
+        worst_force = std::max(worst_force, force_residual);
+        worst_torque = std::max(worst_torque, torque_residual);
+        worst_power = std::max(worst_power, power_residual);
+    }
+
+    void applyBackend()
+    {
+        packState(a.port, nodes_a_);
+        packState(b.port, nodes_b_);
+        backend_->apply(nodes_a_, nodes_b_, points_);
+        if (points_.size() != stiffness.size())
+            throw std::logic_error("Bonded interface backend returned the wrong point count");
+        for (size_t i = 0; i < nodes_a_.size(); ++i)
+            a.port.external[i] = vector(nodes_a_[i].external);
+        for (size_t i = 0; i < nodes_b_.size(); ++i)
+            b.port.external[i] = vector(nodes_b_[i].external);
+
+        energy = max_gap = 0;
+        Vecd sum = Vecd::Zero(), torque = Vecd::Zero();
+        Real power = 0, force_scale = 0, power_scale = 0;
+        for (size_t i = 0; i < points_.size(); ++i)
+        {
+            const auto &point = points_[i];
+            x_a[i] = vector(point.position_a);
+            x_b[i] = vector(point.position_b);
+            force_a[i] = vector(point.force_a);
+            energy += point.energy;
+            max_gap = std::max(max_gap, Real(point.gap));
+            sum += vector(point.sum);
+            torque += vector(point.torque);
+            power += point.power;
+            force_scale += point.force_scale;
+            power_scale += point.power_scale;
+        }
+        finishAudit(sum, torque, power, force_scale, power_scale);
+    }
+
   public:
     ReferenceSolidSurface &a,&b;
     StdVec<Real> stiffness;
@@ -210,8 +289,9 @@ class BondedSolidInterface
     Real stable_dt,energy=0,max_gap=0,force_residual=0,torque_residual=0,power_residual=0;
     Real worst_force=0,worst_torque=0,worst_power=0,length_scale;size_t a_mapping_version=~size_t(0),b_mapping_version=~size_t(0);
     BondedSolidInterface(ReferenceSolidSurface &first,ReferenceSolidSurface &second,
-                         const StdVec<Real> &areas,Real stiffness_per_area,Real length)
-        : a(first),b(second),length_scale(length)
+                         const StdVec<Real> &areas,Real stiffness_per_area,Real length,
+                         std::unique_ptr<BondedInterfaceBatch> backend = nullptr)
+        : backend_(std::move(backend)),a(first),b(second),length_scale(length)
     {
         if(a.rows.size()!=b.rows.size() || a.points.size()!=areas.size() || length<=0)
             throw std::invalid_argument("Invalid bonded-solid interface dimensions");
@@ -220,12 +300,33 @@ class BondedSolidInterface
             throw std::invalid_argument("Bonded-solid reference surfaces do not coincide");
          stiffness.push_back(areas[i]*stiffness_per_area);}
         x_a.resize(areas.size());x_b.resize(areas.size());force_a.resize(areas.size());
+        if (backend_)
+        {
+            if (a.port.external == b.port.external)
+                throw std::invalid_argument("Batched bonded interface requires distinct external force arrays");
+            nodes_a_.resize(a.port.count);
+            nodes_b_.resize(b.port.count);
+        }
         refreshTimeStepBound();
     }
-    void refreshTimeStepBound(){a.ensureCurrent();b.ensureCurrent();stable_dt=ReferenceSolidSurface::stableBound(a,&b,stiffness);a_mapping_version=a.mappingVersion();b_mapping_version=b.mappingVersion();}
+    void refreshTimeStepBound()
+    {
+        a.ensureCurrent();
+        b.ensureCurrent();
+        stable_dt = ReferenceSolidSurface::stableBound(a, &b, stiffness);
+        if (backend_)
+            backend_->configure(packTrace(a), packTrace(b), std::vector<double>(stiffness.begin(), stiffness.end()));
+        a_mapping_version = a.mappingVersion();
+        b_mapping_version = b.mappingVersion();
+    }
     void apply()
     {
         a.ensureCurrent();b.ensureCurrent();if(a_mapping_version!=a.mappingVersion()||b_mapping_version!=b.mappingVersion())refreshTimeStepBound();
+        if (backend_)
+        {
+            applyBackend();
+            return;
+        }
         energy=max_gap=0;Vecd sum=Vecd::Zero(),torque=Vecd::Zero();Real power=0,fs=0,ps=0;
         for(size_t i=0;i<stiffness.size();++i)
         {
@@ -248,10 +349,7 @@ class BondedSolidInterface
             }
             Real energy_rate=-f.dot(va-vb);power+=energy_rate;ps+=std::abs(energy_rate);
         }
-        force_residual=sum.norm()/std::max(fs,Real(1e-30));
-        torque_residual=torque.norm()/std::max(length_scale*fs,Real(1e-30));
-        power_residual=std::abs(power)/std::max(ps,Real(1e-30));
-        worst_force=std::max(worst_force,force_residual);worst_torque=std::max(worst_torque,torque_residual);worst_power=std::max(worst_power,power_residual);
+        finishAudit(sum, torque, power, fs, ps);
     }
 };
 

@@ -3,6 +3,7 @@
 #include "pd_column_face_surface.h"
 #include "pd_fracture_visible_surface.h"
 #include "pd_crack_face_contact.h"
+#include "pd_execution.h"
 #include "pd_cohesive_crack_law.h"
 #include "pd_fracture_topology_checkpoint.h"
 #include <Eigen/Geometry>
@@ -21,9 +22,17 @@ void writeCloud(const std::filesystem::path&p,const StdVec<Vecd>&x,const StdVec<
 }
 void writeFace(const std::filesystem::path&p,const StdVec<Vecd>&x){std::ofstream f(p);f<<std::setprecision(17)<<"<VTKFile type=\"PolyData\" version=\"0.1\" byte_order=\"LittleEndian\"><PolyData><Piece NumberOfPoints=\"4\" NumberOfPolys=\"2\"><Points><DataArray type=\"Float64\" NumberOfComponents=\"3\" format=\"ascii\">";for(const auto&a:x)f<<a.transpose()<<' ';f<<"</DataArray></Points><Polys><DataArray type=\"Int64\" Name=\"connectivity\" format=\"ascii\">0 1 2 0 2 3</DataArray><DataArray type=\"Int64\" Name=\"offsets\" format=\"ascii\">3 6</DataArray></Polys></Piece></PolyData></VTKFile>\n";}
 #include "pd_automatic_growth_benchmark.h"
-int main(int argc,char**argv){bool published=false;try{
- const bool contact_only=argc==3&&std::string(argv[2])=="--fracture-contact-only";
- if(argc!=2&&!contact_only)throw std::invalid_argument("Output directory and optional --fracture-contact-only required");
+int main(int argc,char**argv){bool published=false,contact_only=false;try{
+ if(argc<2)throw std::invalid_argument("Output directory required");
+ PeriExecutionMode execution_mode=PeriExecutionMode::Default;
+ for(int i=2;i<argc;++i){
+    const std::string arg=argv[i];
+    if(arg=="--fracture-contact-only")contact_only=true;
+    else if(arg.rfind("--execution=",0)==0)execution_mode=parsePeriExecution(arg.substr(12));
+    else throw std::invalid_argument("Unknown crack benchmark argument "+arg);
+ }
+ const PeriExecution execution(execution_mode);
+ auto projection=execution.makeCrackProjection();
 std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesystem::is_empty(out))throw std::runtime_error("Benchmark output must be new or empty");std::filesystem::create_directories(out/"frames");
  {std::ofstream pending(out/"acceptance.json");pending<<"{\"geometry_status\":\"RUNNING\",\"capsule_restart_allowed\":false}\n";if(!pending)throw std::runtime_error("Cannot publish precrack acceptance start");published=true;}
  const Real E=2.151e9,nu=.3,ft=46.4e6,Gc=100,dp=25e-6,t=5e-6,K=2.8491556e15;const int nx=16,ny=16;
@@ -38,7 +47,7 @@ std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesy
  auto anchors=[&](const StdVec<Vecd>&points,int side){StdVec<size_t>result;for(const auto&q:points){size_t a=count;Real best=std::numeric_limits<Real>::infinity();for(size_t i=0;i<count;++i)if((s.x0[i][0]>0?1:-1)==side){Real d=(s.x0[i]-q).squaredNorm();if(d<best){best=d;a=i;}}if(a==count)throw std::runtime_error("Missing crack-face owner");result.push_back(a);}return result;};
  VisibleCrackSurface master(port,master_points,anchors(master_points,-1),ref,dp,3,2),slave(port,slave_points,anchors(slave_points,1),ref,dp,3,2),plus_corners(port,master_points,anchors(master_points,1),ref,dp,3,2);
  BilinearCrackSurface minus_geometry(master,slave_points),plus_geometry(plus_corners,slave_points);
- CrackSurfaceContactNetwork contact({{&minus_geometry,&areas,1,0},{&plus_geometry,&areas,-1,0}},K,dp);
+ CrackSurfaceContactNetwork contact({{&minus_geometry,&areas,1,0},{&plus_geometry,&areas,-1,0}},K,dp,projection.get());
 
  Real volume=0,area=0;for(size_t i=0;i<count;++i)volume+=s.measure[i];for(Real a:areas)area+=a;
  auto evaluate=[&](){for(size_t i=0;i<count;++i)bulk.evaluate(i);port.clear();for(size_t i=0;i<count;++i){acc[i].setZero();bulk.forces(i);}master.ensureCurrent();slave.ensureCurrent();contact.apply();for(size_t i=0;i<count;++i)acc[i]+=port.external[i];return bulk.energy()+contact.energy;};
@@ -124,7 +133,7 @@ std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesy
     candidate.point=slave_points;
     candidate.area=areas;
     candidate.stress_pairs={{anchors({Vecd::Zero()},-1).front(),anchors({Vecd::Zero()},1).front()}};
-    Growth growth(ref,bulk,port,ft,Gc,dp,K,{candidate},Growth::SurfaceLaw::ContactOnly);
+    Growth growth(ref,bulk,port,ft,Gc,dp,K,{candidate},Growth::SurfaceLaw::ContactOnly,projection.get());
     growth.affine_contact_traces=true;
     auto energy=[&](){
         for(size_t i=0;i<count;++i)bulk.evaluate(i);
@@ -152,7 +161,7 @@ std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesy
         std::abs(closed_force/expected_closed_force-1)<1e-8&&std::isfinite(growth.contact_dt);
     std::ofstream report(out/"acceptance.json");
     report<<std::setprecision(17)<<"{\"overall_status\":\""<<(pass?"PASSED":"FAILED")
-        <<"\",\"surface_law\":\"contact_only\",\"broken_bond_pairs\":"<<ref.physical_broken_bonds
+        <<"\",\"surface_law\":\"contact_only\",\"execution_backend\":" << std::quoted(execution.backendName()) << ",\"broken_bond_pairs\":"<<ref.physical_broken_bonds
         <<",\"live_crossing_bonds\":"<<live_crossing<<",\"maximum_normal_opening_m\":"<<open_gap
         <<",\"open_contact_energy_J\":"<<open_contact<<",\"maximum_cohesive_force_N\":"<<maximum_cohesive_force
         <<",\"closure_normal_force_N\":"<<closed_force<<",\"expected_closure_normal_force_N\":"<<expected_closed_force
@@ -351,9 +360,9 @@ std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesy
    for(size_t i=0;i<count;++i){s.x[i]=saved_x[i];s.v[i]=saved_v[i];}
    if(!passed)throw std::runtime_error("Cohesive history comparison or energy failed the prescribed unload check");
   }
-  auto automatic_growth=runAutomaticGrowthBenchmark(out,ref,bulk,port,intact_topology,s.x0,s.mass,s.x,s.v,acc,E,nu,ft,Gc,dp,t,K,nx,ny);
+  auto automatic_growth=runAutomaticGrowthBenchmark(out,ref,bulk,port,intact_topology,s.x0,s.mass,s.x,s.v,acc,E,nu,ft,Gc,dp,t,K,nx,ny,projection.get());
  if(automatic_growth.completed_only){std::ofstream report(out/"acceptance.json");report<<R"({"geometry_status":"PASSED","overall_status":"DYNAMIC_STAGE_COMPLETE_GC_PENDING","capsule_restart_allowed":false})"<<'\n';std::cout<<"COMPLETED_DYNAMIC_CHECKPOINT_SAVED"<<std::endl;return 86;}
   bool pass=geometry_pass&&automatic_growth.passed;
  std::ofstream report(out/"acceptance.json");report<<std::setprecision(17)<<"{\"geometry_status\":\""<<(geometry_pass?"PASSED":"FAILED")<<"\",\"overall_status\":\""<<(pass?"PASSED":"FAILED")<<"\",\"capsule_restart_allowed\":false,\"growth_insertion_status\":\""<<(automatic_growth.passed?"PASSED":"FAILED")<<"\",\"fracture_checkpoint_roundtrip_passed\":true,\"corrupt_or_incompatible_checkpoint_rejected\":true,\"topology_cache_guards_passed\":true,\"specimens\":1,\"physical_particles\":"<<count<<",\"disconnected_components\":"<<component_count<<",\"broken_bond_pairs\":"<<broken<<",\"live_damage_history_preserved\":"<<(damage_history_preserved?"true":"false")<<",\"live_damage_energy_over_E_volume\":"<<live_damage_energy<<",\"live_damage_force_over_E_area\":"<<live_damage_force<<",\"live_bonds_crossing_precrack\":"<<bad_bonds<<",\"maximum_visual_opening_m\":0.0006,\"sliding_m\":"<<2*dp<<",\"bulk_energy_over_E_volume\":"<<max_bulk<<",\"contact_force_error_over_E_area\":"<<max_contact_error<<",\"sliding_force_over_E_area\":"<<max_slip<<",\"gap_error_over_spacing\":"<<max_gap_error<<",\"force_energy_relative_error\":"<<max_fd<<",\"force_balance\":"<<max_balance<<",\"torque_balance\":"<<max_torque<<",\"outside_projections\":"<<outside<<",\"explicit_undamped_steps\":200,\"explicit_dt_s\":"<<dt<<",\"explicit_energy_relative_drift\":"<<drift<<",\"cohesive_Gc_J_m2\":"<<work<<",\"cohesive_Gc_relative_error\":"<<gc_error<<",\"cohesive_peak_relative_error\":"<<strength_error<<",\"growth_topology_insertion_tested\":true,\"material_parameters_changed\":false,\"particles_deleted\":0}\n";
  std::cout<<(pass?"PHYSICAL_PRECRACK_AND_AUTOMATIC_GROWTH_PASSED":"PHYSICAL_PRECRACK_BENCHMARK_FAILED")<<std::endl;return pass?0:2;
-}catch(const std::exception&e){if(argc==2&&published){std::filesystem::path out(argv[1]);std::ifstream stage(out/"precrack_stage_acceptance.json");std::string status((std::istreambuf_iterator<char>(stage)),{});std::ofstream failed(out/"acceptance.json");failed<<"{\"overall_status\":\"FAILED\",\"geometry_status\":\""<<(status.find("PASSED")!=std::string::npos?"PASSED":"FAILED")<<"\",\"capsule_restart_allowed\":false,\"growth_insertion_status\":\"NOT_VERIFIED\",\"error\":"<<std::quoted(e.what())<<"}\n";}std::cerr<<"PHYSICAL_CRACK_BENCHMARK_ERROR "<<e.what()<<std::endl;return 1;}}
+}catch(const std::exception&e){if(!contact_only&&published){std::filesystem::path out(argv[1]);std::ifstream stage(out/"precrack_stage_acceptance.json");std::string status((std::istreambuf_iterator<char>(stage)),{});std::ofstream failed(out/"acceptance.json");failed<<"{\"overall_status\":\"FAILED\",\"geometry_status\":\""<<(status.find("PASSED")!=std::string::npos?"PASSED":"FAILED")<<"\",\"capsule_restart_allowed\":false,\"growth_insertion_status\":\"NOT_VERIFIED\",\"error\":"<<std::quoted(e.what())<<"}\n";}std::cerr<<"PHYSICAL_CRACK_BENCHMARK_ERROR "<<e.what()<<std::endl;return 1;}}

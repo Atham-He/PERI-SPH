@@ -114,7 +114,7 @@ endif()
 
 # Actual disconnected precrack with one-sided reconstruction and face contact.
 add_executable(pd_physical_crack_benchmark pd_physical_crack_benchmark.cpp)
-target_link_libraries(pd_physical_crack_benchmark sphinxsys_3d)
+target_link_libraries(pd_physical_crack_benchmark sphinxsys_3d SPHinXsys::peri_execution)
 target_compile_features(pd_physical_crack_benchmark PRIVATE cxx_std_17)
 if(BUILD_TESTING)
     add_test(NAME pd_physical_precrack_open_close_slip COMMAND pd_physical_crack_benchmark ${CMAKE_CURRENT_BINARY_DIR}/physical_precrack_acceptance)

@@ -55,6 +55,22 @@ struct PointOutput
     PointFailure failure;
 };
 
+struct SnsniPointInput
+{
+    PointInput material;
+    double deformation_gradient[3][3][3];
+    double inverse_Cp_gradient[3][3][3];
+    double kappa_gradient[3];
+};
+
+struct SnsniPointOutput
+{
+    PointOutput material;
+    double trial_sigma[3][3];
+    double trial_sigma_gradient[3][3][3];
+    double acoustic_dt;
+};
+
 class PointBatch
 {
   public:
@@ -62,6 +78,8 @@ class PointBatch
     // Outputs trial material histories. The caller owns acceptance and commit.
     // Numerical fields are populated for successful points and BadReturn diagnostics.
     virtual void evaluate(const std::vector<PointInput> &input, std::vector<PointOutput> &output) = 0;
+    virtual void evaluateSnsni(const std::vector<SnsniPointInput> &input, double rho0, double cfl_length,
+                               std::vector<SnsniPointOutput> &output) = 0;
 };
 
 class Model;

@@ -1,5 +1,5 @@
 /** Captured hardening-driven shear/cap branch change; no fitted correction. */
-#include "drucker_prager_cap_kernel.h"
+#include "dpc_snsni_adapter.h"
 #include "pd_execution.h"
 #include <string_view>
 #include <iostream>
@@ -69,7 +69,7 @@ int main(int argc, char **argv)
         append_hydrostatic(1.,0);
         append_hydrostatic(.98,2);
         append_hydrostatic(1.005,3);
-        double maximum_error=0;
+        double maximum_error=0, trial_error=0, acoustic_error=0;
         if (batch)
         {
             // One invalid point must report failure without hiding adjacent
@@ -104,9 +104,63 @@ int main(int argc, char **argv)
                 if (computed.yield_residual>2e-8 || computed.plastic_stress_work < -1e-6 || maximum_error>1e-9)
                     throw std::runtime_error("Device DPC failed stress, history or yield consistency at the moving junction");
             }
+
+            const TensorGradient grad_F{.12*Tensor::Identity(),-.27*Tensor::Identity(),.09*Tensor::Identity()};
+            TensorGradient grad_Cp{Tensor::Zero(),Tensor::Zero(),Tensor::Zero()};
+            grad_Cp[1](0,2)=grad_Cp[1](2,0)=.15;
+            const Eigen::Vector3d grad_kappa(.4,-.3,.17);
+            std::vector<SnsniPointInput> trial_inputs(2);
+            // Check a nonuniform history and the repeated spectrum at rest.
+            trial_inputs[0].material=inputs[1];
+            trial_inputs[1].material=inputs[3];
+            for (auto &point : trial_inputs)
+                for (int k=0;k<3;++k)
+                {
+                    point.kappa_gradient[k]=grad_kappa[k];
+                    for (int row=0;row<3;++row)
+                        for (int col=0;col<3;++col)
+                        {
+                            point.deformation_gradient[k][row][col]=grad_F[k](row,col);
+                            point.inverse_Cp_gradient[k][row][col]=grad_Cp[k](row,col);
+                        }
+                }
+
+            std::vector<SnsniPointOutput> trial_results;
+            constexpr double density=1229.24, cfl_length=5e-6;
+            batch->evaluateSnsni(trial_inputs,density,cfl_length,trial_results);
+            if (trial_results.size()!=trial_inputs.size())
+                throw std::runtime_error("Device S-NSNI trial output size mismatch");
+            for (size_t i=0;i<trial_results.size();++i)
+            {
+                const auto &computed=trial_results[i];
+                if (computed.material.failure!=PointFailure::None)
+                    throw std::runtime_error("Device S-NSNI trial update did not converge");
+                const Tensor deformation=i==0 ? F : Tensor(Tensor::Identity());
+                const auto &history=i==0 ? old : initial;
+                const auto &accepted=references[i==0 ? 1 : 3];
+                const auto expected=henckyTrialField(model,deformation,history,grad_F,grad_Cp,grad_kappa);
+                const auto parameters=model.parameters(accepted.relative_density,accepted.state.alpha);
+                const auto expected_dt=acousticStep(deformation,deformation.inverse(),parameters,density,cfl_length);
+                acoustic_error=std::max(acoustic_error,std::abs(computed.acoustic_dt/expected_dt-1));
+                Tensor stress;
+                TensorGradient gradient;
+                for (int row=0;row<3;++row)
+                    for (int col=0;col<3;++col)
+                    {
+                        stress(row,col)=computed.trial_sigma[row][col];
+                        for (int k=0;k<3;++k)
+                            gradient[k](row,col)=computed.trial_sigma_gradient[k][row][col];
+                    }
+                trial_error=std::max(trial_error,(stress-expected.sigma).norm()/std::max(1.,expected.sigma.norm()));
+                for (int k=0;k<3;++k)
+                    trial_error=std::max(trial_error,(gradient[k]-expected.gradient[k]).norm()/expected.gradient[k].norm());
+            }
+            if (!(acoustic_error<1e-10 && trial_error<1e-9))
+                throw std::runtime_error("Device S-NSNI trial stress, gradient or acoustic bound differs from CPU");
         }
         std::cout<<"DPC moving shear/cap junction regression passed ("<<execution.backendName()
-                 <<", maximum relative stress or absolute history difference "<<maximum_error<<")"<<std::endl;
+                 <<", maximum relative stress or absolute history difference "<<maximum_error
+                 <<", trial stress/gradient "<<trial_error<<", acoustic bound "<<acoustic_error<<")"<<std::endl;
         return 0;
     }
     catch(const std::exception &e){std::cerr<<e.what()<<std::endl;return 1;}

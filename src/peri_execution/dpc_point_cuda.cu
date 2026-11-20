@@ -1,4 +1,4 @@
-#include "drucker_prager_cap_kernel.h"
+#include "dpc_snsni_adapter.h"
 #include "pd_cuda_buffer.cuh"
 
 namespace SPH::dpc
@@ -10,18 +10,10 @@ using peridynamics::cuda_detail::DeviceBuffer;
 using peridynamics::cuda_detail::download;
 using peridynamics::cuda_detail::upload;
 
-__global__ void integrateMaterialPoints(PointInputModel model, const PointInput *input,
-                                        std::size_t count, PointOutput *output)
+__device__ void loadPoint(const PointInput &point, Tensor &deformation, State &history)
 {
-    const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= count)
-        return;
-
-    const auto &point = input[i];
-    State history;
     history.kappa = point.history.kappa;
     history.alpha = point.history.alpha;
-    Tensor deformation;
     for (int row = 0; row < 3; ++row)
         for (int col = 0; col < 3; ++col)
         {
@@ -29,9 +21,10 @@ __global__ void integrateMaterialPoints(PointInputModel model, const PointInput 
             history.inverse_Cp(row, col) = point.history.inverse_Cp[row][col];
         }
 
-    Result material;
-    const auto failure = PointModel(model).integrate(deformation, history, material);
-    auto &result = output[i];
+}
+
+__device__ void saveResult(const Result &material, PointFailure failure, PointOutput &result)
+{
     result.failure = failure;
     if (failure != PointFailure::None && failure != PointFailure::BadReturn)
         return;
@@ -55,6 +48,88 @@ __global__ void integrateMaterialPoints(PointInputModel model, const PointInput 
     result.surface = material.surface;
 }
 
+__global__ void integrateMaterialPoints(PointInputModel model, const PointInput *input,
+                                        std::size_t count, PointOutput *output)
+{
+    const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count)
+        return;
+
+    State history;
+    Tensor deformation;
+    loadPoint(input[i], deformation, history);
+    Result material;
+    const auto failure = PointModel(model).integrate(deformation, history, material);
+    saveResult(material, failure, output[i]);
+}
+
+__global__ void integrateSnsniPoints(PointInputModel model, const SnsniPointInput *input,
+                                     std::size_t count, double rho0, double cfl_length,
+                                     SnsniPointOutput *output)
+{
+    const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count)
+        return;
+
+    const auto &point=input[i];
+    auto &result=output[i];
+    State history;
+    Tensor deformation;
+    loadPoint(point.material, deformation, history);
+    if (!(deformation.determinant()>0))
+    {
+        result.material.failure=PointFailure::Deformation;
+        return;
+    }
+
+    TensorGradient gradient_F, gradient_Cp;
+    Eigen::Vector3d gradient_kappa;
+    for (int direction=0;direction<3;++direction)
+    {
+        gradient_kappa[direction]=point.kappa_gradient[direction];
+        for (int row=0;row<3;++row)
+            for (int col=0;col<3;++col)
+            {
+                gradient_F[direction](row,col)=point.deformation_gradient[direction][row][col];
+                gradient_Cp[direction](row,col)=point.inverse_Cp_gradient[direction][row][col];
+            }
+    }
+
+    Spectrum elastic_spectrum;
+    computeElasticSpectrum(deformation, history, elastic_spectrum);
+    const PointModel point_model(model);
+    TrialField trial;
+    auto failure=evaluateHenckyTrial(point_model,deformation,history,gradient_F,gradient_Cp,gradient_kappa,
+                                     trial,&elastic_spectrum);
+    if (failure!=PointFailure::None)
+    {
+        result.material.failure=failure;
+        return;
+    }
+
+    Result material;
+    failure=point_model.integrate(deformation,history,material,&elastic_spectrum);
+    saveResult(material,failure,result.material);
+    if (failure!=PointFailure::None)
+        return;
+
+    Parameters parameters;
+    failure=point_model.parameters(material.relative_density, material.state.alpha, parameters);
+    if (failure!=PointFailure::None)
+    {
+        result.material.failure=failure;
+        return;
+    }
+    for (int row=0;row<3;++row)
+        for (int col=0;col<3;++col)
+        {
+            result.trial_sigma[row][col]=trial.sigma(row,col);
+            for (int direction=0;direction<3;++direction)
+                result.trial_sigma_gradient[direction][row][col]=trial.gradient[direction](row,col);
+        }
+    result.acoustic_dt=acousticStep(deformation,deformation.inverse(),parameters,rho0,cfl_length);
+}
+
 class CudaPointBatch final : public PointBatch
 {
   public:
@@ -74,23 +149,46 @@ class CudaPointBatch final : public PointBatch
         output.resize(input.size());
         if (input.empty())
             return;
-        constexpr unsigned threads = 128;
-        const auto blocks = (input.size() - 1) / threads + 1;
-        if (blocks > max_blocks_)
-            throw std::length_error("DPC material batch exceeds the device grid");
+        const unsigned blocks = blocksFor(input.size());
         upload(inputs_, input, "DPC material inputs");
         outputs_.reserve(input.size());
-        integrateMaterialPoints<<<static_cast<unsigned>(blocks), threads>>>(model_,
+        integrateMaterialPoints<<<blocks, threads>>>(model_,
             inputs_.get(), input.size(), outputs_.get());
         check(cudaGetLastError(), "integrate DPC material points");
         download(output, outputs_, "DPC material outputs");
     }
 
+    void evaluateSnsni(const std::vector<SnsniPointInput> &input, double rho0, double cfl_length,
+                        std::vector<SnsniPointOutput> &output) override
+    {
+        output.resize(input.size());
+        if (input.empty())
+            return;
+        const unsigned blocks=blocksFor(input.size());
+        upload(snsni_inputs_,input,"S-NSNI material inputs");
+        snsni_outputs_.reserve(input.size());
+        integrateSnsniPoints<<<blocks,threads>>>(model_,snsni_inputs_.get(),input.size(),rho0,cfl_length,snsni_outputs_.get());
+        check(cudaGetLastError(),"integrate S-NSNI material points");
+        download(output,snsni_outputs_,"S-NSNI material outputs");
+    }
+
   private:
+    static constexpr unsigned threads=128;
+
+    unsigned blocksFor(std::size_t count) const
+    {
+        const auto blocks=(count-1)/threads+1;
+        if (blocks>max_blocks_)
+            throw std::length_error("DPC material batch exceeds the device grid");
+        return static_cast<unsigned>(blocks);
+    }
+
     std::size_t max_blocks_ = 0;
     DeviceBuffer<Node> nodes_;
     DeviceBuffer<PointInput> inputs_;
     DeviceBuffer<PointOutput> outputs_;
+    DeviceBuffer<SnsniPointInput> snsni_inputs_;
+    DeviceBuffer<SnsniPointOutput> snsni_outputs_;
     PointInputModel model_;
 };
 }

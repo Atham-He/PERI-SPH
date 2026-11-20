@@ -92,10 +92,7 @@ class SnsniPlasticSolid
             for(int k=0;k<3;++k){derivativeF[k].setZero();cp_spatial[k].setZero();
                 for(int j=0;j<3;++j){cp_spatial[k]+=inverseF[l](j,k)*derivativeCp[j];for(int a=0;a<3;++a)derivativeF[k].row(a)+=inverseF[l](j,k)*h[a].col(j).transpose();}}
             if (material_points_)
-            {
-                packMaterialInput(l);
-                pending[l].trial=dpc::henckyTrialField(model,F[l],history[l],derivativeF,cp_spatial,kappa_spatial);
-            }
+                packMaterialInput(l,derivativeF,cp_spatial,kappa_spatial);
             else
             {
                 pending[l]=dpc::snsniMaterialStep(model,F[l],history[l],derivativeF,cp_spatial,kappa_spatial);
@@ -103,7 +100,7 @@ class SnsniPlasticSolid
             }
         });
         if (material_points_)
-            evaluateDeviceMaterial(n);
+            evaluateDeviceMaterial(n,rho0,cfl*reference.dp);
         tbb::parallel_for(size_t(0),n,[&](size_t l){const auto&cell=reference.cells[l];const auto&inv=inverseF[l];
             Triple derivative;for(auto&a:derivative)a.setZero();
             for(const auto&e:sampling_gradient[l]){Matd delta=correction[e.j]-correction[l];for(int k=0;k<3;++k)derivative[k]+=e.gradient[k]*delta;}
@@ -124,11 +121,20 @@ class SnsniPlasticSolid
             tbb::parallel_for(size_t(0),internal.size(),[&](size_t j){Vecd f=Vecd::Zero();for(auto[l,k]:reference.transpose[j]){const auto&e=reference.cells[l].rows[k];f+=force_gradient[l]*e.gradient;
                 for(int a=0;a<3;++a)f[a]+=(force_hessian[l][a].array()*e.hessian.array()).sum();}internal[j]=f;});
         acoustic_dt=std::numeric_limits<Real>::infinity();
-        for(size_t l=0;l<n;++l){auto a=model.parameters(pending[l].material.relative_density,pending[l].material.state.alpha);
-            Eigen::SelfAdjointEigenSolver<Matd> eig(inverseF[l].transpose()*inverseF[l]);
-            Real inverse_stretch=std::sqrt(eig.eigenvalues().maxCoeff());
-            Real sound=std::sqrt((a.K+4*a.G/3)*F[l].determinant()/rho0);
-            acoustic_dt=std::min(acoustic_dt,cfl*reference.dp/(inverse_stretch*sound));}
+        if (material_points_)
+        {
+            for (const auto &point : point_output_)
+                acoustic_dt=std::min(acoustic_dt,point.acoustic_dt);
+        }
+        else
+        {
+            for (size_t l=0;l<n;++l)
+            {
+                const auto dpc_parameters=model.parameters(pending[l].material.relative_density,pending[l].material.state.alpha);
+                const Real local_step=dpc::acousticStep(F[l],inverseF[l],dpc_parameters,rho0,cfl*reference.dp);
+                acoustic_dt=std::min(acoustic_dt,local_step);
+            }
+        }
         ++evaluations;pending_commit=true;
     }
     void commit()
@@ -145,33 +151,40 @@ class SnsniPlasticSolid
     std::vector<peridynamics::SpatialDerivatives3> device_derivatives_, device_force_coefficients_;
     std::vector<peridynamics::ParticleVector3> device_internal_force_;
     std::unique_ptr<dpc::PointBatch> material_points_;
-    std::vector<dpc::PointInput> point_input_;
-    std::vector<dpc::PointOutput> point_output_;
+    std::vector<dpc::SnsniPointInput> point_input_;
+    std::vector<dpc::SnsniPointOutput> point_output_;
 
-    void packMaterialInput(size_t cell)
+    void packMaterialInput(size_t cell,const Triple &grad_F,const Triple &grad_Cp,const Vecd &grad_kappa)
     {
         auto &input = point_input_[cell];
         const auto &old = history[cell];
         for (int row = 0; row < 3; ++row)
             for (int col = 0; col < 3; ++col)
             {
-                input.deformation[row][col] = F[cell](row,col);
-                input.history.inverse_Cp[row][col] = old.inverse_Cp(row,col);
+                input.material.deformation[row][col] = F[cell](row,col);
+                input.material.history.inverse_Cp[row][col] = old.inverse_Cp(row,col);
+                for (int direction=0;direction<3;++direction)
+                {
+                    input.deformation_gradient[direction][row][col]=grad_F[direction](row,col);
+                    input.inverse_Cp_gradient[direction][row][col]=grad_Cp[direction](row,col);
+                }
             }
-        input.history.kappa = old.kappa;
-        input.history.alpha = old.alpha;
+        for (int direction=0;direction<3;++direction)
+            input.kappa_gradient[direction]=grad_kappa[direction];
+        input.material.history.kappa = old.kappa;
+        input.material.history.alpha = old.alpha;
     }
 
-    void evaluateDeviceMaterial(size_t cells)
+    void evaluateDeviceMaterial(size_t cells,Real rho0,Real cfl_length)
     {
-        material_points_->evaluate(point_input_, point_output_);
+        material_points_->evaluateSnsni(point_input_,rho0,cfl_length,point_output_);
         if (point_output_.size() != cells)
             throw std::logic_error("DPC backend returned an incomplete material field");
         // No accepted history is mutated. Diagnose a failed cell with the
         // same deformation and original history as the CPU model.
         for (size_t l = 0; l < cells; ++l)
         {
-            const auto &point = point_output_[l];
+            const auto &point = point_output_[l].material;
             if (point.failure != dpc::PointFailure::None)
             {
                 dpc::Result diagnostic;
@@ -183,7 +196,15 @@ class SnsniPlasticSolid
         tbb::parallel_for(size_t(0), cells, [&](size_t l)
         {
             auto &step = pending[l];
-            step.material = unpackMaterialResult(point_output_[l]);
+            const auto &point=point_output_[l];
+            step.material = unpackMaterialResult(point.material);
+            for (int row=0;row<3;++row)
+                for (int col=0;col<3;++col)
+                {
+                    step.trial.sigma(row,col)=point.trial_sigma[row][col];
+                    for (int direction=0;direction<3;++direction)
+                        step.trial.gradient[direction](row,col)=point.trial_sigma_gradient[direction][row][col];
+                }
             step.correction = step.trial.sigma - step.material.sigma;
             correction[l] = step.correction;
         });

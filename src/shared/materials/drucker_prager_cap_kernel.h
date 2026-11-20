@@ -48,6 +48,24 @@ struct Result
     int surface = 0; // 0 elastic, 1 shear, 2 cap, 3 tensile apex
 };
 
+using Spectrum = Eigen::SelfAdjointEigenSolver<Tensor>;
+
+EIGEN_DEVICE_FUNC inline void computeSymmetricSpectrum(const Tensor &symmetric, Spectrum &spectrum)
+{
+#if defined(__CUDA_ARCH__)
+    // Eigen's iterative tridiagonalization is host-only for this fixed size.
+    spectrum.computeDirect(symmetric);
+#else
+    spectrum.compute(symmetric);
+#endif
+}
+
+EIGEN_DEVICE_FUNC inline void computeElasticSpectrum(const Tensor &F, const State &old, Spectrum &spectrum)
+{
+    const Tensor metric=F*old.inverse_Cp*F.transpose();
+    computeSymmetricSpectrum(.5*(metric+metric.transpose()), spectrum);
+}
+
 // This view owns no memory. The CPU model and the CUDA batch both use the
 // same table interpolation, trial state, branch selection and admissibility.
 class PointModel
@@ -88,6 +106,16 @@ class PointModel
         : nodes_(input.nodes), count_(input.count), r0_(input.initial_density),
           shear_dilation_(input.shear_dilation), shear_hardening_(input.shear_hardening) {}
 
+    EIGEN_DEVICE_FUNC double initialDensity() const { return r0_; }
+    EIGEN_DEVICE_FUNC const Node &node(size_t i) const { return nodes_[i]; }
+    EIGEN_DEVICE_FUNC size_t densityInterval(double r) const
+    {
+        size_t upper = 1;
+        while (upper + 1 < count_ && nodes_[upper].r < r)
+            ++upper;
+        return upper;
+    }
+
     EIGEN_DEVICE_FUNC double kappaMin() const { return std::log(nodes_[0].r/r0_); }
     EIGEN_DEVICE_FUNC double kappaMax() const { return std::log(nodes_[count_-1].r/r0_); }
     EIGEN_DEVICE_FUNC PointFailure parameters(double r, double alpha, Parameters &p) const
@@ -95,7 +123,7 @@ class PointModel
         if (!finite(r) || r<nodes_[0].r-1e-12 || r>nodes_[count_ - 1].r+1e-12)
             return PointFailure::DensityDomain;
         r=std::max(nodes_[0].r,std::min(nodes_[count_ - 1].r,r));
-        size_t k=1; while(k+1<count_ && nodes_[k].r<r) ++k;
+        const size_t k = densityInterval(r);
         const auto &a=nodes_[k-1]; const auto &z=nodes_[k];
         const double t=(r-a.r)/(z.r-a.r);
         auto mix=[&](double x,double y){return x+t*(y-x);};
@@ -117,20 +145,19 @@ class PointModel
     {
         return p<=a.pa ? q-a.d-p*a.b : std::hypot(p-a.pa,a.R*q)-a.R*(a.d+a.pa*a.b);
     }
-    EIGEN_DEVICE_FUNC PointFailure integrate(const Tensor &F, const State &old, Result &out) const
+    EIGEN_DEVICE_FUNC PointFailure integrate(const Tensor &F, const State &old, Result &out,
+                                            const Spectrum *elastic_spectrum = nullptr) const
     {
         const double J=F.determinant();
         if (!allFinite(F) || J<=0 || !allFinite(old.inverse_Cp) || !finite(old.kappa) || !finite(old.alpha) || old.alpha<0)
             return PointFailure::Deformation;
-        const Tensor be=F*old.inverse_Cp*F.transpose();
-        Eigen::SelfAdjointEigenSolver<Tensor> eig;
-#if defined(__CUDA_ARCH__)
-        // Eigen's fixed-size direct solver is device-callable. The iterative
-        // solver uses a host-only tridiagonalization specialization.
-        eig.computeDirect(.5*(be+be.transpose()));
-#else
-        eig.compute(.5*(be+be.transpose()));
-#endif
+        Spectrum local_spectrum;
+        if (!elastic_spectrum)
+        {
+            computeElasticSpectrum(F, old, local_spectrum);
+            elastic_spectrum = &local_spectrum;
+        }
+        const auto &eig = *elastic_spectrum;
         if(eig.info()!=Eigen::Success || eig.eigenvalues().minCoeff()<=1e-14)
             return PointFailure::ElasticMetric;
         const Eigen::Vector3d ev=.5*eig.eigenvalues().array().log().matrix();
@@ -430,7 +457,6 @@ class Model
         throw std::runtime_error(out.str());
     }
 
-  private:
     static const char *failureReason(PointFailure failure)
     {
         switch (failure)

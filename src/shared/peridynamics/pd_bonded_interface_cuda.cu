@@ -105,22 +105,61 @@ __global__ void evaluateInterface(TraceView a, TraceView b, const double *stiffn
     points[point] = result;
 }
 
-__global__ void accumulateNodalForce(const std::size_t *offsets, const NodeContribution *entries,
-                                     const BondedInterfacePoint *points, std::size_t count,
-                                     BondedInterfaceNode *nodes)
+constexpr unsigned int force_lanes = 8;
+constexpr unsigned int warp_lanes = 32;
+
+template <bool divide_by_mass>
+__device__ void sumNodeContributions(const NodeContribution *entries, const BondedInterfacePoint *points,
+                                     std::size_t begin, std::size_t end, double divisor, double *force)
 {
-    const std::size_t node = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (node >= count || offsets[node] == offsets[node + 1])
-        return;
-    auto &state = nodes[node];
-    // Each node sums its entries in the original trace order.
-    for (auto k = offsets[node]; k < offsets[node + 1]; ++k)
+    for (auto k = begin; k < end; k += force_lanes)
     {
         const auto entry = entries[k];
         const auto &point = points[entry.point];
         for (int d = 0; d < 3; ++d)
-            state.external[d] += (entry.weight * point.force_a[d]) / state.force_divisor;
+        {
+            const double contribution = entry.weight * point.force_a[d];
+            if constexpr (divide_by_mass)
+                force[d] += contribution / divisor;
+            else
+                force[d] += contribution;
+        }
     }
+}
+
+__global__ void accumulateNodalForce(const std::size_t *__restrict__ offsets,
+                                     const NodeContribution *__restrict__ entries,
+                                     const BondedInterfacePoint *__restrict__ points, std::size_t count,
+                                     BondedInterfaceNode *__restrict__ nodes)
+{
+    const std::size_t thread = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t node = thread / force_lanes;
+    unsigned int lane = threadIdx.x % force_lanes;
+    if (node >= count)
+        return;
+
+    const auto begin = offsets[node], end = offsets[node + 1];
+    if (begin == end)
+        return;
+
+    const double divisor = nodes[node].force_divisor;
+    double force[3]{};
+    if (divisor == 1.0)
+        sumNodeContributions<false>(entries, points, begin + lane, end, divisor, force);
+    else
+        sumNodeContributions<true>(entries, points, begin + lane, end, divisor, force);
+
+    // One group owns each output node. The fixed tree keeps the force sum
+    // reproducible between GPU runs, including after trace reconstruction.
+    const unsigned int warp_lane = threadIdx.x % warp_lanes;
+    const unsigned int mask = ((1u << force_lanes) - 1u) << (warp_lane - lane);
+    for (unsigned int offset = force_lanes / 2; offset > 0; offset /= 2)
+        for (int d = 0; d < 3; ++d)
+            force[d] += __shfl_down_sync(mask, force[d], offset, force_lanes);
+
+    if (lane == 0)
+        for (int d = 0; d < 3; ++d)
+            nodes[node].external[d] += force[d];
 }
 
 template <class T>
@@ -254,7 +293,8 @@ class CudaBondedInterface final : public BondedInterfaceBatch
     {
         if (trace.count == 0)
             return;
-        accumulateNodalForce<<<grid(trace.count), threads>>>(trace.transpose_offsets.get(),
+        static_assert(threads % warp_lanes == 0);
+        accumulateNodalForce<<<grid(trace.count * force_lanes), threads>>>(trace.transpose_offsets.get(),
             trace.contributions.get(), points_.get(), trace.count, trace.nodes.get());
         check(cudaGetLastError(), "bonded interface force accumulation");
     }

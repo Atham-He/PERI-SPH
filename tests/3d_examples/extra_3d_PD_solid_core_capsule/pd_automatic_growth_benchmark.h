@@ -25,7 +25,7 @@ inline AutomaticGrowthAcceptance runAutomaticGrowthBenchmark(
     Growth growth(ref,bulk,port,ft,Gc,dp,K,bank,Growth::SurfaceLaw::Cohesive,projection);
     Field force(count),v(count,Vecd::Zero()),inverse_mass(count),old_force;
     std::vector<bool>fixed(count);for(size_t i=0;i<count;++i){size_t ix=(i%columns)/ny;fixed[i]=ix==0||ix==size_t(nx-1);inverse_mass[i]=fixed[i]?Vecd::Zero():Vecd::Constant(1/mass[i]);}
-    auto bulkForce=[&](){bulk.evaluateAll();port.clear();growth.applyContact();tbb::parallel_for(size_t(0),count,[&](size_t i){acc[i].setZero();bulk.forces(i);force[i]=mass[i]*acc[i]+mass[i]*port.external[i];});};
+    auto bulkForce=[&](){bulk.evaluateAll();port.clear();growth.applyContact();bulk.recomputeForces();tbb::parallel_for(size_t(0),count,[&](size_t i){force[i]=mass[i]*acc[i]+mass[i]*port.external[i];});};
     auto energy=[&](){bulkForce();growth.statistics(growth.positions());return bulk.energy()+growth.stored+growth.contact_energy;};
     auto refresh=[&](){growth.rebuildTraces();};
     energy();if(!growth.insert(0,true,refresh,energy))throw std::runtime_error("Automatic benchmark precrack: "+growth.last_rejection);

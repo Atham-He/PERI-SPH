@@ -40,6 +40,10 @@ class SpatialDerivativeBatch
     virtual void configure(const SpatialDerivativeMap &map) = 0;
     virtual void evaluate(const std::vector<ParticleVector3> &particles,
                           std::vector<SpatialDerivatives3> &result) = 0;
+    // Transpose of the linear part of evaluate. The constant identity has
+    // zero derivative. A difference stencil contributes with both signs.
+    virtual void assembleAdjoint(const std::vector<SpatialDerivatives3> &coefficients,
+                                 std::vector<ParticleVector3> &result) = 0;
 };
 
 std::unique_ptr<SpatialDerivativeBatch> makeCudaSpatialDerivatives();

@@ -101,8 +101,11 @@ class SnsniPlasticSolid
             force_gradient[l]=(J*cell.volume*pending[l].material.sigma-geometric)*inv.transpose();
         });
         internal.resize(reference.X.size());
-        tbb::parallel_for(size_t(0),internal.size(),[&](size_t j){Vecd f=Vecd::Zero();for(auto[l,k]:reference.transpose[j]){const auto&e=reference.cells[l].rows[k];f+=force_gradient[l]*e.gradient;
-            for(int a=0;a<3;++a)f[a]+=(force_hessian[l][a].array()*e.hessian.array()).sum();}internal[j]=f;});
+        if (derivatives_)
+            assembleDeviceInternalForce(n);
+        else
+            tbb::parallel_for(size_t(0),internal.size(),[&](size_t j){Vecd f=Vecd::Zero();for(auto[l,k]:reference.transpose[j]){const auto&e=reference.cells[l].rows[k];f+=force_gradient[l]*e.gradient;
+                for(int a=0;a<3;++a)f[a]+=(force_hessian[l][a].array()*e.hessian.array()).sum();}internal[j]=f;});
         acoustic_dt=std::numeric_limits<Real>::infinity();
         for(size_t l=0;l<n;++l){auto a=model.parameters(pending[l].material.relative_density,pending[l].material.state.alpha);
             Eigen::SelfAdjointEigenSolver<Matd> eig(inverseF[l].transpose()*inverseF[l]);
@@ -122,7 +125,33 @@ class SnsniPlasticSolid
  private:
     std::unique_ptr<peridynamics::SpatialDerivativeBatch> derivatives_;
     std::vector<peridynamics::ParticleVector3> device_field_;
-    std::vector<peridynamics::SpatialDerivatives3> device_derivatives_;
+    std::vector<peridynamics::SpatialDerivatives3> device_derivatives_, device_force_coefficients_;
+    std::vector<peridynamics::ParticleVector3> device_internal_force_;
+
+    void assembleDeviceInternalForce(size_t cells)
+    {
+        device_force_coefficients_.resize(cells);
+        for (size_t l = 0; l < cells; ++l)
+        {
+            auto &coefficient = device_force_coefficients_[l];
+            for (int a = 0; a < 3; ++a)
+                for (int i = 0; i < 3; ++i)
+                {
+                    coefficient.gradient[a][i] = force_gradient[l](a, i);
+                    for (int j = 0; j < 3; ++j)
+                        coefficient.hessian[a][i][j] = force_hessian[l][a](i, j);
+                }
+        }
+        derivatives_->assembleAdjoint(device_force_coefficients_, device_internal_force_);
+        if (device_internal_force_.size() != internal.size())
+            throw std::logic_error("Spatial adjoint backend returned an incomplete S-NSNI particle field");
+        for (size_t i = 0; i < internal.size(); ++i)
+        {
+            const auto &force = device_internal_force_[i].component;
+            internal[i] = Vecd(force[0], force[1], force[2]);
+        }
+    }
+
 
     void configureDerivatives()
     {

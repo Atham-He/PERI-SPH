@@ -47,6 +47,47 @@ __global__ void evaluateSpatialDerivatives(const std::size_t *offsets, const std
     }
 }
 
+struct AdjointContribution
+{
+    std::size_t row, entry;
+    int sign;
+};
+
+template <bool second_order>
+__global__ void assembleSpatialAdjoint(const std::size_t *offsets, const AdjointContribution *entries,
+                                       const ParticleVector3 *gradients, const ShapeHessian3 *hessians,
+                                       const SpatialDerivatives3 *coefficients, std::size_t particle_count,
+                                       ParticleVector3 *result)
+{
+    const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const auto particle = index / 3;
+    const auto axis = index % 3;
+    if (particle >= particle_count)
+        return;
+
+    double force = 0.0;
+    for (auto i = offsets[particle]; i < offsets[particle + 1]; ++i)
+    {
+        const auto entry = entries[i];
+        const auto &coefficient = coefficients[entry.row];
+        const auto &gradient = gradients[entry.entry];
+        const double first = (coefficient.gradient[axis][0] * gradient.component[0] +
+                              coefficient.gradient[axis][1] * gradient.component[1]) +
+                              coefficient.gradient[axis][2] * gradient.component[2];
+        force += entry.sign * first;
+        if constexpr (second_order)
+        {
+            double second = 0.0;
+            const auto &hessian = hessians[entry.entry];
+            for (int j = 0; j < 3; ++j)
+                for (int k = 0; k < 3; ++k)
+                    second += coefficient.hessian[axis][j][k] * hessian.derivative[j][k];
+            force += entry.sign * second;
+        }
+    }
+    result[particle].component[axis] = force;
+}
+
 class CudaSpatialDerivatives final : public SpatialDerivativeBatch
 {
   public:
@@ -82,6 +123,7 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
         upload(origins_, map.origins, "spatial derivative origins");
         upload(gradients_, map.gradients, "reference gradients");
         upload(hessians_, map.hessians, "reference Hessians");
+        configureAdjoint(map);
         particle_count_ = map.particle_count;
         rows_ = rows;
         use_origins_ = !map.origins.empty();
@@ -99,32 +141,93 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
         if (rows_ == 0)
             return;
 
-        constexpr unsigned int threads = 128;
-        const std::size_t blocks = (rows_ * 3 + threads - 1) / threads;
-        if (blocks > max_blocks_)
-            throw std::length_error("Spatial derivative batch exceeds the device grid");
+        const auto blocks = grid(rows_);
         upload(particles_, particles, "spatial derivative particle field");
         result_.reserve(rows_);
         const auto *origins = use_origins_ ? origins_.get() : nullptr;
         if (use_hessians_)
-            evaluateSpatialDerivatives<true><<<static_cast<unsigned int>(blocks), threads>>>(
+            evaluateSpatialDerivatives<true><<<blocks, threads>>>(
                 offsets_.get(), neighbors_.get(), origins, gradients_.get(), hessians_.get(),
                 particles_.get(), add_identity_, rows_, result_.get());
         else
-            evaluateSpatialDerivatives<false><<<static_cast<unsigned int>(blocks), threads>>>(
+            evaluateSpatialDerivatives<false><<<blocks, threads>>>(
                 offsets_.get(), neighbors_.get(), origins, gradients_.get(), nullptr,
                 particles_.get(), add_identity_, rows_, result_.get());
         check(cudaGetLastError(), "spatial derivative evaluation");
         download(result, result_, "spatial derivative results");
     }
 
+    void assembleAdjoint(const std::vector<SpatialDerivatives3> &coefficients,
+                         std::vector<ParticleVector3> &result) override
+    {
+        if (!configured_ || coefficients.size() != rows_)
+            throw std::invalid_argument("Coefficient field does not match the spatial derivative stencil");
+        result.resize(particle_count_);
+        if (particle_count_ == 0)
+            return;
+
+        const auto blocks = grid(particle_count_);
+        upload(adjoint_coefficients_, coefficients, "spatial adjoint coefficients");
+        adjoint_result_.reserve(particle_count_);
+        if (use_hessians_)
+            assembleSpatialAdjoint<true><<<blocks, threads>>>(adjoint_offsets_.get(), adjoint_entries_.get(),
+                gradients_.get(), hessians_.get(), adjoint_coefficients_.get(), particle_count_, adjoint_result_.get());
+        else
+            assembleSpatialAdjoint<false><<<blocks, threads>>>(adjoint_offsets_.get(), adjoint_entries_.get(),
+                gradients_.get(), nullptr, adjoint_coefficients_.get(), particle_count_, adjoint_result_.get());
+        check(cudaGetLastError(), "assemble spatial adjoint");
+        download(result, adjoint_result_, "spatial adjoint particle result");
+    }
+
   private:
+    static constexpr unsigned int threads = 128;
+
+    unsigned int grid(std::size_t sites) const
+    {
+        const std::size_t blocks = (sites * 3 + threads - 1) / threads;
+        if (blocks > max_blocks_)
+            throw std::length_error("Spatial derivative batch exceeds the device grid");
+        return static_cast<unsigned int>(blocks);
+    }
+
+    void configureAdjoint(const SpatialDerivativeMap &map)
+    {
+        // The traversal is stable in reference stencil order, including
+        // negative contributions at difference origins.
+        auto for_each_contribution = [&](auto apply)
+        {
+            for (std::size_t row = 0; row + 1 < map.offsets.size(); ++row)
+                for (auto entry = map.offsets[row]; entry < map.offsets[row + 1]; ++entry)
+                {
+                    apply(map.neighbors[entry], AdjointContribution{row, entry, 1});
+                    if (!map.origins.empty())
+                        apply(map.origins[row], AdjointContribution{row, entry, -1});
+                }
+        };
+        std::vector<std::size_t> offsets(map.particle_count + 1, 0);
+        for_each_contribution([&](std::size_t node, const AdjointContribution &) { ++offsets[node + 1]; });
+        for (std::size_t i = 1; i < offsets.size(); ++i)
+            offsets[i] += offsets[i - 1];
+
+        std::vector<AdjointContribution> entries(offsets.back());
+        auto cursor = offsets;
+        for_each_contribution([&](std::size_t node, const AdjointContribution &entry)
+        {
+            entries[cursor[node]++] = entry;
+        });
+        upload(adjoint_offsets_, offsets, "spatial adjoint offsets");
+        upload(adjoint_entries_, entries, "spatial adjoint entries");
+    }
+
     std::size_t particle_count_ = 0, rows_ = 0, max_blocks_ = 0;
     bool use_origins_ = false, use_hessians_ = false, add_identity_ = false, configured_ = false;
     DeviceBuffer<std::size_t> offsets_, neighbors_, origins_;
     DeviceBuffer<ParticleVector3> gradients_, particles_;
     DeviceBuffer<ShapeHessian3> hessians_;
-    DeviceBuffer<SpatialDerivatives3> result_;
+    DeviceBuffer<SpatialDerivatives3> result_, adjoint_coefficients_;
+    DeviceBuffer<std::size_t> adjoint_offsets_;
+    DeviceBuffer<AdjointContribution> adjoint_entries_;
+    DeviceBuffer<ParticleVector3> adjoint_result_;
 };
 }
 

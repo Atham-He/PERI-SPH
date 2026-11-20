@@ -84,10 +84,20 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
         hg_density[i]=hg;stored_density[i]=state.positive+state.negative+hg;tangent_bound[i]=elastic.tangentBound(state.principal_stretches,state.J,0);
     }
   public:
-    void forces(size_t i) {
-        if(version!=reference.topology_version||reference.topologyPending())throw std::runtime_error("Live force assembly is stale after a fracture event");reference.checkIntact(i);
-        Vecd f=Vecd::Zero(),h=Vecd::Zero();for(size_t n=0;n<reference.rows[i].size();++n){auto&e=reference.rows[i][n];f+=volume[i]*P[i]*e.gradient-volume[e.j]*P[e.j]*reference.rows[e.j][e.reverse].gradient;h+=projection[i][n].force-projection[e.j][e.reverse].force;}
-        internal[i]=f;hourglass[i]=h;acc[i]+=(f+h)/mass[i];
+    void forces(size_t i) { assembleParticleForce(i, nullptr); }
+
+    void recomputeForces()
+    {
+        if (version != reference.topology_version || reference.topologyPending())
+            throw std::runtime_error("Live force assembly is stale after a fracture event");
+        const auto count = projection.size();
+        if (derivatives_)
+            assembleDeviceStressForce(count);
+        tbb::parallel_for(size_t(0), count, [&](size_t i)
+        {
+            acc[i].setZero();
+            assembleParticleForce(i, derivatives_ ? &device_stress_force_[i] : nullptr);
+        });
     }
     Real energy()const{Real result=0;for(size_t i=0;i<projection.size();++i)result+=volume[i]*stored_density[i];return result;}
     Real stabilizationEnergy()const{Real result=0;for(size_t i=0;i<projection.size();++i)result+=volume[i]*hg_density[i];return result;}
@@ -97,9 +107,29 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
     std::unique_ptr<peridynamics::SpatialDerivativeBatch> derivatives_;
     bool derivative_stencil_current_ = false;
     std::vector<peridynamics::ParticleVector3> device_field_;
-    std::vector<peridynamics::SpatialDerivatives3> device_derivatives_;
+    std::vector<peridynamics::SpatialDerivatives3> device_derivatives_, device_force_coefficients_;
+    std::vector<peridynamics::ParticleVector3> device_stress_force_;
 
-    void evaluateDeviceDerivatives(size_t count)
+    void assembleParticleForce(size_t i, const peridynamics::ParticleVector3 *adjoint)
+    {
+        if(version!=reference.topology_version||reference.topologyPending())throw std::runtime_error("Live force assembly is stale after a fracture event");
+        reference.checkIntact(i);
+        Vecd f = Vecd::Zero(), h = Vecd::Zero();
+        if (adjoint)
+            f = -Vecd(adjoint->component[0], adjoint->component[1], adjoint->component[2]);
+        for (size_t n = 0; n < reference.rows[i].size(); ++n)
+        {
+            const auto &e = reference.rows[i][n];
+            if (!adjoint)
+                f += volume[i] * P[i] * e.gradient - volume[e.j] * P[e.j] * reference.rows[e.j][e.reverse].gradient;
+            h += projection[i][n].force - projection[e.j][e.reverse].force;
+        }
+        internal[i] = f;
+        hourglass[i] = h;
+        acc[i] += (f + h) / mass[i];
+    }
+
+    void prepareDerivativeStencil(size_t count)
     {
         if (!derivative_stencil_current_)
         {
@@ -119,7 +149,24 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
             derivatives_->configure(map);
             derivative_stencil_current_ = true;
         }
+    }
 
+    void assembleDeviceStressForce(size_t count)
+    {
+        prepareDerivativeStencil(count);
+        device_force_coefficients_.resize(count);
+        for (size_t i = 0; i < count; ++i)
+            for (int a = 0; a < 3; ++a)
+                for (int b = 0; b < 3; ++b)
+                    device_force_coefficients_[i].gradient[a][b] = volume[i] * P[i](a, b);
+        derivatives_->assembleAdjoint(device_force_coefficients_, device_stress_force_);
+        if (device_stress_force_.size() != count)
+            throw std::logic_error("Spatial adjoint backend returned an incomplete live PD force field");
+    }
+
+    void evaluateDeviceDerivatives(size_t count)
+    {
+        prepareDerivativeStencil(count);
         device_field_.resize(count);
         for (size_t i = 0; i < count; ++i)
             device_field_[i] = {{x[i][0], x[i][1], x[i][2]}};

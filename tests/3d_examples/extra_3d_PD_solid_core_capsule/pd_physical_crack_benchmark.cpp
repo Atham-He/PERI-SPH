@@ -50,7 +50,7 @@ std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesy
  CrackSurfaceContactNetwork contact({{&minus_geometry,&areas,1,0},{&plus_geometry,&areas,-1,0}},K,dp,projection.get());
 
  Real volume=0,area=0;for(size_t i=0;i<count;++i)volume+=s.measure[i];for(Real a:areas)area+=a;
- auto evaluate=[&](){bulk.evaluateAll();port.clear();for(size_t i=0;i<count;++i){acc[i].setZero();bulk.forces(i);}master.ensureCurrent();slave.ensureCurrent();contact.apply();for(size_t i=0;i<count;++i)acc[i]+=port.external[i];return bulk.energy()+contact.energy;};
+ auto evaluate=[&](){bulk.evaluateAll();port.clear();bulk.recomputeForces();master.ensureCurrent();slave.ensureCurrent();contact.apply();for(size_t i=0;i<count;++i)acc[i]+=port.external[i];return bulk.energy()+contact.energy;};
  auto set=[&](Real gap,Real slide,const Matd&Q){for(size_t i=0;i<count;++i){Vecd jump=Vecd((s.x0[i][0]>0?.5:-.5)*gap,s.x0[i][0]>0?slide:0,0);s.x[i]=Q*(s.x0[i]+jump);s.v[i].setZero();}};
  StdVec<int>components(count,-1);int component_count=0;for(size_t start=0;start<count;++start)if(components[start]<0){StdVec<size_t>queue{start};components[start]=component_count;for(size_t k=0;k<queue.size();++k){size_t i=queue[k];for(size_t n=0;n<ref.rows[i].size();++n)if(ref.live(i,n)){size_t j=ref.rows[i][n].j;if(components[j]<0){components[j]=component_count;queue.push_back(j);}}}++component_count;}
  size_t bad_bonds=0;for(size_t i=0;i<count;++i)for(size_t n=0;n<ref.rows[i].size();++n){const auto&e=ref.rows[i][n];bad_bonds+=ref.live(i,n)&&(s.x0[i][0]*s.x0[e.j][0]<0);if(!ref.live(i,n)&&e.gradient.norm()!=0)throw std::runtime_error("A broken bond retains a material gradient");}
@@ -137,6 +137,7 @@ std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesy
     growth.affine_contact_traces=true;
     auto energy=[&](){
         bulk.evaluateAll();
+        bulk.recomputeForces();
         port.clear();growth.applyContact();
         return bulk.energy()+growth.contact_energy;
     };
@@ -175,6 +176,7 @@ std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesy
         <<",\"host_contact_fallbacks\":"<<network.host_contact_fallbacks
         <<",\"device_trace_pullback\":"<<(network.device_trace_pullback?"true":"false")
         <<",\"shell_derivatives_backend\":"<<std::quoted(bulk.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")
+        <<",\"shell_stress_force_backend\":"<<std::quoted(bulk.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")
         <<",\"cohesive_fracture_work_J\":"<<growth.dissipated<<",\"insertion_defect_J\":"<<growth.insertion_defect<<"}\n";
     return pass?0:2;
  }

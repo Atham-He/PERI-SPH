@@ -6,7 +6,7 @@ target_compile_features(sphinxsys_peri_execution PUBLIC cxx_std_17)
 target_include_directories(sphinxsys_peri_execution PUBLIC
     $<BUILD_INTERFACE:${PERI_EXECUTION_HEADERS}>)
 
-if(PERI_SPH_ENABLE_CUDA OR PERI_SPH_CUDA_CRACK_PROJECTION OR PERI_SPH_CUDA_BONDED_INTERFACE)
+if(PERI_SPH_ENABLE_CUDA)
     find_package(CUDAToolkit REQUIRED)
     target_sources(sphinxsys_peri_execution PRIVATE
         "${PERI_EXECUTION_HEADERS}/pd_crack_projection_cuda.cu"
@@ -14,5 +14,5 @@ if(PERI_SPH_ENABLE_CUDA OR PERI_SPH_CUDA_CRACK_PROJECTION OR PERI_SPH_CUDA_BONDE
     set_target_properties(sphinxsys_peri_execution PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED YES)
     target_compile_options(sphinxsys_peri_execution PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
     target_compile_definitions(sphinxsys_peri_execution PRIVATE PERI_SPH_HAS_CUDA=1)
-    target_link_libraries(sphinxsys_peri_execution PRIVATE CUDA::cudart)
+    target_link_libraries(sphinxsys_peri_execution PRIVATE CUDA::cudart_static)
 endif()

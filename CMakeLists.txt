@@ -145,7 +145,10 @@ endif()
 
 # ------ Setup the concrete libraries
 # Retain the previous diagnostic build flags as aliases for the backend.
-if(PERI_SPH_ENABLE_CUDA OR PERI_SPH_CUDA_CRACK_PROJECTION OR PERI_SPH_CUDA_BONDED_INTERFACE)
+if(PERI_SPH_CUDA_CRACK_PROJECTION OR PERI_SPH_CUDA_BONDED_INTERFACE)
+    set(PERI_SPH_ENABLE_CUDA ON)
+endif()
+if(PERI_SPH_ENABLE_CUDA)
     if(SPHINXSYS_USE_SYCL OR SPHINXSYS_USE_FLOAT)
         message(FATAL_ERROR "The PERI-SPH CUDA execution backend requires an FP64 host build")
     endif()

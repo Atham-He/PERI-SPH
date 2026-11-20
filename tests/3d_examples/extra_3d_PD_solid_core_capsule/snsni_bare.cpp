@@ -1,5 +1,6 @@
 #include "capsule_core_fixture.h"
 #include "pd_solid_reference_coupling.h"
+#include "pd_execution.h"
 #include "solid_snsni_plastic.h"
 #include "solid_snsni_diagnostics.h"
 #include <tbb/task_arena.h>
@@ -27,7 +28,8 @@ void writeFields(const fs::path&path,const SnsniReference&r,const SnsniPlasticSo
     scalar("RelativeDensity",[&](size_t l){return body.pending[l].material.relative_density;});
     f<<"</PointData></Piece></PolyData></VTKFile>\n";
 }
-int qualify(SnsniReference&r,SnsniPlasticSolid&body,Real rho,Real cfl,const fs::path&out)
+int qualify(SnsniReference&r,SnsniPlasticSolid&body,Real rho,Real cfl,const fs::path&out,
+            const peridynamics::PeriExecution &execution)
 {
     size_t n=r.X.size();Field d(n),linear,nonlinear;
     for(size_t j=0;j<n;++j){Vecd z=r.X[j]/.0005;d[j]=5e-11*Vecd(z[0]*z[2],-.3*z[1]*z[2],z[2]*z[2]-.2*z[0]*z[0]);}
@@ -67,10 +69,11 @@ int qualify(SnsniReference&r,SnsniPlasticSolid&body,Real rho,Real cfl,const fs::
     Real initial=hamilton(),energy_error=0;
     for(size_t s=0;s<128;++s){time.step(dt,0,[&](const Field&u,const Field&,Field&force){r.apply(u,force);for(auto&v:force)v=-v;});energy_error=std::max(energy_error,std::abs(hamilton()/initial-1));}
     bool pass=audit_pass&&limit<2e-5&&objective<1e-7&&net_error<1e-10&&torque_error<1e-9&&native_error==0&&shear&&cap&&double_rejected&&body.commits-commit_start==2&&energy_error<1e-9;
-    std::ofstream result(out/"qualification.json");result<<std::setprecision(17)<<"{\n\"status\":\""<<(pass?"PASSED":"FAILED")<<"\",\n\"elastic_limit_relative_force_error\":"<<limit<<",\n\"finite_rotation_force_objectivity_error\":"<<objective<<",\n\"net_internal_force_error\":"<<net_error<<",\n\"internal_torque_error\":"<<torque_error<<",\n\"native_DPC_stress_difference\":"<<native_error<<",\n\"shear_and_cap_exercised\":"<<(shear&&cap?"true":"false")<<",\n\"double_commit_rejected\":"<<(double_rejected?"true":"false")<<",\n\"central_difference_invariant_error\":"<<energy_error<<",\n\"linear_frequency_bound_squared\":"<<body.linear_frequency_bound_squared<<",\n\"linear_dt_s\":"<<dt<<",\n\"physical_compression_histories\":0\n}\n";result.close();
+    std::ofstream result(out/"qualification.json");result<<std::setprecision(17)<<"{\n\"status\":\""<<(pass?"PASSED":"FAILED")<<"\",\n\"elastic_limit_relative_force_error\":"<<limit<<",\n\"finite_rotation_force_objectivity_error\":"<<objective<<",\n\"net_internal_force_error\":"<<net_error<<",\n\"internal_torque_error\":"<<torque_error<<",\n\"native_DPC_stress_difference\":"<<native_error<<",\n\"shear_and_cap_exercised\":"<<(shear&&cap?"true":"false")<<",\n\"double_commit_rejected\":"<<(double_rejected?"true":"false")<<",\n\"central_difference_invariant_error\":"<<energy_error<<",\n\"linear_frequency_bound_squared\":"<<body.linear_frequency_bound_squared<<",\n\"linear_dt_s\":"<<dt<<",\n\"execution_backend\":"<<std::quoted(execution.backendName())<<",\n\"physical_compression_histories\":0\n}\n";result.close();
     std::cout<<"QUALIFICATION "<<(pass?"PASSED":"FAILED")<<" elastic="<<limit<<" objective="<<objective<<" energy="<<energy_error<<std::endl;return pass?0:2;
 }
-int run(const PDSolidCapsuleOptions&o,const std::string&geometry,bool gate,const std::string&audit_baseline)
+int run(const PDSolidCapsuleOptions&o,const std::string&geometry,bool gate,const std::string&audit_baseline,
+        const peridynamics::PeriExecution &execution)
 {
     if(o.coated||o.material!="dpc")throw std::invalid_argument("This qualified entry is frozen-input bare DPC; capsule remains gated");
     fs::path out=fs::absolute(o.output);if(fs::exists(out)&&!fs::is_empty(out))throw std::runtime_error("Output must be new or empty");fs::create_directories(out/"vtp");
@@ -81,8 +84,9 @@ int run(const PDSolidCapsuleOptions&o,const std::string&geometry,bool gate,const
     core.generateParticles<BaseParticles,CapsuleCoreGenerator>(R,o.spacing);
     auto&p=core.getBaseParticles();size_t n=p.TotalRealParticles();auto*x=p.getVariableDataByName<Vecd>("Position");auto*v=p.registerStateVariableData<Vecd>("Velocity");auto*m=p.getVariableDataByName<Real>("Mass");auto*volume=p.getVariableDataByName<Real>("VolumetricMeasure");
     Field X(x,x+n);SnsniReference reference(X,o.spacing,o.core_E/(2*(1+o.core_nu)),o.core_E*o.core_nu/((1+o.core_nu)*(1-2*o.core_nu)),o.core_rho,geometry);
-    SnsniPlasticSolid body(reference,dpc::Model::fromCSV(o.dpc_table,o.dpc_r0,o.dpc_shear_dilation,o.dpc_shear_hardening));
-    if(gate)return qualify(reference,body,o.core_rho,o.cfl,out);
+    SnsniPlasticSolid body(reference,dpc::Model::fromCSV(o.dpc_table,o.dpc_r0,o.dpc_shear_dilation,o.dpc_shear_hardening),
+                           execution.makeSpatialDerivatives());
+    if(gate)return qualify(reference,body,o.core_rho,o.cfl,out,execution);
     for(size_t j=0;j<n;++j){m[j]=reference.mass[j];volume[j]=m[j]/o.core_rho;}
     peridynamics::SolidForcePort port(core,peridynamics::SolidForcePort::Storage::ForcePrior);
     StdVec<Vecd>points;StdVec<Real>areas;for(const auto&face:reference.faces)if(face.boundary)for(const auto&q:face.q){points.push_back(q.x);areas.push_back(q.w);}
@@ -103,7 +107,7 @@ int run(const PDSolidCapsuleOptions&o,const std::string&geometry,bool gate,const
         for(size_t j=0;j<n;++j){x[j]=X[j]+d[j];v[j]=velocity[j];}port.clear();Real u=delta(t);contact.apply(-R+u/2,R-u/2);
         force.resize(n);for(size_t j=0;j<n;++j)force[j]=port.external[j]-body.internal[j];body.commit();};
     evaluate(time.displacement,time.velocity,0,total);for(size_t j=0;j<n;++j)time.acceleration[j]=total[j]/m[j];writeFields(out/"vtp/core_0.vtp",reference,body,time.displacement);
-    std::ofstream config(out/"numerics.json");config<<std::setprecision(17)<<"{\"linear_dt_bound_s\":"<<linear_dt<<",\"contact_dt_bound_s\":"<<contact.stable_dt<<",\"combined_bound_s\":"<<constant_bound<<",\"contact_K_Pa_per_m\":"<<K<<",\"ramp_duration_s\":"<<ramp<<",\"relaxation_rate_s_inverse\":"<<damping<<",\"coefficient_dofs\":"<<n<<",\"material_sites\":"<<body.history.size()<<",\"mass_kg\":"<<std::accumulate(m,m+n,Real(0))<<"}\n";config.close();
+    std::ofstream config(out/"numerics.json");config<<std::setprecision(17)<<"{\"linear_dt_bound_s\":"<<linear_dt<<",\"contact_dt_bound_s\":"<<contact.stable_dt<<",\"combined_bound_s\":"<<constant_bound<<",\"contact_K_Pa_per_m\":"<<K<<",\"ramp_duration_s\":"<<ramp<<",\"relaxation_rate_s_inverse\":"<<damping<<",\"coefficient_dofs\":"<<n<<",\"material_sites\":"<<body.history.size()<<",\"mass_kg\":"<<std::accumulate(m,m+n,Real(0))<<",\"execution_backend\":"<<std::quoted(execution.backendName())<<",\"spatial_derivatives_backend\":"<<std::quoted(body.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")<<"}\n";config.close();
     while(stage<=o.load_steps){Real dt=std::min({o.max_dt,constant_bound,body.acoustic_dt});if(stage_time<ramp)dt=std::min(dt,ramp-stage_time);
         if(!std::isfinite(dt)||dt<1e-15||time.steps>=o.max_steps)throw std::runtime_error("Explicit time/count bound exhausted");
         audit.before(time,body,contact,total,stage,delta(stage_time));
@@ -122,7 +126,40 @@ int run(const PDSolidCapsuleOptions&o,const std::string&geometry,bool gate,const
     }
     std::ofstream summary(out/"summary.json");summary<<"{\"status\":\"COMPLETE_FROZEN_INPUT_BARE_SNSNI_CURVE\",\"accepted_points\":"<<o.load_steps<<",\"steps\":"<<time.steps<<",\"material_evaluations\":"<<body.evaluations<<",\"history_commits\":"<<body.commits<<",\"material_parameters_changed\":false}\n";return 0;
 }
-int main(int argc,char**argv)
-{try{std::string cells,audit_baseline;bool gate=false;std::vector<char*>args{argv[0]};for(int i=1;i<argc;++i){std::string a=argv[i];if(a=="--qualify-snsni")gate=true;else if(a.rfind("--snsni-cells=",0)==0)cells=a.substr(14);else if(a.rfind("--audit-baseline=",0)==0)audit_baseline=a.substr(17);else args.push_back(argv[i]);}
-    PDSolidCapsuleOptions o;o.parse(int(args.size()),args.data());if(cells.empty())throw std::invalid_argument("--snsni-cells required");tbb::task_arena arena(int(o.threads));return arena.execute([&]{return run(o,cells,gate,audit_baseline);});
- }catch(const std::exception&e){std::cerr<<"SNSNI_ERROR "<<e.what()<<std::endl;return 1;}}
+int main(int argc, char **argv)
+{
+    try
+    {
+        std::string cells, audit_baseline;
+        bool gate = false;
+        peridynamics::PeriExecutionMode execution_mode = peridynamics::PeriExecutionMode::Default;
+        std::vector<char *> args{argv[0]};
+        for (int i = 1; i < argc; ++i)
+        {
+            const std::string arg = argv[i];
+            if (arg == "--qualify-snsni")
+                gate = true;
+            else if (arg.rfind("--snsni-cells=", 0) == 0)
+                cells = arg.substr(14);
+            else if (arg.rfind("--audit-baseline=", 0) == 0)
+                audit_baseline = arg.substr(17);
+            else if (arg.rfind("--execution=", 0) == 0)
+                execution_mode = peridynamics::parsePeriExecution(arg.substr(12));
+            else
+                args.push_back(argv[i]);
+        }
+        PDSolidCapsuleOptions options;
+        options.parse(static_cast<int>(args.size()), args.data());
+        if (cells.empty())
+            throw std::invalid_argument("--snsni-cells required");
+
+        const peridynamics::PeriExecution execution(execution_mode);
+        tbb::task_arena arena(static_cast<int>(options.threads));
+        return arena.execute([&] { return run(options, cells, gate, audit_baseline, execution); });
+    }
+    catch (const std::exception &error)
+    {
+        std::cerr << "SNSNI_ERROR " << error.what() << std::endl;
+        return 1;
+    }
+}

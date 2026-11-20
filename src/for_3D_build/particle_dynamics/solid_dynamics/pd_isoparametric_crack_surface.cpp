@@ -37,6 +37,68 @@ BilinearCrackGeometry::Param BilinearCrackGeometry::closest(const std::array<Vec
     std::ostringstream message;message<<std::setprecision(17)<<"Closest crack-surface projection did not converge; local_q "<<q.transpose()<<" param "<<p.transpose()<<" corners ";for(const auto&v:x)message<<v.transpose()<<" / ";throw std::runtime_error(message.str());
 }
 
+void CrackSurfaceContactNetwork::updateDeviceTraceMap()
+{
+    // The backend can be shared by more than one contact network.
+    bool current = trace_generation_ != 0 && trace_generation_ == projection_batch_->contactTraceGeneration() &&
+                   trace_versions_.size() == sides.size();
+    for (std::size_t i = 0; current && i < sides.size(); ++i)
+        current = trace_versions_[i].first == sides[i].surface &&
+                  trace_versions_[i].second == sides[i].surface->mappingVersion();
+    if (current)
+        return;
+
+    trace_generation_ = 0;
+    ParticleTraceMap map{sides.front().surface->port.count, {0}, {}};
+    trace_versions_.clear();
+    trace_side_offsets_.clear();
+    for (const auto &side : sides)
+    {
+        const auto &surface = *side.surface;
+        trace_side_offsets_.push_back(map.offsets.size() - 1);
+        trace_versions_.emplace_back(&surface, surface.mappingVersion());
+        // The last rows reconstruct normals and never receive contact loads.
+        for (size_t i = 0; i < 4 + surface.natural.size(); ++i)
+        {
+            const auto &row = surface.rows[i];
+            for (size_t j = 0; j < row.index.size(); ++j)
+                map.entries.push_back({row.index[j], row.weight[j]});
+            map.offsets.push_back(map.entries.size());
+        }
+    }
+    trace_generation_ = projection_batch_->configureContactTrace(map);
+}
+
+void CrackSurfaceContactNetwork::applyDeviceTracePullback(SolidForcePort &port)
+{
+    updateDeviceTraceMap();
+    contact_addresses_.clear();
+    for (const auto &point : selected_contacts_)
+    {
+        const auto slave = trace_side_offsets_[point.slave] + 4 + point.quadrature;
+        const auto master = trace_side_offsets_[point.master];
+        contact_addresses_.push_back({{slave, master, master + 1, master + 2, master + 3}});
+    }
+    trace_particle_input_.resize(port.count);
+    for (size_t i = 0; i < port.count; ++i)
+    {
+        trace_particle_input_[i].mass = port.mass[i];
+        std::copy_n(port.external[i].data(), 3, trace_particle_input_[i].external);
+    }
+    const bool acceleration_port = port.storage == SolidForcePort::Storage::PDAccelerationPrior;
+    projection_batch_->assembleContactTrace(trace_generation_, contact_addresses_, trace_particle_input_,
+                                            acceleration_port, trace_particle_output_);
+    if (trace_particle_output_.size() != port.count)
+        throw std::logic_error("Crack backend returned an incomplete particle force batch");
+    for (size_t i = 0; i < port.count; ++i)
+    {
+        const auto &particle = trace_particle_output_[i];
+        port.external[i] = Vecd(particle.external[0], particle.external[1], particle.external[2]);
+        rates[i] = Vecd(particle.rate[0], particle.rate[1], particle.rate[2]);
+    }
+    device_trace_pullback = true;
+}
+
 void CrackSurfaceContactNetwork::apply(){
     energy=max_penetration=normal_force_sum=force_residual=torque_residual=power_residual=tangential_force_sum=0;active_contacts=outside_projections=neighbor_contacts=0;for(auto&r:rates)r.setZero();
     struct Master {std::array<Vecd,4>x,v;};StdVec<Master>masters(sides.size());
@@ -170,27 +232,30 @@ void CrackSurfaceContactNetwork::apply(){
 
     Vecd balance = Vecd::Zero(), moment = Vecd::Zero();
     Real magnitude = 0, length = spacing, power = 0, power_scale = 0, energy_rate = 0;
-    auto accumulate = [&](const ContactPoint &point, const TraceRows &rows, const CrackLocalContactResult &local)
+    auto accumulate = [&](const ContactPoint &point, const TraceRows &rows,
+                          const CrackLocalContactResult &local, bool scatter_on_host)
     {
         auto &slave = *sides[point.slave].surface;
         auto &master = *sides[point.master].surface;
-        for (size_t i = 0; i < rows.size(); ++i)
-            for (size_t d = 0; d < 3; ++d)
-            {
-                const Real row_bound = local.row_bound[i][d];
-                for (size_t j = 0; j < rows[i]->index.size(); ++j)
+        if (scatter_on_host)
+            for (size_t i = 0; i < rows.size(); ++i)
+                for (size_t d = 0; d < 3; ++d)
                 {
-                    const auto node = rows[i]->index[j];
-                    rates[node][d] += std::abs(rows[i]->weight[j]) * row_bound / std::sqrt(slave.port.mass[node]);
+                    const Real row_bound = local.row_bound[i][d];
+                    for (size_t j = 0; j < rows[i]->index.size(); ++j)
+                    {
+                        const auto node = rows[i]->index[j];
+                        rates[node][d] += std::abs(rows[i]->weight[j]) * row_bound / std::sqrt(slave.port.mass[node]);
+                    }
                 }
-            }
 
         if (point.gap >= 0)
             return;
         if (sides[point.slave].reference_patch != sides[point.master].reference_patch)
             ++neighbor_contacts;
         const Vecd force(local.force_on_slave[0], local.force_on_slave[1], local.force_on_slave[2]);
-        slave.scatter(4 + point.quadrature, force);
+        if (scatter_on_host)
+            slave.scatter(4 + point.quadrature, force);
         Vecd relative = point.velocity;
         balance += force;
         moment += point.position.cross(force);
@@ -203,7 +268,8 @@ void CrackSurfaceContactNetwork::apply(){
         for (size_t j = 0; j < 4; ++j)
         {
             const Vecd reaction = -point.geometry.N[j] * force;
-            master.scatter(j, reaction);
+            if (scatter_on_host)
+                master.scatter(j, reaction);
             balance += reaction;
             moment += master_state.x[j].cross(reaction);
             magnitude += reaction.norm();
@@ -223,6 +289,7 @@ void CrackSurfaceContactNetwork::apply(){
     selected_contacts_.clear();
     contact_inputs_.clear();
     device_contact_evaluations = host_contact_fallbacks = 0;
+    device_trace_pullback = false;
     for (size_t si = 0; si < sides.size(); ++si)
     {
         auto &slave = *sides[si].surface;
@@ -281,7 +348,7 @@ void CrackSurfaceContactNetwork::apply(){
                 contact_inputs_.push_back(deviceInput(point, weighted));
             }
             else
-                accumulate(point, rows, hostContact(point, weighted));
+                accumulate(point, rows, hostContact(point, weighted), true);
         }
     }
 
@@ -290,18 +357,32 @@ void CrackSurfaceContactNetwork::apply(){
         projection_batch_->assembleLocalContact(contact_inputs_, contact_results_);
         if (contact_results_.size() != selected_contacts_.size())
             throw std::logic_error("Crack contact backend returned an incomplete batch");
+
+        auto &port = sides.front().surface->port;
+        const bool one_force_port = std::all_of(sides.begin(), sides.end(), [&](const Side &side)
+        {
+            return side.surface->port.external == port.external && side.surface->port.storage == port.storage &&
+                   side.surface->port.count == port.count;
+        });
+        const bool valid_batch = std::all_of(contact_results_.begin(), contact_results_.end(), [](const auto &result)
+        {
+            return result.valid;
+        });
+        if (!selected_contacts_.empty() && one_force_port && valid_batch && projection_batch_->assemblesTracePullback())
+            applyDeviceTracePullback(port);
+
         for (size_t i = 0; i < selected_contacts_.size(); ++i)
         {
             const auto &point = selected_contacts_[i];
             const auto rows = traceRows(point);
             if (contact_results_[i].valid)
             {
-                accumulate(point, rows, contact_results_[i]);
+                accumulate(point, rows, contact_results_[i], !device_trace_pullback);
                 ++device_contact_evaluations;
             }
             else
             {
-                accumulate(point, rows, hostContact(point, massWeights(rows)));
+                accumulate(point, rows, hostContact(point, massWeights(rows)), true);
                 ++host_contact_fallbacks;
             }
         }

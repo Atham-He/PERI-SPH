@@ -1,5 +1,8 @@
 #pragma once
 
+#include "pd_particle_trace_map.h"
+
+#include <cstdint>
 #include <memory>
 #include <stdexcept>
 #include <vector>
@@ -33,6 +36,21 @@ struct CrackLocalContactResult
     bool valid;
 };
 
+struct CrackTraceAddress
+{
+    std::size_t rows[5];
+};
+
+struct CrackTraceParticleState
+{
+    double mass, external[3];
+};
+
+struct CrackTraceParticleResult
+{
+    double external[3], rate[3];
+};
+
 class CrackProjectionBatch
 {
   public:
@@ -45,6 +63,23 @@ class CrackProjectionBatch
     {
         throw std::logic_error("This crack backend only implements projection");
     }
+    virtual bool assemblesTracePullback() const noexcept { return false; }
+    virtual std::uint64_t contactTraceGeneration() const noexcept { return 0; }
+    virtual std::uint64_t configureContactTrace(const ParticleTraceMap &)
+    {
+        throw std::logic_error("This crack backend does not implement trace assembly");
+    }
+    // Assembles the most recent local response batch in the configured trace
+    // generation. The host can retain its reference path for invalid tangents.
+    virtual void assembleContactTrace(std::uint64_t,
+                                      const std::vector<CrackTraceAddress> &,
+                                      const std::vector<CrackTraceParticleState> &,
+                                      bool,
+                                      std::vector<CrackTraceParticleResult> &)
+    {
+        throw std::logic_error("This crack backend does not implement trace assembly");
+    }
+
 };
 
 std::unique_ptr<CrackProjectionBatch> makeCudaCrackProjection(bool assemble_local_contact = false);

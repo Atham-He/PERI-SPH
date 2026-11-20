@@ -1,23 +1,13 @@
 #pragma once
 
-#include <cstddef>
+#include "pd_particle_trace_map.h"
 #include <memory>
 #include <vector>
 
 namespace SPH::peridynamics
 {
-struct BondedTraceEntry
-{
-    std::size_t node;
-    double weight;
-};
-
-struct BondedTraceMap
-{
-    std::size_t node_count;
-    std::vector<std::size_t> offsets;
-    std::vector<BondedTraceEntry> entries;
-};
+using BondedTraceEntry = ParticleTraceEntry;
+using BondedTraceMap = ParticleTraceMap;
 
 struct BondedInterfaceNode
 {

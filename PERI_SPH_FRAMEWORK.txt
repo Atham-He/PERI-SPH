@@ -106,9 +106,11 @@ execution=gpu in their configuration files, or --execution=cpu and
 --execution=gpu on the command line. CPU is the default.
 
 CUDA currently covers bonded solid interface assembly, bilinear crack
-projection, and local crack force and tangent evaluation. Global crack force
-and stability-bound assembly use the existing host traces. The case
-parameters.json records the backend used for each of these phases. The material calibration,
+projection, local crack forces and tangent bounds, and assembly of those
+crack quantities onto particles. Bonded interfaces and crack contact share
+the same sparse particle trace mapping. Crack geometry selection and the
+global time-step decision use the host solver. The case parameters.json
+records the backend selected for each phase. The material calibration,
 contact law, and checkpoint schema use the same inputs for both backends.
 
 Build and regression

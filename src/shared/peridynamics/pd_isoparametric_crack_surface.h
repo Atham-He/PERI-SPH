@@ -69,6 +69,14 @@ class CrackSurfaceContactNetwork {
     std::vector<ContactPoint> selected_contacts_;
     std::vector<CrackLocalContactInput> contact_inputs_;
     std::vector<CrackLocalContactResult> contact_results_;
+    std::uint64_t trace_generation_ = 0;
+    std::vector<size_t> trace_side_offsets_;
+    std::vector<std::pair<const BilinearCrackSurface *, size_t>> trace_versions_;
+    std::vector<CrackTraceAddress> contact_addresses_;
+    std::vector<CrackTraceParticleState> trace_particle_input_;
+    std::vector<CrackTraceParticleResult> trace_particle_output_;
+    void updateDeviceTraceMap();
+    void applyDeviceTracePullback(SolidForcePort &port);
 
  public:
     struct Side {BilinearCrackSurface*surface=nullptr;const StdVec<Real>*areas=nullptr;Real outward_sign=1;size_t reference_patch=~size_t(0);};
@@ -77,6 +85,7 @@ class CrackSurfaceContactNetwork {
     Real force_residual=0,torque_residual=0,power_residual=0,tangential_force_sum=0;
     size_t active_contacts=0,outside_projections=0,neighbor_contacts=0;StdVec<Vecd>rates;
     size_t device_contact_evaluations=0,host_contact_fallbacks=0;
+    bool device_trace_pullback=false;
     explicit CrackSurfaceContactNetwork(const StdVec<Side>&s,Real K,Real dp,CrackProjectionBatch *projection_batch=nullptr):projection_batch_(projection_batch),sides(s),penalty(K),spacing(dp){if(K<=0||dp<=0||s.empty())throw std::invalid_argument("Invalid crack-contact network");for(const auto&a:s)if(!a.surface||!a.areas||a.areas->size()!=a.surface->natural.size()||std::abs(a.outward_sign)!=1||a.surface->port.position!=s[0].surface->port.position||a.surface->port.mass!=s[0].surface->port.mass)throw std::invalid_argument("Crack-contact sides must belong to one physical material port");rates.resize(s[0].surface->port.count);}
     void apply();
 };

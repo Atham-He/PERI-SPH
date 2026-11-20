@@ -68,6 +68,7 @@ foreach(SNSNI_FILE
         ${PERI_SHARED}/peridynamics/pd_column_face_surface.h
         ${PERI_SHARED}/peridynamics/pd_execution.h
         ${PERI_SHARED}/../peri_execution/pd_execution.cpp
+        ${PERI_SHARED}/peridynamics/pd_particle_trace_map.h
         ${PERI_SHARED}/peridynamics/pd_crack_projection.h
         ${PERI_SHARED}/peridynamics/pd_crack_projection_cuda.cu
         ${PERI_SHARED}/peridynamics/pd_bonded_interface_batch.h

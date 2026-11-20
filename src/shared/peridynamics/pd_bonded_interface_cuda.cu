@@ -9,12 +9,8 @@ namespace
 {
 using cuda_detail::check;
 using cuda_detail::DeviceBuffer;
-
-struct NodeContribution
-{
-    std::size_t point;
-    double weight;
-};
+using cuda_detail::download;
+using cuda_detail::upload;
 
 struct TraceView
 {
@@ -109,13 +105,13 @@ constexpr unsigned int force_lanes = 8;
 constexpr unsigned int warp_lanes = 32;
 
 template <bool divide_by_mass>
-__device__ void sumNodeContributions(const NodeContribution *entries, const BondedInterfacePoint *points,
+__device__ void sumParticleTraceContributions(const ParticleTraceContribution *entries, const BondedInterfacePoint *points,
                                      std::size_t begin, std::size_t end, double divisor, double *force)
 {
     for (auto k = begin; k < end; k += force_lanes)
     {
         const auto entry = entries[k];
-        const auto &point = points[entry.point];
+        const auto &point = points[entry.row];
         for (int d = 0; d < 3; ++d)
         {
             const double contribution = entry.weight * point.force_a[d];
@@ -128,7 +124,7 @@ __device__ void sumNodeContributions(const NodeContribution *entries, const Bond
 }
 
 __global__ void accumulateNodalForce(const std::size_t *__restrict__ offsets,
-                                     const NodeContribution *__restrict__ entries,
+                                     const ParticleTraceContribution *__restrict__ entries,
                                      const BondedInterfacePoint *__restrict__ points, std::size_t count,
                                      BondedInterfaceNode *__restrict__ nodes)
 {
@@ -145,9 +141,9 @@ __global__ void accumulateNodalForce(const std::size_t *__restrict__ offsets,
     const double divisor = nodes[node].force_divisor;
     double force[3]{};
     if (divisor == 1.0)
-        sumNodeContributions<false>(entries, points, begin + lane, end, divisor, force);
+        sumParticleTraceContributions<false>(entries, points, begin + lane, end, divisor, force);
     else
-        sumNodeContributions<true>(entries, points, begin + lane, end, divisor, force);
+        sumParticleTraceContributions<true>(entries, points, begin + lane, end, divisor, force);
 
     // One group owns each output node. The fixed tree keeps the force sum
     // reproducible between GPU runs, including after trace reconstruction.
@@ -162,28 +158,11 @@ __global__ void accumulateNodalForce(const std::size_t *__restrict__ offsets,
             nodes[node].external[d] += force[d];
 }
 
-template <class T>
-void upload(DeviceBuffer<T> &device, const std::vector<T> &host)
-{
-    device.reserve(host.size());
-    if (!host.empty())
-        check(cudaMemcpy(device.get(), host.data(), host.size() * sizeof(T), cudaMemcpyHostToDevice),
-              "bonded interface upload");
-}
-
-template <class T>
-void download(std::vector<T> &host, const DeviceBuffer<T> &device)
-{
-    if (!host.empty())
-        check(cudaMemcpy(host.data(), device.get(), host.size() * sizeof(T), cudaMemcpyDeviceToHost),
-              "bonded interface download");
-}
-
 struct DeviceTrace
 {
     DeviceBuffer<std::size_t> offsets, transpose_offsets;
     DeviceBuffer<BondedTraceEntry> entries;
-    DeviceBuffer<NodeContribution> contributions;
+    DeviceBuffer<ParticleTraceContribution> contributions;
     DeviceBuffer<BondedInterfaceNode> nodes;
     std::size_t count = 0;
 
@@ -193,26 +172,12 @@ struct DeviceTrace
         upload(offsets, map.offsets);
         upload(entries, map.entries);
 
-        std::vector<std::size_t> transpose(count + 1, 0);
-        for (std::size_t point = 0; point + 1 < map.offsets.size(); ++point)
-            if (other.offsets[point] != other.offsets[point + 1])
-                for (auto k = map.offsets[point]; k < map.offsets[point + 1]; ++k)
-                    ++transpose[map.entries[k].node + 1];
-        for (std::size_t i = 1; i < transpose.size(); ++i)
-            transpose[i] += transpose[i - 1];
-
-        std::vector<NodeContribution> sorted(transpose.back());
-        auto cursor = transpose;
-        for (std::size_t point = 0; point + 1 < map.offsets.size(); ++point)
-            if (other.offsets[point] != other.offsets[point + 1])
-                for (auto k = map.offsets[point]; k < map.offsets[point + 1]; ++k)
-                {
-                    const auto entry = map.entries[k];
-                    sorted[cursor[entry.node]++] = {point, sign * entry.weight};
-                }
-
-        upload(transpose_offsets, transpose);
-        upload(contributions, sorted);
+        const auto transpose = transposeParticleTrace(map, [&](std::size_t row)
+        {
+            return other.offsets[row] != other.offsets[row + 1];
+        }, sign);
+        upload(transpose_offsets, transpose.offsets);
+        upload(contributions, transpose.entries);
         nodes.reserve(count);
     }
 
@@ -232,8 +197,8 @@ class CudaBondedInterface final : public BondedInterfaceBatch
     void configure(const BondedTraceMap &a, const BondedTraceMap &b,
                    const std::vector<double> &stiffness) override
     {
-        validate(a, stiffness.size());
-        validate(b, stiffness.size());
+        validateParticleTrace(a, stiffness.size());
+        validateParticleTrace(b, stiffness.size());
         a_.configure(a, b, 1);
         b_.configure(b, a, -1);
         upload(stiffness_, stiffness);
@@ -267,19 +232,6 @@ class CudaBondedInterface final : public BondedInterfaceBatch
     DeviceBuffer<BondedInterfacePoint> points_;
     std::size_t point_count_ = 0;
     cudaDeviceProp properties_{};
-
-    static void validate(const BondedTraceMap &map, std::size_t points)
-    {
-        if (map.offsets.size() != points + 1 || map.offsets.front() != 0 ||
-            map.offsets.back() != map.entries.size())
-            throw std::invalid_argument("Invalid CUDA bonded trace offsets");
-        for (std::size_t i = 1; i < map.offsets.size(); ++i)
-            if (map.offsets[i] < map.offsets[i - 1])
-                throw std::invalid_argument("Unordered CUDA bonded trace offsets");
-        for (const auto &entry : map.entries)
-            if (entry.node >= map.node_count)
-                throw std::invalid_argument("CUDA bonded trace contains a node outside its port");
-    }
 
     unsigned int grid(std::size_t count) const
     {

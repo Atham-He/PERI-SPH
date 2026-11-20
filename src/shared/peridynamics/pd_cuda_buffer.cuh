@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace SPH::peridynamics::cuda_detail
 {
@@ -38,5 +39,22 @@ class DeviceBuffer
     T *data_ = nullptr;
     std::size_t capacity_ = 0;
 };
+
+template <class T>
+void upload(DeviceBuffer<T> &device, const std::vector<T> &host, const char *operation = "upload")
+{
+    device.reserve(host.size());
+    if (!host.empty())
+        check(cudaMemcpy(device.get(), host.data(), host.size() * sizeof(T), cudaMemcpyHostToDevice),
+              operation);
+}
+
+template <class T>
+void download(std::vector<T> &host, const DeviceBuffer<T> &device, const char *operation = "download")
+{
+    if (!host.empty())
+        check(cudaMemcpy(host.data(), device.get(), host.size() * sizeof(T), cudaMemcpyDeviceToHost),
+              operation);
+}
 
 }

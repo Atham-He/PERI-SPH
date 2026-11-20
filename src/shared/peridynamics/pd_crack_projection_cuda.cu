@@ -2,6 +2,7 @@
 #include "pd_cuda_buffer.cuh"
 
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <cmath>
 
 namespace SPH::peridynamics
@@ -10,6 +11,8 @@ namespace
 {
 using cuda_detail::check;
 using cuda_detail::DeviceBuffer;
+using cuda_detail::download;
+using cuda_detail::upload;
 
 // The double-precision solve follows BilinearCrackGeometry::closest,
 // including its stationarity, damping and rank checks.
@@ -157,6 +160,68 @@ __global__ void localContactBatch(const CrackLocalContactInput *input, CrackLoca
         output[i] = localContact(input[i]);
 }
 
+struct ContactTraceUse
+{
+    std::size_t contact;
+    unsigned int leg;
+};
+
+struct TraceLoad
+{
+    double force[3], rate[3];
+};
+
+__global__ void collectTraceLoads(const CrackLocalContactInput *input,
+                                  const CrackLocalContactResult *response,
+                                  const std::size_t *offsets, const ContactTraceUse *uses,
+                                  std::size_t trace_count, TraceLoad *output)
+{
+    const auto trace = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (trace >= trace_count)
+        return;
+
+    TraceLoad load{};
+    for (auto i = offsets[trace]; i < offsets[trace + 1]; ++i)
+    {
+        const auto use = uses[i];
+        const auto &contact = response[use.contact];
+        const double coefficient = use.leg == 0 ? 1.0 : -input[use.contact].shape[use.leg - 1];
+        for (int d = 0; d < 3; ++d)
+        {
+            load.force[d] += coefficient * contact.force_on_slave[d];
+            load.rate[d] += contact.row_bound[use.leg][d];
+        }
+    }
+    output[trace] = load;
+}
+
+__global__ void pullBackCrackTraces(const std::size_t *node_offsets,
+                                    const ParticleTraceContribution *entries,
+                                    const TraceLoad *traces,
+                                    const CrackTraceParticleState *particles, bool acceleration_port,
+                                    std::size_t count, CrackTraceParticleResult *output)
+{
+    const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count)
+        return;
+
+    const auto &particle = particles[i];
+    const double divisor = acceleration_port ? particle.mass : 1.0;
+    const double sqrt_mass = sqrt(particle.mass);
+    CrackTraceParticleResult state{{particle.external[0], particle.external[1], particle.external[2]}, {}};
+    for (auto k = node_offsets[i]; k < node_offsets[i + 1]; ++k)
+    {
+        const auto entry = entries[k];
+        const auto &trace = traces[entry.row];
+        for (int d = 0; d < 3; ++d)
+        {
+            state.external[d] += (entry.weight * trace.force[d]) / divisor;
+            state.rate[d] += (fabs(entry.weight) * trace.rate[d]) / sqrt_mass;
+        }
+    }
+    output[i] = state;
+}
+
 class CudaCrackProjection final : public CrackProjectionBatch
 {
   public:
@@ -194,6 +259,8 @@ class CudaCrackProjection final : public CrackProjectionBatch
         if (!assemble_local_contact_)
             throw std::logic_error("Local contact assembly is disabled for this projection backend");
         const auto count = input.size();
+        local_contact_count_ = count;
+        local_contact_valid_ = count == 0;
         output.resize(count);
         if (count == 0)
             return;
@@ -206,6 +273,81 @@ class CudaCrackProjection final : public CrackProjectionBatch
         check(cudaGetLastError(), "crack tangent kernel launch");
         check(cudaMemcpy(output.data(), contact_output_.get(), count * sizeof(output[0]),
                          cudaMemcpyDeviceToHost), "crack tangent output transfer");
+        local_contact_valid_ = std::all_of(output.begin(), output.end(),
+                                           [](const auto &value) { return value.valid; });
+    }
+
+    bool assemblesTracePullback() const noexcept override { return assemble_local_contact_; }
+    std::uint64_t contactTraceGeneration() const noexcept override { return trace_ready_ ? trace_generation_ : 0; }
+
+    std::uint64_t configureContactTrace(const ParticleTraceMap &map) override
+    {
+        if (!assemble_local_contact_)
+            throw std::logic_error("Trace assembly is disabled for this projection backend");
+        if (map.offsets.empty())
+            throw std::invalid_argument("Crack trace offsets are missing");
+        const auto rows = map.offsets.size() - 1;
+        validateParticleTrace(map, rows);
+        const auto transpose = transposeParticleTrace(map, [](std::size_t) { return true; });
+        trace_ready_ = false;
+        upload(node_trace_offsets_, transpose.offsets, "crack node trace offsets");
+        upload(node_trace_entries_, transpose.entries, "crack node trace entries");
+        trace_count_ = rows;
+        particle_count_ = map.node_count;
+        if (++trace_generation_ == 0)
+            ++trace_generation_;
+        trace_ready_ = true;
+        return trace_generation_;
+    }
+
+    void assembleContactTrace(std::uint64_t generation, const std::vector<CrackTraceAddress> &address,
+                              const std::vector<CrackTraceParticleState> &particles, bool acceleration_port,
+                              std::vector<CrackTraceParticleResult> &output) override
+    {
+        if (generation == 0 || generation != contactTraceGeneration() || !local_contact_valid_ ||
+            particles.size() != particle_count_ ||
+            address.size() != local_contact_count_)
+            throw std::invalid_argument("Crack contact batch does not match the active trace generation");
+
+        trace_use_offsets_.assign(trace_count_ + 1, 0);
+        for (const auto &contact : address)
+            for (auto trace : contact.rows)
+            {
+                if (trace >= trace_count_)
+                    throw std::invalid_argument("Contact references a trace outside the active map");
+                ++trace_use_offsets_[trace + 1];
+            }
+        for (std::size_t i = 1; i < trace_use_offsets_.size(); ++i)
+            trace_use_offsets_[i] += trace_use_offsets_[i - 1];
+        trace_uses_.resize(trace_use_offsets_.back());
+        trace_use_cursor_ = trace_use_offsets_;
+        for (std::size_t i = 0; i < address.size(); ++i)
+            for (unsigned int leg = 0; leg < 5; ++leg)
+                trace_uses_[trace_use_cursor_[address[i].rows[leg]]++] = {i, leg};
+
+        for (const auto &particle : particles)
+            if (!std::isfinite(particle.mass) || particle.mass <= 0.0)
+                throw std::invalid_argument("Crack trace assembly requires positive finite particle masses");
+        output.resize(particles.size());
+        if (particles.empty())
+            return;
+
+        trace_loads_.reserve(trace_count_);
+        if (trace_count_ > 0)
+        {
+            upload(trace_use_device_offsets_, trace_use_offsets_, "crack trace use offsets");
+            upload(trace_use_device_entries_, trace_uses_, "crack trace uses");
+            collectTraceLoads<<<grid(trace_count_), threads>>>(contact_input_.get(), contact_output_.get(),
+                trace_use_device_offsets_.get(), trace_use_device_entries_.get(), trace_count_, trace_loads_.get());
+            check(cudaGetLastError(), "collect crack trace loads");
+        }
+
+        upload(trace_particle_input_, particles, "crack trace particle state");
+        trace_particle_output_.reserve(particle_count_);
+        pullBackCrackTraces<<<grid(particle_count_), threads>>>(node_trace_offsets_.get(), node_trace_entries_.get(),
+            trace_loads_.get(), trace_particle_input_.get(), acceleration_port, particle_count_, trace_particle_output_.get());
+        check(cudaGetLastError(), "pull back crack trace loads");
+        download(output, trace_particle_output_, "crack trace particle forces and rates");
     }
 
   private:
@@ -224,6 +366,17 @@ class CudaCrackProjection final : public CrackProjectionBatch
     DeviceBuffer<CrackProjectionResult> output_;
     DeviceBuffer<CrackLocalContactInput> contact_input_;
     DeviceBuffer<CrackLocalContactResult> contact_output_;
+    std::size_t local_contact_count_ = 0, trace_count_ = 0, particle_count_ = 0;
+    std::uint64_t trace_generation_ = 0;
+    bool trace_ready_ = false, local_contact_valid_ = false;
+    std::vector<std::size_t> trace_use_offsets_, trace_use_cursor_;
+    std::vector<ContactTraceUse> trace_uses_;
+    DeviceBuffer<std::size_t> node_trace_offsets_, trace_use_device_offsets_;
+    DeviceBuffer<ParticleTraceContribution> node_trace_entries_;
+    DeviceBuffer<ContactTraceUse> trace_use_device_entries_;
+    DeviceBuffer<TraceLoad> trace_loads_;
+    DeviceBuffer<CrackTraceParticleState> trace_particle_input_;
+    DeviceBuffer<CrackTraceParticleResult> trace_particle_output_;
 };
 }
 

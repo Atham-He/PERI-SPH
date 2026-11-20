@@ -12,9 +12,11 @@ set(PERI_SHARED ${CMAKE_CURRENT_SOURCE_DIR}/../../../src/shared)
 file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/pd_solid_capsule.cpp MAIN_HASH)
 file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/capsule_core_fixture.h FIXTURE_HASH)
 file(SHA256 ${PERI_SHARED}/peridynamics/pd_solid_reference_coupling.h COUPLING_HASH)
+set(CRACK_CONTACT_IMPL ${PERI_SHARED}/../for_3D_build/particle_dynamics/solid_dynamics/pd_isoparametric_crack_surface.cpp)
+file(SHA256 ${CRACK_CONTACT_IMPL} CRACK_CONTACT_HASH)
 file(SHA256 ${PERI_SHARED}/materials/drucker_prager_cap_kernel.h KERNEL_HASH)
 file(SHA256 ${PERI_SHARED}/materials/drucker_prager_cap_solid.h ADAPTER_HASH)
-set(PD_ASSEMBLY_HASHES "${MAIN_HASH};${FIXTURE_HASH};${COUPLING_HASH}")
+set(PD_ASSEMBLY_HASHES "${MAIN_HASH};${FIXTURE_HASH};${COUPLING_HASH};${CRACK_CONTACT_HASH}")
 foreach(PD_HEADER pd_quadratic_correspondence.h pd_principal_stress_onset.h
         pd_fracture_correspondence.h pd_fracture_surface.h pd_fragment_contact.h pd_energy_crack_band.h pd_directional_crack_energy.h
         pd_layered_geometry.h pd_layered_correspondence.h pd_layered_surface.h pd_coulomb_friction.h
@@ -30,6 +32,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/pd_solid_capsule.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/capsule_core_fixture.h
     ${PERI_SHARED}/peridynamics/pd_solid_reference_coupling.h
+    ${CRACK_CONTACT_IMPL}
     ${PERI_SHARED}/materials/drucker_prager_cap_kernel.h
     ${PERI_SHARED}/materials/drucker_prager_cap_solid.h)
 string(SHA256 ASSEMBLY_HASH "${PD_ASSEMBLY_HASHES}")

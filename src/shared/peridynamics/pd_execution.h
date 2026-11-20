@@ -36,6 +36,7 @@ class PeriExecution
     std::unique_ptr<BondedInterfaceBatch> makeBondedInterface() const;
 
   private:
+    PeriExecutionMode mode_;
     bool crack_projection_;
     bool bonded_interface_;
 };

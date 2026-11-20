@@ -14,7 +14,7 @@ PeriExecutionMode parsePeriExecution(std::string_view input)
 }
 
 PeriExecution::PeriExecution(PeriExecutionMode mode, LegacyGpuSelection legacy)
-    : crack_projection_(mode == PeriExecutionMode::GPU || legacy.crack_projection),
+    : mode_(mode), crack_projection_(mode == PeriExecutionMode::GPU || legacy.crack_projection),
       bonded_interface_(mode == PeriExecutionMode::GPU || legacy.bonded_interface)
 {
     if (mode == PeriExecutionMode::CPU && (crack_projection_ || bonded_interface_))
@@ -34,7 +34,7 @@ std::unique_ptr<CrackProjectionBatch> PeriExecution::makeCrackProjection() const
 {
 #if defined(PERI_SPH_HAS_CUDA)
     if (crack_projection_)
-        return makeCudaCrackProjection();
+        return makeCudaCrackProjection(mode_ == PeriExecutionMode::GPU);
 #endif
     return nullptr;
 }

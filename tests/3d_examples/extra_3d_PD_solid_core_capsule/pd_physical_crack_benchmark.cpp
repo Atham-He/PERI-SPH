@@ -159,12 +159,18 @@ std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesy
     bool pass=live_crossing==0&&ref.physical_broken_bonds==broken&&std::abs(open_gap-20e-6)<1e-9*dp&&
         open_contact==0&&maximum_cohesive_force==0&&growth.stored==0&&growth.dissipated==0&&
         std::abs(closed_force/expected_closed_force-1)<1e-8&&std::isfinite(growth.contact_dt);
+    const auto &network = *growth.contact_network;
+    const bool device_contact = projection && projection->assemblesLocalContact();
+    pass = pass && (!device_contact || network.device_contact_evaluations > 0);
     std::ofstream report(out/"acceptance.json");
     report<<std::setprecision(17)<<"{\"overall_status\":\""<<(pass?"PASSED":"FAILED")
         <<"\",\"surface_law\":\"contact_only\",\"execution_backend\":" << std::quoted(execution.backendName()) << ",\"broken_bond_pairs\":"<<ref.physical_broken_bonds
         <<",\"live_crossing_bonds\":"<<live_crossing<<",\"maximum_normal_opening_m\":"<<open_gap
         <<",\"open_contact_energy_J\":"<<open_contact<<",\"maximum_cohesive_force_N\":"<<maximum_cohesive_force
         <<",\"closure_normal_force_N\":"<<closed_force<<",\"expected_closure_normal_force_N\":"<<expected_closed_force
+        <<",\"closure_time_step_s\":"<<growth.contact_dt
+        <<",\"device_contact_evaluations\":"<<network.device_contact_evaluations
+        <<",\"host_contact_fallbacks\":"<<network.host_contact_fallbacks
         <<",\"cohesive_fracture_work_J\":"<<growth.dissipated<<",\"insertion_defect_J\":"<<growth.insertion_defect<<"}\n";
     return pass?0:2;
  }

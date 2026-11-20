@@ -37,7 +37,8 @@ __device__ void gather(TraceView trace, std::size_t point, double *position, dou
     }
 }
 
-__device__ void audit(TraceView trace, std::size_t point, double sign, BondedInterfacePoint &result)
+__device__ void audit(TraceView trace, std::size_t point, double sign, double force_norm,
+                      BondedInterfacePoint &result)
 {
     for (auto k = trace.offsets[point]; k < trace.offsets[point + 1]; ++k)
     {
@@ -57,7 +58,7 @@ __device__ void audit(TraceView trace, std::size_t point, double sign, BondedInt
         result.torque[2] += x[0] * fy - x[1] * fx;
         const double power = (fx * v[0] + fy * v[1]) + fz * v[2];
         result.power += power;
-        result.force_scale += sqrt((fx * fx + fy * fy) + fz * fz);
+        result.force_scale += fabs(w) * force_norm;
         result.power_scale += fabs(power);
     }
 }
@@ -86,8 +87,10 @@ __global__ void evaluateInterface(TraceView a, TraceView b, const double *stiffn
         const double gap_squared = (gap[0] * gap[0] + gap[1] * gap[1]) + gap[2] * gap[2];
         result.energy = .5 * k * gap_squared;
         result.gap = sqrt(gap_squared);
-        audit(a, point, 1, result);
-        audit(b, point, -1, result);
+        // Each nodal contribution is a scalar multiple of this point force.
+        const double force_norm = k * result.gap;
+        audit(a, point, 1, fabs(force_norm), result);
+        audit(b, point, -1, fabs(force_norm), result);
         const double energy_rate = -((result.force_a[0] * (v_a[0] - v_b[0]) +
                                       result.force_a[1] * (v_a[1] - v_b[1])) +
                                       result.force_a[2] * (v_a[2] - v_b[2]));

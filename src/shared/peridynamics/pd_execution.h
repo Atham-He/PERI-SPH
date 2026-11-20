@@ -1,5 +1,6 @@
 #pragma once
 
+#include "dpc_point_batch.h"
 #include "pd_bonded_interface_batch.h"
 #include "pd_crack_projection.h"
 #include "pd_spatial_derivatives.h"
@@ -36,6 +37,7 @@ class PeriExecution
     std::unique_ptr<CrackProjectionBatch> makeCrackProjection() const;
     std::unique_ptr<BondedInterfaceBatch> makeBondedInterface() const;
     std::unique_ptr<SpatialDerivativeBatch> makeSpatialDerivatives() const;
+    std::unique_ptr<dpc::PointBatch> makeDpcPoints(const dpc::Model &model) const;
 
   private:
     PeriExecutionMode mode_;

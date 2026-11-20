@@ -15,6 +15,7 @@ file(SHA256 ${PERI_SHARED}/peridynamics/pd_solid_reference_coupling.h COUPLING_H
 set(CRACK_CONTACT_IMPL ${PERI_SHARED}/../for_3D_build/particle_dynamics/solid_dynamics/pd_isoparametric_crack_surface.cpp)
 file(SHA256 ${CRACK_CONTACT_IMPL} CRACK_CONTACT_HASH)
 file(SHA256 ${PERI_SHARED}/materials/drucker_prager_cap_kernel.h KERNEL_HASH)
+file(SHA256 ${PERI_SHARED}/materials/dpc_point_batch.h DPC_BATCH_HASH)
 file(SHA256 ${PERI_SHARED}/materials/drucker_prager_cap_solid.h ADAPTER_HASH)
 set(PD_ASSEMBLY_HASHES "${MAIN_HASH};${FIXTURE_HASH};${COUPLING_HASH};${CRACK_CONTACT_HASH}")
 foreach(PD_HEADER pd_quadratic_correspondence.h pd_principal_stress_onset.h
@@ -34,9 +35,10 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     ${PERI_SHARED}/peridynamics/pd_solid_reference_coupling.h
     ${CRACK_CONTACT_IMPL}
     ${PERI_SHARED}/materials/drucker_prager_cap_kernel.h
+    ${PERI_SHARED}/materials/dpc_point_batch.h
     ${PERI_SHARED}/materials/drucker_prager_cap_solid.h)
 string(SHA256 ASSEMBLY_HASH "${PD_ASSEMBLY_HASHES}")
-string(SHA256 MATERIAL_HASH "${KERNEL_HASH};${ADAPTER_HASH}")
+string(SHA256 MATERIAL_HASH "${KERNEL_HASH};${ADAPTER_HASH};${DPC_BATCH_HASH}")
 add_executable(pd_solid_capsule pd_solid_capsule.cpp)
 target_link_libraries(pd_solid_capsule sphinxsys_3d)
 target_compile_features(pd_solid_capsule PRIVATE cxx_std_17)
@@ -49,7 +51,7 @@ target_link_libraries(pd_coulomb_law_check sphinxsys_3d)
 target_compile_features(pd_coulomb_law_check PRIVATE cxx_std_17)
 
 add_executable(dpc_moving_junction_check test_dpc_moving_junction.cpp)
-target_link_libraries(dpc_moving_junction_check sphinxsys_3d)
+target_link_libraries(dpc_moving_junction_check sphinxsys_3d SPHinXsys::peri_execution)
 target_compile_features(dpc_moving_junction_check PRIVATE cxx_std_17)
 
 # Optional S-NSNI-based bare-solid entry; default PD/SPH entry is unchanged.
@@ -68,6 +70,7 @@ foreach(SNSNI_FILE
         ${PERI_SHARED}/peridynamics/pd_column_face_surface.h
         ${PERI_SHARED}/peridynamics/pd_execution.h
         ${PERI_SHARED}/../peri_execution/pd_execution.cpp
+        ${PERI_SHARED}/../peri_execution/dpc_point_cuda.cu
         ${PERI_SHARED}/peridynamics/pd_spatial_derivatives.h
         ${PERI_SHARED}/peridynamics/pd_spatial_derivatives_cuda.cu
         ${PERI_SHARED}/peridynamics/pd_particle_trace_map.h

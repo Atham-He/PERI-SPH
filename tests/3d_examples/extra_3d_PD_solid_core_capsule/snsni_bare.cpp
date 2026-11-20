@@ -54,11 +54,22 @@ int qualify(SnsniReference&r,SnsniPlasticSolid&body,Real rho,Real cfl,const fs::
     body.evaluate(rotated,rho,cfl);Vecd net=Vecd::Zero(),torque=Vecd::Zero();Real force_sum=0;
     for(size_t j=0;j<n;++j){diff[j]=body.internal[j]-Q*nonlinear[j];net+=body.internal[j];torque+=(r.X[j]+rotated[j]).cross(body.internal[j]);force_sum+=body.internal[j].norm();}
     Real objective=std::sqrt(dot(diff,diff)/dot(nonlinear,nonlinear));Real net_error=net.norm()/force_sum,torque_error=torque.norm()/(.0005*force_sum);body.discard();
-    bool shear=false,cap=false;Real native_error=0;size_t commit_start=body.commits;
+    bool shear=false,cap=false,branches_match=true;Real native_error=0,native_history_error=0;size_t commit_start=body.commits;
     for(int k=0;k<2;++k){Matd F=Matd::Identity();if(k==0)F(0,1)=.015;else F*=.97;
         for(size_t j=0;j<n;++j)d[j]=(F-Matd::Identity())*r.X[j];
         auto old=body.history;body.evaluate(d,rho,cfl);
-        for(size_t l=0;l<r.cells.size();++l){auto exact=body.model.update(body.F[l],old[l]);native_error=std::max(native_error,(exact.sigma-body.pending[l].material.sigma).norm()/std::max(Real(1),exact.sigma.norm()));shear|=exact.surface==1;cap|=exact.surface==2;}
+        for(size_t l=0;l<r.cells.size();++l)
+        {
+            const auto exact=body.model.update(body.F[l],old[l]);
+            const auto &computed=body.pending[l].material;
+            native_error=std::max(native_error,(exact.sigma-computed.sigma).norm()/std::max(Real(1),exact.sigma.norm()));
+            native_history_error=std::max({native_history_error,
+                (exact.state.inverse_Cp-computed.state.inverse_Cp).norm(),
+                std::abs(exact.state.kappa-computed.state.kappa),std::abs(exact.state.alpha-computed.state.alpha)});
+            branches_match=branches_match&&exact.surface==computed.surface;
+            shear|=computed.surface==1;
+            cap|=computed.surface==2;
+        }
         body.commit();}
     bool double_rejected=false;try{body.commit();}catch(const std::logic_error&){double_rejected=true;}
     // One undamped linear dynamics check of the actual central-difference path.
@@ -68,8 +79,11 @@ int qualify(SnsniReference&r,SnsniPlasticSolid&body,Real rho,Real cfl,const fs::
     auto hamilton=[&](){r.apply(time.displacement,f);Real e=time.kinetic()+.5*dot(time.displacement,f);for(size_t j=0;j<n;++j)e-=.125*dt*dt*r.mass[j]*time.acceleration[j].squaredNorm();return e;};
     Real initial=hamilton(),energy_error=0;
     for(size_t s=0;s<128;++s){time.step(dt,0,[&](const Field&u,const Field&,Field&force){r.apply(u,force);for(auto&v:force)v=-v;});energy_error=std::max(energy_error,std::abs(hamilton()/initial-1));}
-    bool pass=audit_pass&&limit<2e-5&&objective<1e-7&&net_error<1e-10&&torque_error<1e-9&&native_error==0&&shear&&cap&&double_rejected&&body.commits-commit_start==2&&energy_error<1e-9;
-    std::ofstream result(out/"qualification.json");result<<std::setprecision(17)<<"{\n\"status\":\""<<(pass?"PASSED":"FAILED")<<"\",\n\"elastic_limit_relative_force_error\":"<<limit<<",\n\"finite_rotation_force_objectivity_error\":"<<objective<<",\n\"net_internal_force_error\":"<<net_error<<",\n\"internal_torque_error\":"<<torque_error<<",\n\"native_DPC_stress_difference\":"<<native_error<<",\n\"shear_and_cap_exercised\":"<<(shear&&cap?"true":"false")<<",\n\"double_commit_rejected\":"<<(double_rejected?"true":"false")<<",\n\"central_difference_invariant_error\":"<<energy_error<<",\n\"linear_frequency_bound_squared\":"<<body.linear_frequency_bound_squared<<",\n\"linear_dt_s\":"<<dt<<",\n\"execution_backend\":"<<std::quoted(execution.backendName())<<",\n\"physical_compression_histories\":0\n}\n";result.close();
+    const Real material_tolerance=body.hasDeviceMaterial()?1e-9:0;
+    bool pass=audit_pass&&limit<2e-5&&objective<1e-7&&net_error<1e-10&&torque_error<1e-9&&
+        native_error<=material_tolerance&&native_history_error<=material_tolerance&&branches_match&&
+        shear&&cap&&double_rejected&&body.commits-commit_start==2&&energy_error<1e-9;
+    std::ofstream result(out/"qualification.json");result<<std::setprecision(17)<<"{\n\"status\":\""<<(pass?"PASSED":"FAILED")<<"\",\n\"elastic_limit_relative_force_error\":"<<limit<<",\n\"finite_rotation_force_objectivity_error\":"<<objective<<",\n\"net_internal_force_error\":"<<net_error<<",\n\"internal_torque_error\":"<<torque_error<<",\n\"native_DPC_stress_difference\":"<<native_error<<",\n\"native_DPC_history_difference\":"<<native_history_error<<",\n\"DPC_branches_match\":"<<(branches_match?"true":"false")<<",\n\"shear_and_cap_exercised\":"<<(shear&&cap?"true":"false")<<",\n\"double_commit_rejected\":"<<(double_rejected?"true":"false")<<",\n\"central_difference_invariant_error\":"<<energy_error<<",\n\"linear_frequency_bound_squared\":"<<body.linear_frequency_bound_squared<<",\n\"linear_dt_s\":"<<dt<<",\n\"execution_backend\":"<<std::quoted(execution.backendName())<<",\n\"material_backend\":"<<std::quoted(body.hasDeviceMaterial()?"cuda_fp64":"cpu_fp64")<<",\n\"physical_compression_histories\":0\n}\n";result.close();
     std::cout<<"QUALIFICATION "<<(pass?"PASSED":"FAILED")<<" elastic="<<limit<<" objective="<<objective<<" energy="<<energy_error<<std::endl;return pass?0:2;
 }
 int run(const PDSolidCapsuleOptions&o,const std::string&geometry,bool gate,const std::string&audit_baseline,
@@ -85,7 +99,7 @@ int run(const PDSolidCapsuleOptions&o,const std::string&geometry,bool gate,const
     auto&p=core.getBaseParticles();size_t n=p.TotalRealParticles();auto*x=p.getVariableDataByName<Vecd>("Position");auto*v=p.registerStateVariableData<Vecd>("Velocity");auto*m=p.getVariableDataByName<Real>("Mass");auto*volume=p.getVariableDataByName<Real>("VolumetricMeasure");
     Field X(x,x+n);SnsniReference reference(X,o.spacing,o.core_E/(2*(1+o.core_nu)),o.core_E*o.core_nu/((1+o.core_nu)*(1-2*o.core_nu)),o.core_rho,geometry);
     SnsniPlasticSolid body(reference,dpc::Model::fromCSV(o.dpc_table,o.dpc_r0,o.dpc_shear_dilation,o.dpc_shear_hardening),
-                           execution.makeSpatialDerivatives());
+                           execution);
     if(gate)return qualify(reference,body,o.core_rho,o.cfl,out,execution);
     for(size_t j=0;j<n;++j){m[j]=reference.mass[j];volume[j]=m[j]/o.core_rho;}
     peridynamics::SolidForcePort port(core,peridynamics::SolidForcePort::Storage::ForcePrior);
@@ -107,7 +121,7 @@ int run(const PDSolidCapsuleOptions&o,const std::string&geometry,bool gate,const
         for(size_t j=0;j<n;++j){x[j]=X[j]+d[j];v[j]=velocity[j];}port.clear();Real u=delta(t);contact.apply(-R+u/2,R-u/2);
         force.resize(n);for(size_t j=0;j<n;++j)force[j]=port.external[j]-body.internal[j];body.commit();};
     evaluate(time.displacement,time.velocity,0,total);for(size_t j=0;j<n;++j)time.acceleration[j]=total[j]/m[j];writeFields(out/"vtp/core_0.vtp",reference,body,time.displacement);
-    std::ofstream config(out/"numerics.json");config<<std::setprecision(17)<<"{\"linear_dt_bound_s\":"<<linear_dt<<",\"contact_dt_bound_s\":"<<contact.stable_dt<<",\"combined_bound_s\":"<<constant_bound<<",\"contact_K_Pa_per_m\":"<<K<<",\"ramp_duration_s\":"<<ramp<<",\"relaxation_rate_s_inverse\":"<<damping<<",\"coefficient_dofs\":"<<n<<",\"material_sites\":"<<body.history.size()<<",\"mass_kg\":"<<std::accumulate(m,m+n,Real(0))<<",\"execution_backend\":"<<std::quoted(execution.backendName())<<",\"spatial_derivatives_backend\":"<<std::quoted(body.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")<<"}\n";config.close();
+    std::ofstream config(out/"numerics.json");config<<std::setprecision(17)<<"{\"linear_dt_bound_s\":"<<linear_dt<<",\"contact_dt_bound_s\":"<<contact.stable_dt<<",\"combined_bound_s\":"<<constant_bound<<",\"contact_K_Pa_per_m\":"<<K<<",\"ramp_duration_s\":"<<ramp<<",\"relaxation_rate_s_inverse\":"<<damping<<",\"coefficient_dofs\":"<<n<<",\"material_sites\":"<<body.history.size()<<",\"mass_kg\":"<<std::accumulate(m,m+n,Real(0))<<",\"execution_backend\":"<<std::quoted(execution.backendName())<<",\"spatial_derivatives_backend\":"<<std::quoted(body.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")<<",\"material_backend\":"<<std::quoted(body.hasDeviceMaterial()?"cuda_fp64":"cpu_fp64")<<"}\n";config.close();
     while(stage<=o.load_steps){Real dt=std::min({o.max_dt,constant_bound,body.acoustic_dt});if(stage_time<ramp)dt=std::min(dt,ramp-stage_time);
         if(!std::isfinite(dt)||dt<1e-15||time.steps>=o.max_steps)throw std::runtime_error("Explicit time/count bound exhausted");
         audit.before(time,body,contact,total,stage,delta(stage_time));

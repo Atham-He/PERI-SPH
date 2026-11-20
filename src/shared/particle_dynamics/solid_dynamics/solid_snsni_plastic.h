@@ -7,7 +7,7 @@
 #pragma once
 #include "solid_snsni_reference.h"
 #include "dpc_snsni_adapter.h"
-#include "pd_spatial_derivatives.h"
+#include "pd_execution.h"
 namespace SPH::solid_dynamics
 {
 class SnsniPlasticSolid
@@ -27,9 +27,13 @@ class SnsniPlasticSolid
     size_t evaluations=0,commits=0;
     bool pending_commit=false;
     Real linear_frequency_bound_squared=0,acoustic_dt=0;
+    SnsniPlasticSolid(SnsniReference &r, const dpc::Model &m, const peridynamics::PeriExecution &execution)
+        : SnsniPlasticSolid(r, m, execution.makeSpatialDerivatives(), execution.makeDpcPoints(m)) {}
+
     SnsniPlasticSolid(SnsniReference&r,const dpc::Model&m,
-                      std::unique_ptr<peridynamics::SpatialDerivativeBatch> derivatives = nullptr)
-      : reference(r), model(m), derivatives_(std::move(derivatives))
+                      std::unique_ptr<peridynamics::SpatialDerivativeBatch> derivatives = nullptr,
+                      std::unique_ptr<dpc::PointBatch> material_points = nullptr)
+      : reference(r), model(m), derivatives_(std::move(derivatives)), material_points_(std::move(material_points))
     {
         const size_t n=r.cells.size();history.resize(n);pending.resize(n);F.resize(n);inverseF.resize(n);correction.resize(n);force_gradient.resize(n);displacement_hessian.resize(n);force_hessian.resize(n);accumulated_plastic_work.assign(n,0);sampling_gradient.resize(n);
         StdVec<Vecd> sites;StdVec<Real> volumes;
@@ -51,12 +55,15 @@ class SnsniPlasticSolid
             configureDerivatives();
     }
     bool hasDeviceDerivatives() const noexcept { return derivatives_ != nullptr; }
+    bool hasDeviceMaterial() const noexcept { return material_points_ != nullptr; }
     void evaluate(const Field&d,Real rho0,Real cfl)
     {
         if(pending_commit)throw std::logic_error("Commit or explicitly discard pending DPC history before the next evaluation");
         const size_t n=history.size();
         if (derivatives_)
             evaluateDeviceDerivatives(d);
+        if (material_points_)
+            point_input_.resize(n);
         tbb::parallel_for(size_t(0),n,[&](size_t l){auto&h=displacement_hessian[l];
             if (derivatives_)
             {
@@ -84,9 +91,19 @@ class SnsniPlasticSolid
             Triple cp_spatial;Vecd kappa_spatial=inverseF[l].transpose()*derivativeKappa;
             for(int k=0;k<3;++k){derivativeF[k].setZero();cp_spatial[k].setZero();
                 for(int j=0;j<3;++j){cp_spatial[k]+=inverseF[l](j,k)*derivativeCp[j];for(int a=0;a<3;++a)derivativeF[k].row(a)+=inverseF[l](j,k)*h[a].col(j).transpose();}}
-            pending[l]=dpc::snsniMaterialStep(model,F[l],history[l],derivativeF,cp_spatial,kappa_spatial);
-            correction[l]=pending[l].correction;
+            if (material_points_)
+            {
+                packMaterialInput(l);
+                pending[l].trial=dpc::henckyTrialField(model,F[l],history[l],derivativeF,cp_spatial,kappa_spatial);
+            }
+            else
+            {
+                pending[l]=dpc::snsniMaterialStep(model,F[l],history[l],derivativeF,cp_spatial,kappa_spatial);
+                correction[l]=pending[l].correction;
+            }
         });
+        if (material_points_)
+            evaluateDeviceMaterial(n);
         tbb::parallel_for(size_t(0),n,[&](size_t l){const auto&cell=reference.cells[l];const auto&inv=inverseF[l];
             Triple derivative;for(auto&a:derivative)a.setZero();
             for(const auto&e:sampling_gradient[l]){Matd delta=correction[e.j]-correction[l];for(int k=0;k<3;++k)derivative[k]+=e.gradient[k]*delta;}
@@ -127,6 +144,73 @@ class SnsniPlasticSolid
     std::vector<peridynamics::ParticleVector3> device_field_;
     std::vector<peridynamics::SpatialDerivatives3> device_derivatives_, device_force_coefficients_;
     std::vector<peridynamics::ParticleVector3> device_internal_force_;
+    std::unique_ptr<dpc::PointBatch> material_points_;
+    std::vector<dpc::PointInput> point_input_;
+    std::vector<dpc::PointOutput> point_output_;
+
+    void packMaterialInput(size_t cell)
+    {
+        auto &input = point_input_[cell];
+        const auto &old = history[cell];
+        for (int row = 0; row < 3; ++row)
+            for (int col = 0; col < 3; ++col)
+            {
+                input.deformation[row][col] = F[cell](row,col);
+                input.history.inverse_Cp[row][col] = old.inverse_Cp(row,col);
+            }
+        input.history.kappa = old.kappa;
+        input.history.alpha = old.alpha;
+    }
+
+    void evaluateDeviceMaterial(size_t cells)
+    {
+        material_points_->evaluate(point_input_, point_output_);
+        if (point_output_.size() != cells)
+            throw std::logic_error("DPC backend returned an incomplete material field");
+        // No accepted history is mutated. Diagnose a failed cell with the
+        // same deformation and original history as the CPU model.
+        for (size_t l = 0; l < cells; ++l)
+        {
+            const auto &point = point_output_[l];
+            if (point.failure != dpc::PointFailure::None)
+            {
+                dpc::Result diagnostic;
+                if (point.failure == dpc::PointFailure::BadReturn)
+                    diagnostic = unpackMaterialResult(point);
+                model.throwPointError(point.failure, F[l], history[l], diagnostic);
+            }
+        }
+        tbb::parallel_for(size_t(0), cells, [&](size_t l)
+        {
+            auto &step = pending[l];
+            step.material = unpackMaterialResult(point_output_[l]);
+            step.correction = step.trial.sigma - step.material.sigma;
+            correction[l] = step.correction;
+        });
+    }
+
+    static dpc::Result unpackMaterialResult(const dpc::PointOutput &point)
+    {
+        dpc::Result result;
+        for (int row = 0; row < 3; ++row)
+            for (int col = 0; col < 3; ++col)
+            {
+                result.sigma(row,col) = point.sigma[row][col];
+                result.state.inverse_Cp(row,col) = point.history.inverse_Cp[row][col];
+            }
+        result.state.kappa = point.history.kappa;
+        result.state.alpha = point.history.alpha;
+        result.p = point.p;
+        result.q = point.q;
+        result.relative_density = point.relative_density;
+        result.plastic_shear = point.plastic_shear;
+        result.plastic_stress_work = point.plastic_stress_work;
+        result.elastic_energy = point.elastic_energy;
+        result.yield_residual = point.yield_residual;
+        result.effective_d = point.effective_d;
+        result.surface = point.surface;
+        return result;
+    }
 
     void assembleDeviceInternalForce(size_t cells)
     {

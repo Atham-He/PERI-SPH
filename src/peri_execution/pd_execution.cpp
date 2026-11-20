@@ -57,4 +57,15 @@ std::unique_ptr<SpatialDerivativeBatch> PeriExecution::makeSpatialDerivatives() 
     return nullptr;
 }
 
+std::unique_ptr<dpc::PointBatch> PeriExecution::makeDpcPoints(const dpc::Model &model) const
+{
+#if defined(PERI_SPH_HAS_CUDA)
+    if (mode_ == PeriExecutionMode::GPU)
+        return dpc::makeCudaPointBatch(model);
+#else
+    (void)model;
+#endif
+    return nullptr;
+}
+
 }

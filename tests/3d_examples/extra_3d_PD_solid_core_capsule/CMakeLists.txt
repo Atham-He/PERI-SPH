@@ -55,8 +55,6 @@ target_link_libraries(snsni_bare sphinxsys_3d)
 target_compile_features(snsni_bare PRIVATE cxx_std_17)
 
 # S-NSNI solid core coupled to the layered NOSB-PD capsule shell.
-option(PERI_SPH_CUDA_CRACK_PROJECTION "Build FP64 CUDA crack projection for the S-NSNI capsule" OFF)
-option(PERI_SPH_CUDA_BONDED_INTERFACE "Build FP64 CUDA shell-core coupling for the S-NSNI capsule" OFF)
 set(SNSNI_CAPSULE_HASHES "${ASSEMBLY_HASH};${MATERIAL_HASH}")
 foreach(SNSNI_FILE
         ${CMAKE_CURRENT_SOURCE_DIR}/pd_snsni_capsule.cpp
@@ -65,6 +63,8 @@ foreach(SNSNI_FILE
         ${PERI_SHARED}/particle_dynamics/solid_dynamics/solid_snsni_plastic.h
         ${PERI_SHARED}/peridynamics/pd_radial_layered_surface.h
         ${PERI_SHARED}/peridynamics/pd_column_face_surface.h
+        ${PERI_SHARED}/peridynamics/pd_execution.h
+        ${PERI_SHARED}/../peri_execution/pd_execution.cpp
         ${PERI_SHARED}/peridynamics/pd_crack_projection.h
         ${PERI_SHARED}/peridynamics/pd_crack_projection_cuda.cu
         ${PERI_SHARED}/peridynamics/pd_bonded_interface_batch.h
@@ -77,24 +77,8 @@ foreach(SNSNI_FILE
 endforeach()
 string(SHA256 SNSNI_CAPSULE_HASH "${SNSNI_CAPSULE_HASHES}")
 add_executable(pd_snsni_capsule pd_snsni_capsule.cpp)
-target_link_libraries(pd_snsni_capsule sphinxsys_3d)
+target_link_libraries(pd_snsni_capsule sphinxsys_3d SPHinXsys::peri_execution)
 target_compile_features(pd_snsni_capsule PRIVATE cxx_std_17)
-if(PERI_SPH_CUDA_CRACK_PROJECTION OR PERI_SPH_CUDA_BONDED_INTERFACE)
-    if(SPHINXSYS_USE_SYCL OR SPHINXSYS_USE_FLOAT)
-        message(FATAL_ERROR "PERI-SPH CUDA kernels require the FP64 host build")
-    endif()
-    enable_language(CUDA)
-    set_target_properties(pd_snsni_capsule PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED YES)
-    target_compile_options(pd_snsni_capsule PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
-endif()
-if(PERI_SPH_CUDA_CRACK_PROJECTION)
-    target_sources(pd_snsni_capsule PRIVATE ${PERI_SHARED}/peridynamics/pd_crack_projection_cuda.cu)
-    target_compile_definitions(pd_snsni_capsule PRIVATE PERI_SPH_CUDA_CRACK_PROJECTION=1)
-endif()
-if(PERI_SPH_CUDA_BONDED_INTERFACE)
-    target_sources(pd_snsni_capsule PRIVATE ${PERI_SHARED}/peridynamics/pd_bonded_interface_cuda.cu)
-    target_compile_definitions(pd_snsni_capsule PRIVATE PERI_SPH_CUDA_BONDED_INTERFACE=1)
-endif()
 target_compile_definitions(pd_snsni_capsule PRIVATE
     CAPSULE_SOURCE_SHA256="${SNSNI_CAPSULE_HASH}"
     DPC_MATERIAL_SHA256="${MATERIAL_HASH}")
@@ -107,7 +91,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     ${PERI_SHARED}/peridynamics/rigid_grain_shear.h)
 string(SHA256 DIRECT_SHEAR_HASH "${ASSEMBLY_HASH};${DIRECT_SHEAR_MAIN_HASH};${DIRECT_SHEAR_CONTACT_HASH}")
 add_executable(pd_snsni_direct_shear pd_snsni_direct_shear.cpp)
-target_link_libraries(pd_snsni_direct_shear sphinxsys_3d)
+target_link_libraries(pd_snsni_direct_shear sphinxsys_3d SPHinXsys::peri_execution)
 target_compile_features(pd_snsni_direct_shear PRIVATE cxx_std_17)
 target_compile_definitions(pd_snsni_direct_shear PRIVATE
     CAPSULE_SOURCE_SHA256="${DIRECT_SHEAR_HASH}"

@@ -17,7 +17,6 @@ std::string fracture_bank_input;
 bool use_column_interface=false,column_handoff_only=false,local_platen_step_bound=false,fracture_contact_only=false;
 bool affine_crack_contact=false,affine_contact_handoff_only=false;
 bool affine_inner_interface=false,inner_interface_handoff_only=false;
-bool cuda_crack_projection=false,cuda_bonded_interface=false;
 
 class SnsniCoupledSurface:public ReferenceSolidSurface
 {
@@ -54,7 +53,7 @@ void vtkPlates(const fs::path&path,Real R,Real compression)
     f<<"</DataArray></Points><Polys><DataArray type=\"Int64\" Name=\"connectivity\" format=\"ascii\">0 1 2 3 4 5 6 7</DataArray><DataArray type=\"Int64\" Name=\"offsets\" format=\"ascii\">4 8</DataArray></Polys></Piece></PolyData></VTKFile>\n";
 }
 
-int runSnsniCapsule(const HybridOptions&o,const std::string&cells)
+int runSnsniCapsule(const HybridOptions&o,const std::string&cells,const PeriExecution&execution)
 {
     if(!o.layered_kinematics||o.shell_material!="finite_volume_biot"||o.fracture_model!="extrinsic_cohesive"||o.fracture_kinematics!="physical_cohesive"||o.plate_friction!=0||fracture_bank_input.empty())
         throw std::invalid_argument("This entry requires layered NOSB, unchanged Biot elasticity, extrinsic_cohesive/physical_cohesive fracture and --fracture-facets");
@@ -126,18 +125,10 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells)
                            VisibleCrackSurface::TransferOrder::AllowAffinePositionTransfer);
     Real Eref=o.constraint_E>0?o.constraint_E:o.core_E,Ktie=o.tie_factor*Eref/o.spacing,Kcontact=o.contact_factor*Eref/o.spacing;
     auto cs=std::make_unique<SnsniCoupledSurface>(core_port,points,cr);
-    auto tieBackend=[]()->std::unique_ptr<BondedInterfaceBatch>{
-        if(!cuda_bonded_interface)return nullptr;
-#if defined(PERI_SPH_CUDA_BONDED_INTERFACE)
-        return makeCudaBondedInterface();
-#else
-        throw std::invalid_argument("--cuda-bonded-interface requires a build with PERI_SPH_CUDA_BONDED_INTERFACE=ON");
-#endif
-    };
-    auto tie=std::make_unique<BondedSolidInterface>(*si,*cs,areas,Ktie,R,tieBackend());
+    auto tie=std::make_unique<BondedSolidInterface>(*si,*cs,areas,Ktie,R,execution.makeBondedInterface());
     auto installAffineInner=[&](const Field&targets,const Field&velocities){
         auto next=makeInnerSurface(true,targets,velocities);
-        tie=std::make_unique<BondedSolidInterface>(*next,*cs,areas,Ktie,R,tieBackend());
+        tie=std::make_unique<BondedSolidInterface>(*next,*cs,areas,Ktie,R,execution.makeBondedInterface());
         si=std::move(next);
     };
     StdVec<Real>outer_areas(outer_points.size(),4*Pi*R*R/outer_points.size());
@@ -154,21 +145,14 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells)
         for(const auto&c:geometry.columns){Real v=0;for(size_t j:c)v+=svol[j];column_areas.push_back(total_area*v/shell_volume);}
     }
     auto installColumnInterface=[&](){
-        tie=std::make_unique<BondedSolidInterface>(*column_surface,*column_core,column_areas,Ktie,R,tieBackend());
+        tie=std::make_unique<BondedSolidInterface>(*column_surface,*column_core,column_areas,Ktie,R,execution.makeBondedInterface());
         si.reset();cs.reset();
     };
     if(use_column_interface&&recovery::checkpoint.resume.empty())installColumnInterface();
     SolidSurfacePlaneContact contact(so,outer_areas,Kcontact,R);
     auto bank=ExtrinsicCrackGrowth::readBank(fracture_bank_input,geometry);
     using SurfaceLaw=ExtrinsicCrackGrowth::SurfaceLaw;
-    std::unique_ptr<CrackProjectionBatch> crack_projection;
-    if(cuda_crack_projection){
-#if defined(PERI_SPH_CUDA_CRACK_PROJECTION)
-        crack_projection=makeCudaCrackProjection();
-#else
-        throw std::invalid_argument("--cuda-crack-projection requires a build with PERI_SPH_CUDA_CRACK_PROJECTION=ON");
-#endif
-    }
+    auto crack_projection=execution.makeCrackProjection();
     ExtrinsicCrackGrowth growth(sr,sb,pd_port,o.fracture_stress,o.fracture_energy,o.pd_spacing,Kcontact,bank,
                                 fracture_contact_only?SurfaceLaw::ContactOnly:SurfaceLaw::Cohesive,crack_projection.get());
     growth.affine_contact_traces=affine_crack_contact&&recovery::checkpoint.resume.empty();
@@ -194,7 +178,7 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells)
     size_t stage=1,checks=0;Real stage_time=0,elapsed=0,Wp=0,Wcore=0,Wd=0,Walgorithmic=0,interface_switch_work=0,inner_hold_elapsed=0;bool onset=false,fully_failed=false,column_hold=false,inner_hold=false;
     auto compression=[&](Real t){Real a=column_hold?0:std::clamp((inner_hold?stage_time:t)/o.ramp_duration,Real(0),Real(1));return o.diameter*o.strain*(Real(stage-1)+.5*(1-std::cos(Pi*a)))/o.load_steps;};
     forceAt(time.displacement,time.velocity,0,false);Real U0=recoverable(),K0=time.kinetic();
-    std::ofstream parameters(out/"parameters.json");parameters<<std::setprecision(17)<<"{\"core_backend\":\"SNSNI_RKPM_DPC_unchanged\",\"shell_backend\":\"layered_NOSB_PD_live_reconstruction\",\"shell_constitutive\":\"unchanged_finite_volume_Biot\",\"fracture_representation\":"<<std::quoted(fracture_contact_only?"strength_triggered_bond_deletion_contact_only":"strength_triggered_extrinsic_cohesive_true_bonds")<<",\"cohesive_integrator\":"<<std::quoted(fracture_contact_only?"disabled":"explicit_bulk_half_kicks_implicit_objective_surface_drift")<<",\"Gc_used_for_surface_softening\":"<<(fracture_contact_only?"false":"true")<<",\"mixed_mode_assumption\":"<<std::quoted(fracture_contact_only?"equal_strength":"equal_strength_and_Gc")<<",\"candidate_geometry\":\"through_thickness_radial_Voronoi_facets\",\"E_Pa\":"<<o.shell_E<<",\"nu\":"<<o.shell_nu<<",\"ft_Pa\":"<<o.fracture_stress<<",\"Gc_J_m2\":"<<o.fracture_energy<<",\"delta_f_m\":"<<growth.delta_f<<",\"core_particles\":"<<cn<<",\"shell_particles\":"<<sn<<",\"candidate_facets\":"<<bank.size()<<",\"shell_mass_kg\":"<<shell_mass<<",\"interface_K_Pa_per_m\":"<<Ktie<<",\"platen_and_crack_contact_K_Pa_per_m\":"<<Kcontact<<",\"crack_projection_backend\":"<<std::quoted(crack_projection?"cuda_fp64":"cpu_fp64")<<",\"bonded_interface_backend\":"<<std::quoted(cuda_bonded_interface?"cuda_fp64":"cpu_fp64")<<",\"core_parameters_changed\":false,\"source_hash\":"<<std::quoted(CAPSULE_SOURCE_SHA256)<<"}\n";parameters.close();
+    std::ofstream parameters(out/"parameters.json");parameters<<std::setprecision(17)<<"{\"core_backend\":\"SNSNI_RKPM_DPC_unchanged\",\"shell_backend\":\"layered_NOSB_PD_live_reconstruction\",\"shell_constitutive\":\"unchanged_finite_volume_Biot\",\"fracture_representation\":"<<std::quoted(fracture_contact_only?"strength_triggered_bond_deletion_contact_only":"strength_triggered_extrinsic_cohesive_true_bonds")<<",\"cohesive_integrator\":"<<std::quoted(fracture_contact_only?"disabled":"explicit_bulk_half_kicks_implicit_objective_surface_drift")<<",\"Gc_used_for_surface_softening\":"<<(fracture_contact_only?"false":"true")<<",\"mixed_mode_assumption\":"<<std::quoted(fracture_contact_only?"equal_strength":"equal_strength_and_Gc")<<",\"candidate_geometry\":\"through_thickness_radial_Voronoi_facets\",\"E_Pa\":"<<o.shell_E<<",\"nu\":"<<o.shell_nu<<",\"ft_Pa\":"<<o.fracture_stress<<",\"Gc_J_m2\":"<<o.fracture_energy<<",\"delta_f_m\":"<<growth.delta_f<<",\"core_particles\":"<<cn<<",\"shell_particles\":"<<sn<<",\"candidate_facets\":"<<bank.size()<<",\"shell_mass_kg\":"<<shell_mass<<",\"interface_K_Pa_per_m\":"<<Ktie<<",\"platen_and_crack_contact_K_Pa_per_m\":"<<Kcontact<<",\"execution_backend\":"<<std::quoted(execution.backendName())<<",\"crack_projection_backend\":"<<std::quoted(crack_projection?"cuda_fp64":"cpu_fp64")<<",\"bonded_interface_backend\":"<<std::quoted(execution.bondedInterfaceOnDevice()?"cuda_fp64":"cpu_fp64")<<",\"core_parameters_changed\":false,\"source_hash\":"<<std::quoted(CAPSULE_SOURCE_SHA256)<<"}\n";parameters.close();
     if(o.preflight_only){Field d(count),v(count);Matd A=Matd::Identity();A(0,0)=.998;A(1,1)=1.001;A(2,2)=.999;for(size_t j=0;j<count;++j){d[j]=(A-Matd::Identity())*X[j];if(j<cn)d[j]+=Vecd(5e-8*rc/.0005,0,0);v[j]=Vecd(.2*std::sin(37*X[j][0]/R),-.1,.3*X[j][2]/R);}forceAt(d,v,.004*2*R,false);
         Real affine=0,native=0;for(size_t l=0;l<cr.cells.size();++l){affine=std::max(affine,(cb.F[l]-A).norm());auto a=cb.model.update(cb.F[l],cb.history[l]);native=std::max(native,(a.sigma-cb.pending[l].material.sigma).norm());}for(size_t j=0;j<sn;++j)affine=std::max(affine,(sF[j]-A).norm());
         Real power=0;for(size_t j=0;j<cn;++j)power+=core_port.external[j].dot(v[j]);for(size_t j=0;j<sn;++j)power+=sm[j]*pd_port.external[j].dot(v[cn+j]);Real eps=1e-12;Field plus=d,minus=d;for(size_t j=0;j<count;++j){plus[j]+=eps*v[j];minus[j]-=eps*v[j];}forceAt(plus,v,.004*2*R,false);Real ep=tie->energy+contact.energy;forceAt(minus,v,.004*2*R,false);Real em=tie->energy+contact.energy;Real derivative=(ep-em)/(2*eps),error=std::abs(derivative+power)/std::max({Real(1e-20),std::abs(derivative),std::abs(power)});bool pass=affine<1e-8&&native==0&&error<1e-5;
@@ -617,7 +601,7 @@ std::vector<std::pair<Real,std::string>>frame_index;
 
 int main(int argc,char**argv)
 {
-    try{recovery::checkpoint.schema_version=4;std::string cells;std::vector<char*>args{argv[0]};for(int i=1;i<argc;++i){std::string a=argv[i];if(a.rfind("--snsni-cells=",0)==0)cells=a.substr(14);else if(a.rfind("--fracture-facets=",0)==0)fracture_bank_input=a.substr(18);else if(a=="--column-tied-interface")use_column_interface=true;else if(a=="--column-interface-handoff-only")column_handoff_only=true;else if(a=="--local-platen-step-bound")local_platen_step_bound=true;else if(a=="--fracture-contact-only")fracture_contact_only=true;else if(a=="--affine-crack-contact")affine_crack_contact=true;else if(a=="--affine-contact-handoff-only")affine_contact_handoff_only=true;else if(a=="--affine-inner-interface")affine_inner_interface=true;else if(a=="--inner-interface-handoff-only")inner_interface_handoff_only=true;else if(a=="--cuda-crack-projection")cuda_crack_projection=true;else if(a=="--cuda-bonded-interface")cuda_bonded_interface=true;else if(recovery::checkpoint.take(a)){}else args.push_back(argv[i]);}
+    try{recovery::checkpoint.schema_version=4;std::string cells;PeriExecution::LegacyGpuSelection legacy{};std::vector<char*>args{argv[0]};for(int i=1;i<argc;++i){std::string a=argv[i];if(a.rfind("--snsni-cells=",0)==0)cells=a.substr(14);else if(a.rfind("--fracture-facets=",0)==0)fracture_bank_input=a.substr(18);else if(a=="--column-tied-interface")use_column_interface=true;else if(a=="--column-interface-handoff-only")column_handoff_only=true;else if(a=="--local-platen-step-bound")local_platen_step_bound=true;else if(a=="--fracture-contact-only")fracture_contact_only=true;else if(a=="--affine-crack-contact")affine_crack_contact=true;else if(a=="--affine-contact-handoff-only")affine_contact_handoff_only=true;else if(a=="--affine-inner-interface")affine_inner_interface=true;else if(a=="--inner-interface-handoff-only")inner_interface_handoff_only=true;else if(a=="--cuda-crack-projection")legacy.crack_projection=true;else if(a=="--cuda-bonded-interface")legacy.bonded_interface=true;else if(recovery::checkpoint.take(a)){}else args.push_back(argv[i]);}
         if(use_column_interface){recovery::checkpoint.schema_version=5;recovery::checkpoint.compatible_read_version=4;}
         if(fracture_contact_only){
             recovery::checkpoint.compatible_read_version=recovery::checkpoint.schema_version;
@@ -643,6 +627,7 @@ int main(int argc,char**argv)
         if(cells.empty())throw std::invalid_argument("--snsni-cells is required");HybridOptions options;options.parseHybrid(int(args.size()),args.data());
         if(local_platen_step_bound&&options.plate_friction!=0)
             throw std::invalid_argument("Local platen step bound requires frictionless analytic planes");
-        tbb::task_arena arena(int(options.threads));return arena.execute([&]{return runSnsniCapsule(options,cells);});
+        const PeriExecution execution(options.execution,legacy);
+        tbb::task_arena arena(int(options.threads));return arena.execute([&]{return runSnsniCapsule(options,cells,execution);});
     }catch(const std::exception&e){std::cerr<<"COUPLED_ERROR "<<e.what()<<std::endl;return 1;}
 }

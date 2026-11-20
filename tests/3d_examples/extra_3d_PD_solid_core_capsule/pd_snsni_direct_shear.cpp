@@ -52,7 +52,7 @@ void vtkPlates(const fs::path&path,Real R,Real compression)
     f<<"</DataArray></Points><Polys><DataArray type=\"Int64\" Name=\"connectivity\" format=\"ascii\">0 1 2 3 4 5 6 7</DataArray><DataArray type=\"Int64\" Name=\"offsets\" format=\"ascii\">4 8</DataArray></Polys></Piece></PolyData></VTKFile>\n";
 }
 
-int runDirectShear(const HybridOptions&o,const std::string&cells,const std::string&sand,const ShearBoxOptions&box)
+int runDirectShear(const HybridOptions&o,const std::string&cells,const std::string&sand,const ShearBoxOptions&box,const PeriExecution&execution)
 {
     if(!o.layered_kinematics||o.shell_material!="finite_volume_biot"||o.fracture_model!="crack_band_energy"||o.plate_friction!=0)
         throw std::invalid_argument("This entry requires layered NOSB, finite-volume Biot crack-band damage and frictionless contact");
@@ -128,7 +128,7 @@ int runDirectShear(const HybridOptions&o,const std::string&cells,const std::stri
     RadialLayeredSolidSurface si(pd_port,points,geometry,rc,o.thickness,o.pd_spacing,o.interface_shell_support);
     LayeredSolidSurface so(pd_port,outer_points,geometry,1,o.pd_spacing,o.interface_shell_support);
     Real Eref=o.constraint_E>0?o.constraint_E:o.core_E,Ktie=o.tie_factor*Eref/o.spacing,Kcontact=o.contact_factor*Eref/o.spacing;
-    BondedSolidInterface tie(si,cs,areas,Ktie,R);
+    BondedSolidInterface tie(si,cs,areas,Ktie,R,execution.makeBondedInterface());
     StdVec<Real>outer_areas(outer_points.size(),4*Pi*R*R/outer_points.size());
     RigidGrainShearBox world(so,outer_areas,Kcontact,sand,box,&cs,areas);
     const size_t released_preprocessing_bytes=cr.releasePreprocessingCache();
@@ -174,6 +174,8 @@ int runDirectShear(const HybridOptions&o,const std::string&cells,const std::stri
     for(auto&g:world.grains)grain_mass+=g.mass;
     std::ofstream parameters(out/"parameters.json");parameters<<std::setprecision(17)
       <<"{\"core_backend\":\"S-NSNI_RKPM_DPC\",\"shell_backend\":\"NOSB_PD_layered_volume\",\"sand_backend\":\"rotating_rigid_spheres_Hertz_linear_history_Coulomb\",\"core_particles\":"<<cn<<",\"shell_particles\":"<<sn<<",\"material_sites\":"<<cr.cells.size()<<",\"sand_grains\":"<<ng
+      <<",\"execution_backend\":"<<std::quoted(execution.backendName())
+      <<",\"bonded_interface_backend\":"<<std::quoted(execution.bondedInterfaceOnDevice()?"cuda_fp64":"cpu_fp64")
       <<",\"capsule_count\":1,\"capsule_mass_kg\":"<<capsule_mass<<",\"sand_mass_kg\":"<<grain_mass<<",\"capsule_mass_fraction\":"<<capsule_mass/(grain_mass+capsule_mass)<<",\"capsule_sand_mu\":0,\"initial_height_m\":"<<box.initial_height_m
       <<",\"initial_area_m2\":"<<box.length_x_m*box.length_y_m<<",\"normal_pressure_Pa\":"<<box.normal_pressure_Pa<<",\"normal_load_control\":\"massless_exact_piston_constant_nominal_force\",\"load_steps\":"<<box.normal_increments+box.shear_increments
       <<",\"core_material_changed\":false,\"shell_material_changed\":false,\"pore_pressure_solved\":false,\"chemical_strength_feedback\":false,\"representative_volume_claimed\":false,\"shear_rate_validated\":false}\n";parameters.close();
@@ -291,6 +293,7 @@ int main(int argc,char**argv)
       if(a.rfind("--snsni-cells=",0)==0)cells=a.substr(14);else if(a.rfind("--sand-input=",0)==0)sand=a.substr(13);else if(a.rfind("--box-config=",0)==0)boxfile=a.substr(13);else if(recovery::checkpoint.take(a)){}else args.push_back(argv[i]);}
       if(cells.empty()||sand.empty()||boxfile.empty())throw std::invalid_argument("cells, sand-input and box-config are required");
       HybridOptions options;options.parseHybrid(int(args.size()),args.data());ShearBoxOptions box;box.read(boxfile);
-      tbb::task_arena arena(int(options.threads));return arena.execute([&]{return runDirectShear(options,cells,sand,box);});
+      const PeriExecution execution(options.execution);
+      tbb::task_arena arena(int(options.threads));return arena.execute([&]{return runDirectShear(options,cells,sand,box,execution);});
     }catch(const std::exception&e){std::cerr<<"DIRECT_SHEAR_ERROR "<<e.what()<<std::endl;return 1;}
 }

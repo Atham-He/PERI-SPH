@@ -15,6 +15,7 @@ option(SPHINXSYS_USE_FLOAT "Build using float (single-precision floating-point f
 option(SPHINXSYS_USE_VTK "Build using VTK library for writing VTP/VTU files" OFF)
 option(SPHINXSYS_USE_SYCL "Build using SYCL acceleration or not" OFF)
 option(SPHINXSYS_USE_ONEDPL "Build with One DPL for exclusive scan and particle sorting" ON)
+option(PERI_SPH_ENABLE_CUDA "Build the PERI-SPH FP64 CUDA execution backend" OFF)
 
 # ------ Global properties (Some cannot be set on INTERFACE targets)
 set(CMAKE_VERBOSE_MAKEFILE OFF CACHE BOOL "Enable verbose compilation commands for Makefile and Ninja" FORCE) # Extra fluff needed for Ninja: https://github.com/ninja-build/ninja/issues/900
@@ -143,6 +144,14 @@ if(SPHINXSYS_USE_SYCL)
 endif()
 
 # ------ Setup the concrete libraries
+# Retain the previous diagnostic build flags as aliases for the backend.
+if(PERI_SPH_ENABLE_CUDA OR PERI_SPH_CUDA_CRACK_PROJECTION OR PERI_SPH_CUDA_BONDED_INTERFACE)
+    if(SPHINXSYS_USE_SYCL OR SPHINXSYS_USE_FLOAT)
+        message(FATAL_ERROR "The PERI-SPH CUDA execution backend requires an FP64 host build")
+    endif()
+    enable_language(CUDA)
+endif()
+add_subdirectory(src/peri_execution)
 add_subdirectory(src)
 
 # ------ Setup the tests

@@ -8,6 +8,7 @@
 #include "all_peridynamics.h"
 #include "pd_quadratic_correspondence.h"
 #include "pd_solid_reference_coupling.h"
+#include "pd_execution.h"
 #include "pd_principal_stress_onset.h"
 #include "pd_fragment_contact.h"
 #include "pd_energy_crack_band.h"
@@ -19,6 +20,7 @@
 
 struct HybridOptions : PDSolidCapsuleOptions
 {
+    SPH::peridynamics::PeriExecutionMode execution=SPH::peridynamics::PeriExecutionMode::Default;
     bool preflight_only=false;
     size_t postfracture_checkpoint_steps=0;
     bool quadratic_kinematics=false,layered_kinematics=false;
@@ -48,6 +50,7 @@ struct HybridOptions : PDSolidCapsuleOptions
                 {line=line.substr(0,line.find('#'));auto a=line.find_first_not_of(" \t\r");
                  if(a==std::string::npos)continue;line=line.substr(a,line.find_last_not_of(" \t\r")-a+1);consume("--"+line);}return;
             }
+            if(key=="execution"){execution=SPH::peridynamics::parsePeriExecution(value);return;}
             if(key=="pd-kinematics"){if(value!="linear"&&value!="quadratic"&&value!="layered_quadratic")throw std::invalid_argument("pd-kinematics must be linear, quadratic or layered_quadratic");quadratic_kinematics=value!="linear";layered_kinematics=value=="layered_quadratic";return;}
             if(key=="plate-surface-order"){if(value!="1"&&value!="2")throw std::invalid_argument("plate-surface-order must be 1 or 2");plate_surface_order=unsigned(value[0]-'0');return;}
             if(key=="interface-order"){if(value!="1" && value!="2")throw std::invalid_argument("interface-order must be 1 or 2");interface_order=unsigned(value[0]-'0');return;}

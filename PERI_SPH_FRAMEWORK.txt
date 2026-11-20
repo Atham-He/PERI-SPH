@@ -98,6 +98,18 @@ Density/Mach admissibility limits are configurable and do not replace convergenc
 Kinetic energies are diagnostics; a full elastic/plastic/damping/work energy budget
 and an interface momentum residual are still required.
 
+PERI-SPH execution backend
+The SPHinXsys::peri_execution library selects execution for the coupled solver.
+Build with PERI_SPH_ENABLE_CUDA=ON to make the FP64 CUDA backend available.
+The S-NSNI capsule and local direct-shear drivers accept execution=cpu or
+execution=gpu in their configuration files, or --execution=cpu and
+--execution=gpu on the command line. CPU is the default.
+
+CUDA currently covers bonded solid interface assembly and bilinear crack
+projection where the solver uses those operators. The case parameters.json
+records the backend used for each of these phases. The material calibration,
+contact law, and checkpoint schema use the same inputs for both backends.
+
 Build and regression
 For the existing local Conda environment:
   export PATH=/home/hezhy58/sphenv/bin:$PATH

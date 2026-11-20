@@ -25,6 +25,8 @@ namespace SPH::peridynamics {
  * recorded as stabilizer transfer loss, never as physical Gc work.
  */
 class ExtrinsicCrackGrowth {
+    CrackProjectionBatch *contact_projection_;
+
  public:
     enum class SurfaceLaw { Cohesive, ContactOnly };
     const SurfaceLaw surface_law;
@@ -58,8 +60,8 @@ class ExtrinsicCrackGrowth {
     std::string last_rejection;
     struct InsertionAudit {size_t candidate=0;Real area=0,old_energy=0,new_energy=0,old_bulk=0,new_bulk=0,old_cohesive=0,new_cohesive=0,old_contact=0,new_contact=0,new_dissipation=0,maximum_birth_gap=0,maximum_birth_velocity_jump=0,defect=0,fraction=0,old_stabilizer=0,new_stabilizer=0,total_defect=0;} last_insertion;
     ExtrinsicCrackGrowth(Reference&r,Bulk&b,SolidForcePort&p,Real strength,Real energy,Real dp,Real K,const std::vector<Candidate>&bank,
-                         SurfaceLaw law=SurfaceLaw::Cohesive)
-      :surface_law(law),reference(r),bulk(b),port(p),ft(strength),Gc(energy),delta_f(2*energy/strength),spacing(dp),contact_K(K),candidates(bank),active(bank.size(),0){
+                         SurfaceLaw law=SurfaceLaw::Cohesive,CrackProjectionBatch *contact_projection=nullptr)
+      :contact_projection_(contact_projection),surface_law(law),reference(r),bulk(b),port(p),ft(strength),Gc(energy),delta_f(2*energy/strength),spacing(dp),contact_K(K),candidates(bank),active(bank.size(),0){
         if(std::min({ft,Gc,spacing,contact_K})<=0)throw std::invalid_argument("Invalid extrinsic fracture inputs");
         for(const auto&c:bank){if(c.point.empty()||c.point.size()!=c.area.size()||c.barrier.empty()||c.stress_pairs.empty()||std::abs(c.normal.norm()-1)>1e-8)throw std::invalid_argument("Invalid crack candidate bank");for(auto ij:c.stress_pairs)if(ij.first>=port.count||ij.second>=port.count)throw std::invalid_argument("Crack strength sample index");}
     }
@@ -208,7 +210,7 @@ class ExtrinsicCrackGrowth {
         contact_energy=max_penetration=0;contact_dt=std::numeric_limits<Real>::infinity();if(patches.empty()){contact_network.reset();return;}
         if(!contact_network||contact_network->sides.size()!=2*patches.size()){
             StdVec<CrackSurfaceContactNetwork::Side>sides;for(const auto&p:patches){const auto&c=candidates[p.candidate];sides.push_back({p.minus.get(),&c.area,1,p.candidate});sides.push_back({p.plus.get(),&c.area,-1,p.candidate});}
-            contact_network=std::make_unique<CrackSurfaceContactNetwork>(sides,contact_K,spacing);
+            contact_network=std::make_unique<CrackSurfaceContactNetwork>(sides,contact_K,spacing,contact_projection_);
         }
         contact_network->apply();contact_energy=contact_network->energy;max_penetration=contact_network->max_penetration;contact_dt=contact_network->stable_dt;
     }

@@ -1,5 +1,6 @@
 #pragma once
 #include "pd_fracture_visible_surface.h"
+#include "pd_crack_projection.h"
 #include <array>
 #include <unordered_map>
 #include <map>
@@ -85,13 +86,17 @@ class BilinearCrackSurface:public ReferenceSolidSurface {
  * No node deletion, friction spring, force clipping or residual cohesion.
  */
 class CrackSurfaceContactNetwork {
+    CrackProjectionBatch *projection_batch_;
+    std::vector<CrackProjectionInput> projection_inputs_;
+    std::vector<CrackProjectionResult> projection_results_;
+
  public:
     struct Side {BilinearCrackSurface*surface=nullptr;const StdVec<Real>*areas=nullptr;Real outward_sign=1;size_t reference_patch=~size_t(0);};
     StdVec<Side>sides;Real penalty,spacing;
     Real energy=0,max_penetration=0,normal_force_sum=0,stable_dt=std::numeric_limits<Real>::infinity();
     Real force_residual=0,torque_residual=0,power_residual=0,tangential_force_sum=0;
     size_t active_contacts=0,outside_projections=0,neighbor_contacts=0;StdVec<Vecd>rates;
-    explicit CrackSurfaceContactNetwork(const StdVec<Side>&s,Real K,Real dp):sides(s),penalty(K),spacing(dp){if(K<=0||dp<=0||s.empty())throw std::invalid_argument("Invalid crack-contact network");for(const auto&a:s)if(!a.surface||!a.areas||a.areas->size()!=a.surface->natural.size()||std::abs(a.outward_sign)!=1||a.surface->port.position!=s[0].surface->port.position||a.surface->port.mass!=s[0].surface->port.mass)throw std::invalid_argument("Crack-contact sides must belong to one physical material port");rates.resize(s[0].surface->port.count);}
+    explicit CrackSurfaceContactNetwork(const StdVec<Side>&s,Real K,Real dp,CrackProjectionBatch *projection_batch=nullptr):projection_batch_(projection_batch),sides(s),penalty(K),spacing(dp){if(K<=0||dp<=0||s.empty())throw std::invalid_argument("Invalid crack-contact network");for(const auto&a:s)if(!a.surface||!a.areas||a.areas->size()!=a.surface->natural.size()||std::abs(a.outward_sign)!=1||a.surface->port.position!=s[0].surface->port.position||a.surface->port.mass!=s[0].surface->port.mass)throw std::invalid_argument("Crack-contact sides must belong to one physical material port");rates.resize(s[0].surface->port.count);}
     void apply(){
         energy=max_penetration=normal_force_sum=force_residual=torque_residual=power_residual=tangential_force_sum=0;active_contacts=outside_projections=neighbor_contacts=0;for(auto&r:rates)r.setZero();
         struct Master {std::array<Vecd,4>x,v;};StdVec<Master>masters(sides.size());
@@ -102,11 +107,47 @@ class CrackSurfaceContactNetwork {
             for(size_t a=0;a<4;++a){s.kinematics(a,masters[m].x[a],masters[m].v[a]);lo=lo.cwiseMin(masters[m].x[a]);hi=hi.cwiseMax(masters[m].x[a]);}Real margin=std::max(2*spacing,(hi-lo).norm());Cell a=cell(lo-Vecd::Constant(margin)),b=cell(hi+Vecd::Constant(margin));
             for(long long i=a[0];i<=b[0];++i)for(long long j=a[1];j<=b[1];++j)for(long long k=a[2];k<=b[2];++k)grid[{i,j,k}].push_back(m);
         }
+        // Use the grid and the existing master order on both execution paths.
+        // Projection is independent of contact force assembly and trace scattering.
+        size_t next_projection=0;
+        if(projection_batch_){
+            projection_inputs_.clear();
+            for(size_t si=0;si<sides.size();++si){
+                const auto&slave=*sides[si].surface;
+                for(size_t q=0;q<slave.natural.size();++q){
+                    Vecd x,v;
+                    slave.kinematics(4+q,x,v);
+                    const auto it=grid.find(cell(x));
+                    if(it==grid.end())continue;
+                    for(size_t m:it->second){
+                        if(m==si)continue;
+                        CrackProjectionInput input;
+                        for(size_t d=0;d<3;++d){
+                            for(size_t a=0;a<4;++a)input.coordinates[a][d]=masters[m].x[a][d];
+                            input.coordinates[4][d]=x[d];
+                        }
+                        projection_inputs_.push_back(input);
+                    }
+                }
+            }
+            projection_batch_->project(projection_inputs_,projection_results_);
+            if(projection_results_.size()!=projection_inputs_.size())
+                throw std::logic_error("Crack projection backend returned an incomplete batch");
+        }
+        auto closest=[&](size_t master,const Vecd&point){
+            if(projection_batch_){
+                const auto&p=projection_results_.at(next_projection++);
+                if(p.status==0&&std::isfinite(p.s)&&std::isfinite(p.t))
+                    return BilinearCrackGeometry::Param(p.s,p.t);
+                // The scalar solver handles exceptional geometry and preserves its diagnostics.
+            }
+            return BilinearCrackGeometry::closest(masters[master].x,point);
+        };
         Vecd balance=Vecd::Zero(),moment=Vecd::Zero();Real magnitude=0,length=spacing,power=0,power_scale=0,energy_rate=0;
         for(size_t si=0;si<sides.size();++si){auto&slave=*sides[si].surface;for(size_t q=0;q<slave.natural.size();++q){Vecd x,v;slave.kinematics(4+q,x,v);Vecd tangentU=slave.position(slave.normalU(q))-x,tangentV=slave.position(slave.normalV(q))-x;Vecd outward=sides[si].outward_sign*tangentU.cross(tangentV).normalized();
                 if(!outward.allFinite())throw std::runtime_error("Slave crack normal is unresolved");auto it=grid.find(cell(x));if(it==grid.end())continue;
                 size_t chosen=sides.size();Real distance=std::numeric_limits<Real>::infinity(),gap=0;BilinearCrackGeometry::Value selected;Vecd normal;
-                for(size_t m:it->second){if(m==si)continue;auto p=BilinearCrackGeometry::closest(masters[m].x,x);if(p.minCoeff()< -1e-9||p.maxCoeff()>1+1e-9){++outside_projections;continue;}auto a=BilinearCrackGeometry::evaluate(masters[m].x,p);Vecd n=sides[m].outward_sign*a.u.cross(a.v).normalized();if(!n.allFinite())throw std::runtime_error("Master crack normal is unresolved");if(n.dot(outward)>=-1e-8)continue;Real g=n.dot(x-a.x);if(std::abs(g)<distance){distance=std::abs(g);chosen=m;gap=g;selected=a;normal=n;}}
+                for(size_t m:it->second){if(m==si)continue;auto p=closest(m,x);if(p.minCoeff()< -1e-9||p.maxCoeff()>1+1e-9){++outside_projections;continue;}auto a=BilinearCrackGeometry::evaluate(masters[m].x,p);Vecd n=sides[m].outward_sign*a.u.cross(a.v).normalized();if(!n.allFinite())throw std::runtime_error("Master crack normal is unresolved");if(n.dot(outward)>=-1e-8)continue;Real g=n.dot(x-a.x);if(std::abs(g)<distance){distance=std::abs(g);chosen=m;gap=g;selected=a;normal=n;}}
                 if(chosen==sides.size())continue;auto&master=*sides[chosen].surface;const auto&a=selected;Real stiffness=.5*penalty*sides[si].areas->at(q);Vecd residual=Vecd::Zero();if(gap<0)residual=gap*normal;
                 Eigen::Matrix2d Hp;Hp<<a.u.squaredNorm(),a.u.dot(a.v)-residual.dot(a.uv),a.u.dot(a.v)-residual.dot(a.uv),a.v.squaredNorm();Eigen::SelfAdjointEigenSolver<Eigen::Matrix2d>e(Hp);if(e.info()!=Eigen::Success||e.eigenvalues().minCoeff()<=1e-13*e.eigenvalues().maxCoeff())throw std::runtime_error("Closest crack contact tangent is not a local minimum");
                 Eigen::Matrix<Real,15,2>coupling;std::array<Real,5>c{1,-a.N[0],-a.N[1],-a.N[2],-a.N[3]};

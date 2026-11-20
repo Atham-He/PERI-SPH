@@ -54,9 +54,8 @@ add_executable(snsni_bare snsni_bare.cpp)
 target_link_libraries(snsni_bare sphinxsys_3d)
 target_compile_features(snsni_bare PRIVATE cxx_std_17)
 
-# Build the existing S-NSNI capsule entry from the canonical repository.
-# Its current model remains continuous damage; this target is not a restart
-# authorization for the unfinished physical-fracture path.
+# S-NSNI solid core coupled to the layered NOSB-PD capsule shell.
+option(PERI_SPH_CUDA_CRACK_PROJECTION "Build FP64 CUDA crack projection for the S-NSNI capsule" OFF)
 set(SNSNI_CAPSULE_HASHES "${ASSEMBLY_HASH};${MATERIAL_HASH}")
 foreach(SNSNI_FILE
         ${CMAKE_CURRENT_SOURCE_DIR}/pd_snsni_capsule.cpp
@@ -65,6 +64,8 @@ foreach(SNSNI_FILE
         ${PERI_SHARED}/particle_dynamics/solid_dynamics/solid_snsni_plastic.h
         ${PERI_SHARED}/peridynamics/pd_radial_layered_surface.h
         ${PERI_SHARED}/peridynamics/pd_column_face_surface.h
+        ${PERI_SHARED}/peridynamics/pd_crack_projection.h
+        ${PERI_SHARED}/peridynamics/pd_crack_projection_cuda.cu
         ${PERI_SHARED}/peridynamics/diffuse_crack_release.h)
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${SNSNI_FILE})
     file(SHA256 ${SNSNI_FILE} SNSNI_FILE_HASH)
@@ -74,6 +75,16 @@ string(SHA256 SNSNI_CAPSULE_HASH "${SNSNI_CAPSULE_HASHES}")
 add_executable(pd_snsni_capsule pd_snsni_capsule.cpp)
 target_link_libraries(pd_snsni_capsule sphinxsys_3d)
 target_compile_features(pd_snsni_capsule PRIVATE cxx_std_17)
+if(PERI_SPH_CUDA_CRACK_PROJECTION)
+    if(SPHINXSYS_USE_SYCL OR SPHINXSYS_USE_FLOAT)
+        message(FATAL_ERROR "PERI_SPH_CUDA_CRACK_PROJECTION requires the FP64 host build")
+    endif()
+    enable_language(CUDA)
+    target_sources(pd_snsni_capsule PRIVATE ${PERI_SHARED}/peridynamics/pd_crack_projection_cuda.cu)
+    set_target_properties(pd_snsni_capsule PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED YES)
+    target_compile_options(pd_snsni_capsule PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+    target_compile_definitions(pd_snsni_capsule PRIVATE PERI_SPH_CUDA_CRACK_PROJECTION=1)
+endif()
 target_compile_definitions(pd_snsni_capsule PRIVATE
     CAPSULE_SOURCE_SHA256="${SNSNI_CAPSULE_HASH}"
     DPC_MATERIAL_SHA256="${MATERIAL_HASH}")

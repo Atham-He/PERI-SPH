@@ -115,6 +115,12 @@ def run(a):
             raise RuntimeError('Affine crack contact requires a matched contact-only preflight')
         identity['crack_contact_interpolation']='affine'
         identity['checkpoint_schema']+=2
+    if a.affine_inner_interface:
+        if (not a.affine_crack_contact or a.column_tied_interface or preflight.get('affine_inner_interface') is not True
+                or '--affine-inner-interface' not in preflight_manifest.get('argv',[])):
+            raise RuntimeError('Affine inner interface requires a matched affine contact preflight')
+        identity['inner_shell_interpolation']='affine'
+        identity['checkpoint_schema']=10
     # A PASSED file from an earlier executable/input cannot authorize a new run.
     for name,path in [('binary_sha256',binary),('config_sha256',cfg),('DPC_table_sha256',material),('core_cache_sha256',cache),('crack_bank_sha256',bank)]:
         if preflight_manifest.get(name)!=sha(path):raise RuntimeError('Coupled preflight identity mismatch: '+name)
@@ -168,6 +174,7 @@ def run(a):
         if a.column_tied_interface:cmd.append('--column-tied-interface')
         if a.fracture_contact_only:cmd.append('--fracture-contact-only')
         if a.affine_crack_contact:cmd.append('--affine-crack-contact')
+        if a.affine_inner_interface:cmd.append('--affine-inner-interface')
         if a.local_platen_step_bound:cmd.append('--local-platen-step-bound')
         if a.checkpoint_wall_seconds is not None:cmd.append('--checkpoint-wall-seconds='+str(a.checkpoint_wall_seconds))
         if checkpoint is None:cmd.append('--checkpoint-stop-after-equilibrium')
@@ -184,7 +191,7 @@ def run(a):
                     state={'recorded_UTC':utc(),'status':'RUNNING','owner':owner,'native':native,'segment':segment,'output':str(output),'latest_progress':row(output/'progress.csv'),'latest_equilibrium':row(output/'equilibria.csv'),'source_commit':identity['source_commit'],'fingerprint':fingerprint,'capsule_running':True}
                     put(root/'owner_progress.json',state)
                     validation=output/'resume_validation.json'
-                    handoff=output/'affine_crack_contact_handoff.json'
+                    handoff=output/('affine_inner_interface_handoff.json' if a.affine_inner_interface else 'affine_crack_contact_handoff.json')
                     if a.affine_crack_contact and inherited and validation.exists() and handoff.exists():
                         change=json.loads(handoff.read_text())
                         if change['status']=='PASSED' and 'trajectory_end_s' not in inherited[-1]:
@@ -223,6 +230,7 @@ if __name__=='__main__':
     p.add_argument('--checkpoint-wall-seconds',type=int,help='minimum wall seconds between periodic checkpoints (default: 600)')
     p.add_argument('--fracture-contact-only',action='store_true')
     p.add_argument('--affine-crack-contact',action='store_true')
+    p.add_argument('--affine-inner-interface',action='store_true')
     p.add_argument('--local-platen-step-bound',action='store_true',help='check the platen step limit using the potentially contacting traces')
     a=p.parse_args()
     if a.checkpoint_wall_seconds is not None and a.checkpoint_wall_seconds<=0:

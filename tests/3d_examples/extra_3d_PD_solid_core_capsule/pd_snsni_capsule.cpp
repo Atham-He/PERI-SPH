@@ -16,6 +16,7 @@ using Field=StdVec<Vecd>;
 std::string fracture_bank_input;
 bool use_column_interface=false,column_handoff_only=false,local_platen_step_bound=false,fracture_contact_only=false;
 bool affine_crack_contact=false,affine_contact_handoff_only=false;
+bool affine_inner_interface=false,inner_interface_handoff_only=false;
 
 class SnsniCoupledSurface:public ReferenceSolidSurface
 {
@@ -109,13 +110,27 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells)
     auto anchors=[&](const StdVec<Vecd>&targets){StdVec<size_t>ids;for(const auto&q:targets){auto c=cell(q);Real best=std::numeric_limits<Real>::infinity();size_t owner=sn;
         for(int a=-1;a<=1;++a)for(int b=-1;b<=1;++b)for(int d=-1;d<=1;++d){auto it=grid.find(Cell{c[0]+a,c[1]+b,c[2]+d});if(it!=grid.end())for(size_t j:it->second){Real r=(sX[j]-q).squaredNorm();if(r<best){best=r;owner=j;}}}
         if(owner==sn)throw std::runtime_error("No shell material owner for interface/plate trace");ids.push_back(owner);}return ids;};
-    auto si=std::make_unique<VisibleCrackSurface>(pd_port,points,anchors(points),sr,o.pd_spacing,o.interface_shell_support,2,Field{},Field{},Field{},VisibleCrackSurface::AnchorOwnership::ReferencePoint);
+    Field inner_affine_positions;
+    const auto inner_anchors=anchors(points);
+    auto makeInnerSurface=[&](bool affine,const Field&target,const Field&velocity){
+        using Ownership=VisibleCrackSurface::AnchorOwnership;
+        using Transfer=VisibleCrackSurface::TransferOrder;
+        return std::make_unique<VisibleCrackSurface>(pd_port,points,inner_anchors,sr,o.pd_spacing,o.interface_shell_support,
+            affine?1:2,Field{},target,velocity,Ownership::ReferencePoint,
+            affine?Transfer::AllowAffinePositionTransfer:Transfer::PreservePolynomial,affine?&inner_affine_positions:nullptr);
+    };
+    auto si=makeInnerSurface(affine_inner_interface&&recovery::checkpoint.resume.empty(),{},{});
     VisibleCrackSurface so(pd_port,outer_points,anchors(outer_points),sr,o.pd_spacing,o.interface_shell_support,2,
                            {},{},{},VisibleCrackSurface::AnchorOwnership::ReferencePoint,
                            VisibleCrackSurface::TransferOrder::AllowAffinePositionTransfer);
     Real Eref=o.constraint_E>0?o.constraint_E:o.core_E,Ktie=o.tie_factor*Eref/o.spacing,Kcontact=o.contact_factor*Eref/o.spacing;
     auto cs=std::make_unique<SnsniCoupledSurface>(core_port,points,cr);
     auto tie=std::make_unique<BondedSolidInterface>(*si,*cs,areas,Ktie,R);
+    auto installAffineInner=[&](const Field&targets,const Field&velocities){
+        auto next=makeInnerSurface(true,targets,velocities);
+        tie=std::make_unique<BondedSolidInterface>(*next,*cs,areas,Ktie,R);
+        si=std::move(next);
+    };
     StdVec<Real>outer_areas(outer_points.size(),4*Pi*R*R/outer_points.size());
     std::unique_ptr<ColumnFaceSolidSurface> column_surface;
     std::unique_ptr<SnsniCoupledSurface> column_core;
@@ -166,7 +181,7 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells)
     if(o.preflight_only){Field d(count),v(count);Matd A=Matd::Identity();A(0,0)=.998;A(1,1)=1.001;A(2,2)=.999;for(size_t j=0;j<count;++j){d[j]=(A-Matd::Identity())*X[j];if(j<cn)d[j]+=Vecd(5e-8*rc/.0005,0,0);v[j]=Vecd(.2*std::sin(37*X[j][0]/R),-.1,.3*X[j][2]/R);}forceAt(d,v,.004*2*R,false);
         Real affine=0,native=0;for(size_t l=0;l<cr.cells.size();++l){affine=std::max(affine,(cb.F[l]-A).norm());auto a=cb.model.update(cb.F[l],cb.history[l]);native=std::max(native,(a.sigma-cb.pending[l].material.sigma).norm());}for(size_t j=0;j<sn;++j)affine=std::max(affine,(sF[j]-A).norm());
         Real power=0;for(size_t j=0;j<cn;++j)power+=core_port.external[j].dot(v[j]);for(size_t j=0;j<sn;++j)power+=sm[j]*pd_port.external[j].dot(v[cn+j]);Real eps=1e-12;Field plus=d,minus=d;for(size_t j=0;j<count;++j){plus[j]+=eps*v[j];minus[j]-=eps*v[j];}forceAt(plus,v,.004*2*R,false);Real ep=tie->energy+contact.energy;forceAt(minus,v,.004*2*R,false);Real em=tie->energy+contact.energy;Real derivative=(ep-em)/(2*eps),error=std::abs(derivative+power)/std::max({Real(1e-20),std::abs(derivative),std::abs(power)});bool pass=affine<1e-8&&native==0&&error<1e-5;
-        std::ofstream f(out/"preflight.json");f<<std::setprecision(17)<<"{\"status\":\""<<(pass?"PASSED":"FAILED")<<"\",\"affine_F_error\":"<<affine<<",\"native_DPC_stress_difference_Pa\":"<<native<<",\"constraint_energy_gradient_relative_error\":"<<error<<",\"fracture_contact_only\":"<<(fracture_contact_only?"true":"false")<<",\"affine_crack_contact\":"<<(affine_crack_contact?"true":"false")<<",\"physical_histories_advanced\":0}\n";return pass?0:2;}
+        std::ofstream f(out/"preflight.json");f<<std::setprecision(17)<<"{\"status\":\""<<(pass?"PASSED":"FAILED")<<"\",\"affine_F_error\":"<<affine<<",\"native_DPC_stress_difference_Pa\":"<<native<<",\"constraint_energy_gradient_relative_error\":"<<error<<",\"fracture_contact_only\":"<<(fracture_contact_only?"true":"false")<<",\"affine_crack_contact\":"<<(affine_crack_contact?"true":"false")<<",\"affine_inner_interface\":"<<(affine_inner_interface?"true":"false")<<",\"physical_histories_advanced\":0}\n";return pass?0:2;}
     std::ofstream progress(out/"progress.csv"),eq(out/"equilibria.csv"),events(out/"fracture_events.csv");
     const char*header="step,stage,elapsed_s,strain,compression_m,dt_s,upper_N,lower_N,force_residual,plate_imbalance,kinetic_ratio,core_min_J,shell_min_J,broken_bond_pairs,crack_facets,failed_cohesive_quadrature,max_crack_gap_m,cohesive_stored_J,fracture_work_J,shell_stored_J,interface_energy_J,contact_energy_J,crack_contact_energy_J,max_penetration_m,platen_work_J,core_internal_work_J,damping_loss_J,cohesive_algorithmic_loss_J,stabilizer_transfer_loss_J,insertion_defect_J,mechanical_budget_J\n";
     progress<<std::setprecision(17)<<header;eq<<std::setprecision(17)<<header;events<<std::setprecision(17)<<"event,step,stage,strain,candidate,strength_ratio,broken_bond_pairs,max_gap_m\n";
@@ -200,8 +215,20 @@ std::vector<std::pair<Real,std::string>>frame_index;
     if(recovery::checkpoint.resume.empty())snapshot("0",0);
     auto refresh=[&](){if(si){si->rebuildChanged();tie->refreshTimeStepBound();}so.rebuildChanged();contact.refreshTimeStepBound();};
     StdVec<Vecd>old_si_transfer,old_so_transfer,old_si_velocity,old_so_velocity;
-    auto prepareTransfer=[&](){if(si){old_si_transfer=si->transferValues();old_si_velocity=si->transferVelocities();si->captureTransferValues();}old_so_transfer=so.transferValues();old_so_velocity=so.transferVelocities();so.captureTransferValues();};
-    auto rollbackTransfer=[&](){if(si)si->restoreTransferValues(old_si_transfer,old_si_velocity);so.restoreTransferValues(old_so_transfer,old_so_velocity);};
+    Field previous_inner_affine_positions;
+    bool surface_transfer_prepared=false;
+    auto prepareTransfer=[&](){
+        if(si){old_si_transfer=si->transferValues();old_si_velocity=si->transferVelocities();si->captureTransferValues();}
+        old_so_transfer=so.transferValues();old_so_velocity=so.transferVelocities();so.captureTransferValues();
+        previous_inner_affine_positions=std::move(inner_affine_positions);
+        surface_transfer_prepared=true;
+    };
+    auto rollbackTransfer=[&](){
+        if(!surface_transfer_prepared)return;
+        inner_affine_positions=std::move(previous_inner_affine_positions);
+        if(si)si->restoreTransferValues(old_si_transfer,old_si_velocity);
+        so.restoreTransferValues(old_so_transfer,old_so_velocity);
+    };
     auto eventEnergy=[&](){assembleShellAndConstraints(compression(stage_time));growth.statistics(growth.positions());return recoverable();};
     using CrackArchive=FractureTopologyCheckpoint;std::vector<uint64_t>point_ids(sn);for(size_t j=0;j<sn;++j)point_ids[j]=j;
     auto transfer=[&](recovery::Archive&a){
@@ -239,12 +266,19 @@ std::vector<std::pair<Real,std::string>>frame_index;
                 throw std::runtime_error("Invalid affine crack contact checkpoint transfer state");
             growth.affine_contact_traces=true;
         }
+        if(version>=10){
+            a.value(inner_affine_positions);
+            if(!affine_inner_interface||(!inner_affine_positions.empty()&&inner_affine_positions.size()!=sn)||
+                std::any_of(inner_affine_positions.begin(),inner_affine_positions.end(),[](const Vecd&q){return !q.allFinite();}))
+                throw std::runtime_error("Invalid affine core-shell checkpoint transfer state");
+        }
         if(a.reading){CrackArchive::load(sr,bytes,recovery::checkpoint.fingerprint,point_ids,history);
             if(fracture_contact_only&&version<6&&sr.physical_broken_bonds!=0)
                 throw std::runtime_error("The original checkpoint already contains broken bonds");
             if(saved_gradient.size()!=sn||!std::isfinite(saved_elastic_dt)||saved_elastic_dt<=0)throw std::runtime_error("Checkpoint live-operator dimensions/bound");
             for(size_t i=0;i<sn;++i){if(saved_gradient[i].size()!=sr.rows[i].size())throw std::runtime_error("Checkpoint live-operator row count");Matd affine=Matd::Zero();for(size_t k=0;k<sr.rows[i].size();++k){const auto&g=saved_gradient[i][k];if(!g.allFinite()||(!sr.live(i,k)&&g.squaredNorm()!=0))throw std::runtime_error("Invalid checkpoint live gradient");sr.rows[i][k].gradient=g;affine+=(sX[sr.rows[i][k].j]-sX[i])*g.transpose();}if((affine-Matd::Identity()).norm()>1e-8)throw std::runtime_error("Checkpoint live operator lost affine completeness");}sr.elastic_dt_bound=saved_elastic_dt;
-            if(si)si->restoreTransferValues(inner_transfer,inner_velocity);
+            if(version>=10)installAffineInner(inner_transfer,inner_velocity);
+            else if(si)si->restoreTransferValues(inner_transfer,inner_velocity);
             else if(!inner_transfer.empty()||!inner_velocity.empty())throw std::runtime_error("Fixed-column restart includes a dynamic inner trace");
             so.restoreTransferValues(outer_transfer,outer_velocity);growth.restorePatches(order,history.imex[0].history,minus_transfer,plus_transfer,minus_velocity,plus_velocity);if(traction.size()!=growth.history.size())throw std::runtime_error("Checkpoint adhesion-traction dimensions");growth.last_traction=std::move(traction);if(candidate_flags.size()!=growth.active.size())throw std::runtime_error("Checkpoint candidate-state dimensions");for(size_t k=0;k<candidate_flags.size();++k){if(candidate_flags[k]>2||(candidate_flags[k]==1)!=(growth.active[k]==1))throw std::runtime_error("Checkpoint candidate-state mismatch");}growth.active=std::move(candidate_flags);sb.rebuild();refresh();}
         if(time.displacement.size()!=count||cb.history.size()!=cr.cells.size())throw std::runtime_error("Checkpoint geometry mismatch");
@@ -396,13 +430,74 @@ std::vector<std::pair<Real,std::string>>frame_index;
             if(!pass)throw std::runtime_error("Affine crack-contact handoff failed geometry, contact, or time-step verification");
             for(size_t j=0;j<count;++j)time.acceleration[j]=bulk_force[j]/mass[j];
         }
+        if(affine_inner_interface&&recovery::checkpoint.read_version<10){
+            const Real u=compression(stage_time),upper=contact.upper,lower=contact.lower,reaction=.5*(upper+lower);
+            const Real old_dt=tie->stable_dt,old_energy=tie->energy,old_gap=tie->max_gap,crack_gap=growth.max_gap;
+            const Real old_weight=si->maximum_weight_l1;
+            const Real plate_dt=local_platen_step_bound?boundRows(nullptr,u):contact.stable_dt;
+            const Real shell_dt=sb.finiteStrainTimeStep();
+            auto stableStep=[&](Real interface_dt){
+                Real rate=1/(core_dt*core_dt)+1/(shell_dt*shell_dt)+1/(sb.stabilizer_dt*sb.stabilizer_dt)
+                    +1/(interface_dt*interface_dt)+1/(plate_dt*plate_dt);
+                if(std::isfinite(growth.contact_dt))rate+=1/(growth.contact_dt*growth.contact_dt);
+                return std::min({o.max_dt,1/std::sqrt(rate),cb.acoustic_dt,radial_dt});
+            };
+            const Field old_positions=tie->x_a,old_forces=tie->force_a;
+            const size_t old_commits=cb.commits;
+            inner_affine_positions.assign(sx,sx+sn);
+            installAffineInner(old_positions,{});
+            assembleShellAndConstraints(u);
+            growth.statistics(growth.positions());
+            Real position_change=0,force_change=0,force_scale=0,redistribution=0,new_residual=0;
+            for(size_t i=0;i<old_positions.size();++i){
+                position_change=std::max(position_change,(tie->x_a[i]-old_positions[i]).norm());
+                force_change=std::max(force_change,(tie->force_a[i]-old_forces[i]).norm());
+                force_scale=std::max(force_scale,old_forces[i].norm());
+            }
+            for(size_t j=0;j<count;++j){
+                redistribution+=(bulk_force[j]-expected[j]).squaredNorm();
+                new_residual+=bulk_force[j].squaredNorm();
+            }
+            const Real scale_N=std::max(reaction,Real(1e-30));
+            redistribution=std::sqrt(redistribution)/scale_N;
+            new_residual=std::sqrt(new_residual)/scale_N;
+            const Real force_error=force_change/std::max(force_scale,1e-10*scale_N);
+            const Real energy_error=std::abs(tie->energy-old_energy)/std::max(old_energy,1e-22*scale_N);
+            const Real reaction_error=std::max(std::abs(contact.upper-upper),std::abs(contact.lower-lower))/scale_N;
+            const Real old_step=stableStep(old_dt),new_step=stableStep(tie->stable_dt);
+            const bool pass=position_change<=1e-12&&std::abs(growth.max_gap-crack_gap)<=1e-12&&force_error<=.01&&
+                energy_error<=.01&&reaction_error<=.01&&tie->force_residual<=1e-8&&tie->torque_residual<=1e-8&&
+                tie->power_residual<=1e-8&&new_step>old_step&&new_residual<=o.force_tolerance&&cb.commits==old_commits;
+            std::ofstream audit(out/"affine_inner_interface_handoff.json");
+            audit<<std::setprecision(17)<<"{\"status\":\""<<(pass?"PASSED":"FAILED")<<"\",\"step\":"<<time.steps
+                <<",\"strain\":"<<u/o.diameter<<",\"elapsed_s\":"<<elapsed<<",\"old_reaction_N\":"<<reaction
+                <<",\"new_reaction_N\":"<<.5*(contact.upper+contact.lower)<<",\"reaction_relative_error\":"<<reaction_error
+                <<",\"old_interface_gap_m\":"<<old_gap<<",\"new_interface_gap_m\":"<<tie->max_gap
+                <<",\"maximum_interface_position_change_m\":"<<position_change
+                <<",\"maximum_interface_force_change_N\":"<<force_change<<",\"interface_force_relative_error\":"<<force_error
+                <<",\"old_interface_energy_J\":"<<old_energy<<",\"new_interface_energy_J\":"<<tie->energy
+                <<",\"interface_energy_relative_error\":"<<energy_error
+                <<",\"interface_force_balance_residual\":"<<tie->force_residual
+                <<",\"interface_torque_balance_residual\":"<<tie->torque_residual
+                <<",\"interface_power_residual\":"<<tie->power_residual
+                <<",\"nodal_force_redistribution_over_reaction\":"<<redistribution<<",\"new_force_residual\":"<<new_residual
+                <<",\"old_crack_gap_m\":"<<crack_gap<<",\"new_crack_gap_m\":"<<growth.max_gap
+                <<",\"old_max_inner_weight_l1\":"<<old_weight<<",\"new_max_inner_weight_l1\":"<<si->maximum_weight_l1
+                <<",\"inner_horizon_fallback_rows\":"<<si->extended_position_fallback_points
+                <<",\"old_interface_dt_s\":"<<old_dt<<",\"new_interface_dt_s\":"<<tie->stable_dt
+                <<",\"old_combined_dt_s\":"<<old_step<<",\"new_combined_dt_s\":"<<new_step
+                <<",\"material_steps_advanced\":"<<cb.commits-old_commits<<"}\n";
+            if(!pass)throw std::runtime_error("Affine core-shell handoff failed force, work, gap or time-step verification");
+            for(size_t j=0;j<count;++j)time.acceleration[j]=bulk_force[j]/mass[j];
+        }
         cohesive_force=growth.cohesiveForces(growth.positions());snapshot("resumed",compression(stage_time));
         std::ofstream receipt(out/"resume_validation.json");receipt<<std::setprecision(17)<<"{\"status\":\"PASSED\",\"step\":"<<time.steps<<",\"strain\":"<<compression(stage_time)/o.diameter<<",\"force_relative_error\":"<<error/std::max(scale,Real(1e-20))<<",\"core_commits\":"<<cb.commits<<",\"kinetic_energy_J\":"<<time.kinetic()<<",\"loading_history_reset\":false}\n";}
     save();
-    if(column_handoff_only||affine_contact_handoff_only)return 0;
+    if(column_handoff_only||affine_contact_handoff_only||inner_interface_handoff_only)return 0;
 
     while(stage<=o.load_steps){size_t prior_stage=stage,prior_cracks=growth.insertion_events;
         if(time.steps%50==0){for(size_t event=0;event<bank.size();++event){size_t k=growth.select();if(k==bank.size())break;
+            surface_transfer_prepared=false;
             Real ratio=growth.strengthRatio(k);size_t prior_core_commits=cb.commits;bool inserted=growth.insert(k,false,refresh,eventEnergy,prepareTransfer,rollbackTransfer);if(cb.commits!=prior_core_commits)throw std::runtime_error("Topology event advanced frozen core material history");
             if(!inserted&&!growth.last_candidate_unresolved){snapshot("stopped_before_rejected_crack",compression(stage_time));save();throw std::runtime_error("Capsule physical insertion rejected: "+growth.last_rejection);}
             if(inserted){onset=true;cohesive_force=growth.cohesiveForces(growth.positions());events<<(fracture_contact_only?"strength_triggered_bond_deletion":"new_cohesive_crack")<<','<<time.steps<<','<<stage<<','<<compression(stage_time)/o.diameter<<','<<bank[k].id<<','<<ratio<<','<<sr.physical_broken_bonds<<','<<growth.max_gap<<'\n';events.flush();
@@ -493,7 +588,7 @@ std::vector<std::pair<Real,std::string>>frame_index;
 
 int main(int argc,char**argv)
 {
-    try{recovery::checkpoint.schema_version=4;std::string cells;std::vector<char*>args{argv[0]};for(int i=1;i<argc;++i){std::string a=argv[i];if(a.rfind("--snsni-cells=",0)==0)cells=a.substr(14);else if(a.rfind("--fracture-facets=",0)==0)fracture_bank_input=a.substr(18);else if(a=="--column-tied-interface")use_column_interface=true;else if(a=="--column-interface-handoff-only")column_handoff_only=true;else if(a=="--local-platen-step-bound")local_platen_step_bound=true;else if(a=="--fracture-contact-only")fracture_contact_only=true;else if(a=="--affine-crack-contact")affine_crack_contact=true;else if(a=="--affine-contact-handoff-only")affine_contact_handoff_only=true;else if(recovery::checkpoint.take(a)){}else args.push_back(argv[i]);}
+    try{recovery::checkpoint.schema_version=4;std::string cells;std::vector<char*>args{argv[0]};for(int i=1;i<argc;++i){std::string a=argv[i];if(a.rfind("--snsni-cells=",0)==0)cells=a.substr(14);else if(a.rfind("--fracture-facets=",0)==0)fracture_bank_input=a.substr(18);else if(a=="--column-tied-interface")use_column_interface=true;else if(a=="--column-interface-handoff-only")column_handoff_only=true;else if(a=="--local-platen-step-bound")local_platen_step_bound=true;else if(a=="--fracture-contact-only")fracture_contact_only=true;else if(a=="--affine-crack-contact")affine_crack_contact=true;else if(a=="--affine-contact-handoff-only")affine_contact_handoff_only=true;else if(a=="--affine-inner-interface")affine_inner_interface=true;else if(a=="--inner-interface-handoff-only")inner_interface_handoff_only=true;else if(recovery::checkpoint.take(a)){}else args.push_back(argv[i]);}
         if(use_column_interface){recovery::checkpoint.schema_version=5;recovery::checkpoint.compatible_read_version=4;}
         if(fracture_contact_only){
             recovery::checkpoint.compatible_read_version=recovery::checkpoint.schema_version;
@@ -504,6 +599,14 @@ int main(int argc,char**argv)
             recovery::checkpoint.compatible_read_version=recovery::checkpoint.schema_version;
             recovery::checkpoint.schema_version+=2;
         }
+        if(affine_inner_interface){
+            if(!affine_crack_contact||use_column_interface)
+                throw std::invalid_argument("Affine inner interface requires the affine crack-contact model with dynamic shell-side traces");
+            recovery::checkpoint.compatible_read_version=recovery::checkpoint.schema_version;
+            recovery::checkpoint.schema_version=10;
+        }
+        if(inner_interface_handoff_only&&(!affine_inner_interface||recovery::checkpoint.resume.empty()))
+            throw std::invalid_argument("Inner interface handoff audit requires a saved state and --affine-inner-interface");
         if(affine_contact_handoff_only&&(!affine_crack_contact||recovery::checkpoint.resume.empty()))
             throw std::invalid_argument("Affine contact handoff audit requires a saved state and --affine-crack-contact");
         if(column_handoff_only&&(!use_column_interface||recovery::checkpoint.resume.empty()))

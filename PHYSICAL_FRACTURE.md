@@ -102,6 +102,15 @@ position field. Later cuts continue the ordinary topology transfer.
 `--affine-contact-handoff-only` inspects one saved state and exits before
 advancing the load.
 
+With `--affine-inner-interface`, the bonded interface uses an affine
+one-sided trace on the inner shell with the same core interpolation and
+quadrature. An affine crack-contact checkpoint first restores its original
+forces. The trace is then rebuilt to preserve the current physical
+interface points and their penalty forces. The handoff records the change
+in nodal force distribution, the total energy, the measured opening and
+the stable step. `--inner-interface-handoff-only` restores and checks the
+same saved loading state without advancing it.
+
 A cohesive checkpoint can initialize this option only while the shell is
 intact. Any cut or active cohesive history is rejected by the native reader.
 Checkpoints written in the contact-only mode can resume their own history.

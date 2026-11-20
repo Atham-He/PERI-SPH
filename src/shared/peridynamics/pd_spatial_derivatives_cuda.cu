@@ -53,6 +53,59 @@ struct AdjointContribution
     int sign;
 };
 
+__global__ void evaluateWeightedDifferences(const std::size_t *offsets, const std::size_t *neighbors,
+                                            const std::size_t *origins, const WeightedDifferenceEntry *weights,
+                                            const ParticleVector3 *particles, std::size_t rows,
+                                            ParticleVector3 *edge_forces, ParticleVector3 *row_energies)
+{
+    const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const auto row = index / 3;
+    const auto axis = index % 3;
+    if (row >= rows)
+        return;
+
+    const double origin = particles[origins[row]].component[axis];
+    double fit[9]{};
+    for (auto entry = offsets[row]; entry < offsets[row + 1]; ++entry)
+    {
+        const double difference = particles[neighbors[entry]].component[axis] - origin;
+        for (int term = 0; term < 9; ++term)
+            fit[term] += difference * weights[entry].coefficient[term];
+    }
+
+    double energy = 0.0;
+    for (auto entry = offsets[row]; entry < offsets[row + 1]; ++entry)
+    {
+        double prediction = 0.0;
+        for (int term = 0; term < 9; ++term)
+            prediction += fit[term] * weights[entry].basis[term];
+
+        const double residual = (particles[neighbors[entry]].component[axis] - origin) - prediction;
+        energy += weights[entry].energy_weight * residual * residual;
+        edge_forces[entry].component[axis] = weights[entry].force_weight * residual;
+    }
+    row_energies[row].component[axis] = energy;
+}
+
+__global__ void gatherWeightedDifferenceForces(const std::size_t *offsets, const AdjointContribution *entries,
+                                               const ParticleVector3 *edge_forces, std::size_t particle_count,
+                                               ParticleVector3 *forces)
+{
+    const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const auto particle = index / 3;
+    const auto axis = index % 3;
+    if (particle >= particle_count)
+        return;
+
+    double force = 0.0;
+    for (auto i = offsets[particle]; i < offsets[particle + 1]; ++i)
+    {
+        const auto entry = entries[i];
+        force -= entry.sign * edge_forces[entry.entry].component[axis];
+    }
+    forces[particle].component[axis] = force;
+}
+
 template <bool second_order>
 __global__ void assembleSpatialAdjoint(const std::size_t *offsets, const AdjointContribution *entries,
                                        const ParticleVector3 *gradients, const ShapeHessian3 *hessians,
@@ -108,6 +161,9 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
             (!map.hessians.empty() && map.hessians.size() != entries))
             throw std::invalid_argument("Invalid spatial derivative stencil");
         const auto rows = map.offsets.size() - 1;
+        if (!map.weighted_differences.empty() &&
+            (map.weighted_differences.size() != entries || map.origins.empty()))
+            throw std::invalid_argument("Weighted differences require one fit per stencil entry and a row origin");
         if (!map.origins.empty() && map.origins.size() != rows)
             throw std::invalid_argument("Invalid spatial derivative origins");
         for (auto node : map.neighbors)
@@ -123,20 +179,25 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
         upload(origins_, map.origins, "spatial derivative origins");
         upload(gradients_, map.gradients, "reference gradients");
         upload(hessians_, map.hessians, "reference Hessians");
+        upload(weighted_differences_, map.weighted_differences, "reference weighted differences");
         configureAdjoint(map);
         particle_count_ = map.particle_count;
         rows_ = rows;
         use_origins_ = !map.origins.empty();
         use_hessians_ = !map.hessians.empty();
         add_identity_ = map.add_identity;
+        weighted_differences_count_ = map.weighted_differences.size();
         configured_ = true;
     }
 
     void evaluate(const std::vector<ParticleVector3> &particles,
-                  std::vector<SpatialDerivatives3> &result) override
+                  std::vector<SpatialDerivatives3> &result,
+                  WeightedDifferenceResult *weighted_difference) override
     {
         if (!configured_ || particles.size() != particle_count_)
             throw std::invalid_argument("Particle field does not match the spatial derivative stencil");
+        if (weighted_difference && weighted_differences_count_ == 0)
+            throw std::invalid_argument("Stencil has no weighted difference fit");
         result.resize(rows_);
         if (rows_ == 0)
             return;
@@ -154,6 +215,8 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
                 offsets_.get(), neighbors_.get(), origins, gradients_.get(), nullptr,
                 particles_.get(), add_identity_, rows_, result_.get());
         check(cudaGetLastError(), "spatial derivative evaluation");
+        if (weighted_difference)
+            evaluateWeightedDifference(*weighted_difference);
         download(result, result_, "spatial derivative results");
     }
 
@@ -188,6 +251,31 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
         if (blocks > max_blocks_)
             throw std::length_error("Spatial derivative batch exceeds the device grid");
         return static_cast<unsigned int>(blocks);
+    }
+
+    void evaluateWeightedDifference(WeightedDifferenceResult &result)
+    {
+        edge_forces_.reserve(weighted_differences_count_);
+        row_energies_.reserve(rows_);
+        weighted_forces_.reserve(particle_count_);
+        evaluateWeightedDifferences<<<grid(rows_), threads>>>(
+            offsets_.get(), neighbors_.get(), origins_.get(), weighted_differences_.get(), particles_.get(),
+            rows_, edge_forces_.get(), row_energies_.get());
+        check(cudaGetLastError(), "evaluate weighted difference fit");
+        gatherWeightedDifferenceForces<<<grid(particle_count_), threads>>>(
+            adjoint_offsets_.get(), adjoint_entries_.get(), edge_forces_.get(), particle_count_, weighted_forces_.get());
+        check(cudaGetLastError(), "gather weighted difference forces");
+
+        host_energies_.resize(rows_);
+        download(host_energies_, row_energies_, "weighted difference energies");
+        result.energy_density.resize(rows_);
+        for (std::size_t row = 0; row < rows_; ++row)
+        {
+            const auto &energy = host_energies_[row].component;
+            result.energy_density[row] = energy[0] + energy[1] + energy[2];
+        }
+        result.forces.resize(particle_count_);
+        download(result.forces, weighted_forces_, "weighted difference forces");
     }
 
     void configureAdjoint(const SpatialDerivativeMap &map)
@@ -228,6 +316,10 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
     DeviceBuffer<std::size_t> adjoint_offsets_;
     DeviceBuffer<AdjointContribution> adjoint_entries_;
     DeviceBuffer<ParticleVector3> adjoint_result_;
+    std::size_t weighted_differences_count_ = 0;
+    DeviceBuffer<WeightedDifferenceEntry> weighted_differences_;
+    DeviceBuffer<ParticleVector3> edge_forces_, row_energies_, weighted_forces_;
+    std::vector<ParticleVector3> host_energies_;
 };
 }
 

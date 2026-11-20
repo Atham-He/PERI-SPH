@@ -29,6 +29,7 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
     }
     void rebuild() {
         derivative_stencil_current_ = false;
+        device_residual_current_ = false;
         if(reference.topologyPending())throw std::runtime_error("Rebuild the layered gradient before its live residual");
         using namespace peridynamics::layered_detail;size_t count=particles_->TotalRealParticles();projection.resize(count);residual_order.resize(count);maximum_projection_error=0;StdVec<Real>rate(count,0);
         for(size_t i=0;i<count;++i){
@@ -48,7 +49,13 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
         Real largest=0;for(Real a:rate)largest=std::max(largest,a);stabilizer_dt=largest>0?.2/std::sqrt(largest):std::numeric_limits<Real>::infinity();version=reference.topology_version;
     }
     bool hasDeviceDerivatives() const noexcept { return derivatives_ != nullptr; }
-    void evaluate(size_t i) { evaluatePoint(i, nullptr); }
+    // Batched evaluation is required when a device backend owns the force field.
+    void evaluate(size_t i)
+    {
+        if (derivatives_)
+            throw std::logic_error("Use evaluateAll for the device live residual");
+        evaluatePoint(i, nullptr);
+    }
 
     void evaluateAll()
     {
@@ -61,30 +68,57 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
         {
             evaluatePoint(i, derivatives_ ? &device_derivatives_[i] : nullptr);
         });
+        device_residual_current_ = derivatives_ != nullptr;
     }
 
   private:
     void evaluatePoint(size_t i, const peridynamics::SpatialDerivatives3 *derivatives)
     {
-        if(version!=reference.topology_version)throw std::runtime_error("Live elastic residual not rebuilt after bond topology change");reference.checkIntact(i);A39 A=A39::Zero();Matd f=Matd::Zero();
+        if (version != reference.topology_version)
+            throw std::runtime_error("Live elastic residual not rebuilt after bond topology change");
+        reference.checkIntact(i);
+        Matd f = Matd::Zero();
+        Real hg = 0;
         if (derivatives)
+        {
             for (int a = 0; a < 3; ++a)
                 for (int b = 0; b < 3; ++b)
                     f(a, b) = derivatives->gradient[a][b];
-        for(size_t n=0;n<reference.rows[i].size();++n)
-        {
-            const auto &e=reference.rows[i][n];
-            const Vecd y=x[e.j]-x[i];
-            A+=y*projection[i][n].coefficient.transpose();
-            if (!derivatives)
-                f+=y*e.gradient.transpose();
+            hg = device_residual_.energy_density[i];
         }
-        F[i]=f;auto state=elastic.evaluate(f);P[i]=state.positive_P+state.negative_P;stress[i]=P[i]*f.transpose()/state.J;Real hg=0;
-        for(size_t n=0;n<projection[i].size();++n){auto&e=projection[i][n];e.residual=x[reference.rows[i][n].j]-x[i]-A*e.basis;hg+=.5*stabilizer*e.weight*e.residual.squaredNorm();e.force=volume[i]*stabilizer*e.weight*e.residual;}
-        hg_density[i]=hg;stored_density[i]=state.positive+state.negative+hg;tangent_bound[i]=elastic.tangentBound(state.principal_stretches,state.J,0);
+        else
+        {
+            A39 A = A39::Zero();
+            for (size_t n = 0; n < reference.rows[i].size(); ++n)
+            {
+                const auto &e = reference.rows[i][n];
+                const Vecd y = x[e.j] - x[i];
+                A += y * projection[i][n].coefficient.transpose();
+                f += y * e.gradient.transpose();
+            }
+            for (size_t n = 0; n < projection[i].size(); ++n)
+            {
+                auto &e = projection[i][n];
+                e.residual = x[reference.rows[i][n].j] - x[i] - A * e.basis;
+                hg += .5 * stabilizer * e.weight * e.residual.squaredNorm();
+                e.force = volume[i] * stabilizer * e.weight * e.residual;
+            }
+        }
+        F[i] = f;
+        const auto state = elastic.evaluate(f);
+        P[i] = state.positive_P + state.negative_P;
+        stress[i] = P[i] * f.transpose() / state.J;
+        hg_density[i] = hg;
+        stored_density[i] = state.positive + state.negative + hg;
+        tangent_bound[i] = elastic.tangentBound(state.principal_stretches, state.J, 0);
     }
   public:
-    void forces(size_t i) { assembleParticleForce(i, nullptr); }
+    void forces(size_t i)
+    {
+        if (derivatives_)
+            throw std::logic_error("Use recomputeForces for device live forces");
+        assembleParticleForce(i, nullptr);
+    }
 
     void recomputeForces()
     {
@@ -92,7 +126,11 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
             throw std::runtime_error("Live force assembly is stale after a fracture event");
         const auto count = projection.size();
         if (derivatives_)
+        {
+            if (!device_residual_current_)
+                throw std::logic_error("Evaluate the device live residual before force assembly");
             assembleDeviceStressForce(count);
+        }
         tbb::parallel_for(size_t(0), count, [&](size_t i)
         {
             acc[i].setZero();
@@ -106,9 +144,11 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
     Vecd*x;Real*volume,*mass;Vecd*acc;
     std::unique_ptr<peridynamics::SpatialDerivativeBatch> derivatives_;
     bool derivative_stencil_current_ = false;
+    bool device_residual_current_ = false;
     std::vector<peridynamics::ParticleVector3> device_field_;
     std::vector<peridynamics::SpatialDerivatives3> device_derivatives_, device_force_coefficients_;
     std::vector<peridynamics::ParticleVector3> device_stress_force_;
+    peridynamics::WeightedDifferenceResult device_residual_;
 
     void assembleParticleForce(size_t i, const peridynamics::ParticleVector3 *adjoint)
     {
@@ -116,13 +156,19 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
         reference.checkIntact(i);
         Vecd f = Vecd::Zero(), h = Vecd::Zero();
         if (adjoint)
-            f = -Vecd(adjoint->component[0], adjoint->component[1], adjoint->component[2]);
-        for (size_t n = 0; n < reference.rows[i].size(); ++n)
         {
-            const auto &e = reference.rows[i][n];
-            if (!adjoint)
+            f = -Vecd(adjoint->component[0], adjoint->component[1], adjoint->component[2]);
+            const auto &residual_force = device_residual_.forces[i].component;
+            h = Vecd(residual_force[0], residual_force[1], residual_force[2]);
+        }
+        else
+        {
+            for (size_t n = 0; n < reference.rows[i].size(); ++n)
+            {
+                const auto &e = reference.rows[i][n];
                 f += volume[i] * P[i] * e.gradient - volume[e.j] * P[e.j] * reference.rows[e.j][e.reverse].gradient;
-            h += projection[i][n].force - projection[e.j][e.reverse].force;
+                h += projection[i][n].force - projection[e.j][e.reverse].force;
+            }
         }
         internal[i] = f;
         hourglass[i] = h;
@@ -139,10 +185,23 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
             for (size_t i = 0; i < count; ++i)
             {
                 map.origins.push_back(i);
-                for (const auto &e : reference.rows[i])
+                for (size_t n = 0; n < reference.rows[i].size(); ++n)
                 {
+                    if (!reference.live(i, n))
+                        continue;
+                    const auto &e = reference.rows[i][n];
+                    const auto &r = projection[i][n];
                     map.neighbors.push_back(e.j);
                     map.gradients.push_back({{e.gradient[0], e.gradient[1], e.gradient[2]}});
+                    peridynamics::WeightedDifferenceEntry weights{};
+                    for (int term = 0; term < 9; ++term)
+                    {
+                        weights.basis[term] = r.basis[term];
+                        weights.coefficient[term] = r.coefficient[term];
+                    }
+                    weights.energy_weight = .5 * stabilizer * r.weight;
+                    weights.force_weight = volume[i] * stabilizer * r.weight;
+                    map.weighted_differences.push_back(weights);
                 }
                 map.offsets.push_back(map.neighbors.size());
             }
@@ -170,8 +229,10 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
         device_field_.resize(count);
         for (size_t i = 0; i < count; ++i)
             device_field_[i] = {{x[i][0], x[i][1], x[i][2]}};
-        derivatives_->evaluate(device_field_, device_derivatives_);
-        if (device_derivatives_.size() != count)
+        device_residual_current_ = false;
+        derivatives_->evaluate(device_field_, device_derivatives_, &device_residual_);
+        if (device_derivatives_.size() != count || device_residual_.energy_density.size() != count ||
+            device_residual_.forces.size() != count)
             throw std::logic_error("Spatial derivative backend returned an incomplete live PD field");
     }
 };

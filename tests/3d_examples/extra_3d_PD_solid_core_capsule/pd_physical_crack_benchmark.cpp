@@ -71,9 +71,9 @@ std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesy
  for(size_t i=0;i<count&&!severed;++i)for(size_t n=0;n<ref.rows[i].size()&&!severed;++n)
   if(ref.live(i,n)&&geometry.column_of[i]!=geometry.column_of[ref.rows[i][n].j])severed=ref.severBondPair(i,n);
  if(!severed)throw std::runtime_error("No live tangent bond for topology guard verification");
- bool pending_guard=must_reject([&](){bulk.forces(0);})&&must_reject([&](){live_damage.forces(0);})&&must_reject([&](){contact.apply();});
+ bool pending_guard=must_reject([&](){bulk.recomputeForces();})&&must_reject([&](){live_damage.forces(0);})&&must_reject([&](){contact.apply();});
  ref.restoreTopology(saved_topology);ref.restoreTopology(saved_topology);
- bool stale_guard=must_reject([&](){bulk.evaluate(0);})&&must_reject([&](){live_damage.evaluate(0,false);})&&must_reject([&](){master.position(0);})&&must_reject([&](){contact.apply();});
+ bool stale_guard=must_reject([&](){bulk.evaluateAll();})&&must_reject([&](){live_damage.evaluate(0,false);})&&must_reject([&](){master.position(0);})&&must_reject([&](){contact.apply();});
  master.rebuildChanged();slave.rebuildChanged();plus_corners.rebuildChanged();minus_geometry.rebuild();plus_geometry.rebuild();bulk.rebuild();live_damage.initialize();
  bool topology_guards=pending_guard&&stale_guard&&master.isCurrent()&&slave.isCurrent();
  if(!topology_guards)throw std::runtime_error("Stale/pending physical fracture cache was accepted");
@@ -141,12 +141,44 @@ std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesy
         port.clear();growth.applyContact();
         return bulk.energy()+growth.contact_energy;
     };
+    auto stabilization_probe = [&]() {
+        const StdVec<Vecd> saved_positions(s.x, s.x + count);
+        StdVec<Vecd> displacement(count);
+        for (size_t i = 0; i < count; ++i)
+        {
+            const auto &x = s.x0[i];
+            // A non-polynomial mode yields a nonzero residual on both sides.
+            const Real amplitude = .03 * dp * std::sin(x[0] / (2 * dp)) * std::cos(x[1] / (1.5 * dp));
+            displacement[i] = amplitude * Vecd(.65, .24, 0);
+            s.x[i] = x + displacement[i];
+        }
+        bulk.evaluateAll();
+        bulk.recomputeForces();
+        const Real energy = bulk.stabilizationEnergy();
+        Real work = 0, total_force = 0;
+        Vecd resultant = Vecd::Zero();
+        for (size_t i = 0; i < count; ++i)
+        {
+            work -= bulk.hourglass[i].dot(displacement[i]);
+            total_force += bulk.hourglass[i].norm();
+            resultant += bulk.hourglass[i];
+            s.x[i] = saved_positions[i];
+        }
+        if (!(energy > 0 && total_force > 0 && std::abs(work / (2 * energy) - 1) < 1e-8 &&
+              resultant.norm() / total_force < 1e-12))
+            throw std::runtime_error("Live stabilization failed work or force balance");
+        return energy;
+    };
+    const Real stabilization_energy_intact = stabilization_probe();
     set(0,0,Matd::Identity());energy();
     if(growth.select()!=growth.candidates.size())throw std::runtime_error("Contact-only fracture triggered at zero load");
     for(size_t i=0;i<count;++i)s.x[i][0]*=1+1.1*ft/E;
     energy();
     if(growth.select()!=0||!growth.insert(0,false,[](){},energy))
         throw std::runtime_error("Contact-only strength-triggered cut failed: "+growth.last_rejection);
+    const Real stabilization_energy_cut = stabilization_probe();
+    if (!(stabilization_energy_cut < stabilization_energy_intact))
+        throw std::runtime_error("Cut bonds were not removed from the stabilization fit");
     size_t live_crossing=0;
     for(size_t i=0;i<count;++i)for(size_t n=0;n<ref.rows[i].size();++n)
         live_crossing+=ref.live(i,n)&&s.x0[i][0]*s.x0[ref.rows[i][n].j][0]<0;
@@ -177,6 +209,9 @@ std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesy
         <<",\"device_trace_pullback\":"<<(network.device_trace_pullback?"true":"false")
         <<",\"shell_derivatives_backend\":"<<std::quoted(bulk.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")
         <<",\"shell_stress_force_backend\":"<<std::quoted(bulk.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")
+        <<",\"shell_stabilization_backend\":"<<std::quoted(bulk.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")
+        <<",\"stabilization_energy_intact_J\":"<<stabilization_energy_intact
+        <<",\"stabilization_energy_cut_J\":"<<stabilization_energy_cut
         <<",\"cohesive_fracture_work_J\":"<<growth.dissipated<<",\"insertion_defect_J\":"<<growth.insertion_defect<<"}\n";
     return pass?0:2;
  }

@@ -245,8 +245,10 @@ int main(int argc, char **argv)
     std::cout << "NOSB-PD internal force backend " << (pd_bonds.onDevice() ? "cuda_fp64" : "cpu_fp64") << std::endl;
     auto constitutive = peridynamics::makePDConstitutiveDynamics(shell_inner, &pd_bonds);
     auto fracture = peridynamics::makePDFracture(shell_inner, material_options, fracture_options);
-    InteractionDynamics<solid_dynamics::LittleWoodHourGlassControl> hourglass(shell_inner, hourglass_coefficient, hourglass_damage_cutoff);
-    InteractionDynamics<solid_dynamics::PairNumericalDampingforPD> pd_damping(shell_inner);
+    solid_dynamics::NosbPDStabilizationWithExecution hourglass(pd_bonds, hourglass_coefficient, hourglass_damage_cutoff);
+    solid_dynamics::NosbPDDampingWithExecution pd_damping(pd_bonds);
+    std::cout << "NOSB-PD stabilization backend " << (pd_bonds.onDevice() ? "cuda_fp64" : "cpu_fp64")
+              << "; damping " << (pd_damping.onDevice() ? "cuda_fp64" : "cpu_fp64") << std::endl;
     solid_dynamics::NosbPDInternalForceWithExecution third(pd_bonds);
     solid_dynamics::NosbPDStepWithExecution<solid_dynamics::NosbPDFourthStep> fourth(shell, pd_time_integration.get());
     ReduceDynamics<solid_dynamics::PDTimeStep> shell_step(shell, pd_cfl);

@@ -28,7 +28,7 @@ __global__ void evaluateBondTensors(const std::size_t *offsets, const NosbPDBond
     {
         const auto &bond = bonds[entry];
         const auto &target = sites[bond.particle];
-        double eta = bond.reference.component[axis];
+        double eta = (-bond.reference_distance * bond.direction.component[axis]);
         double du = 0.0;
         double eta_half = eta;
         if (live[entry])
@@ -41,7 +41,7 @@ __global__ void evaluateBondTensors(const std::size_t *offsets, const NosbPDBond
         const double weight = target.volume * bond.kernel_weight;
         for (int k = 0; k < 3; ++k)
         {
-            const double reference = bond.reference.component[k];
+            const double reference = -bond.reference_distance * bond.direction.component[k];
             full[k] += weight * (eta * reference);
             increment[k] += weight * (du * reference);
             midpoint[k] += weight * (eta_half * reference);
@@ -85,11 +85,118 @@ __global__ void assembleInternalBondForce(const std::size_t *offsets, const Nosb
 
         const auto &bond = bonds[entry];
         const auto &target = sites[bond.particle];
-        const double from = projectBond(source.force_state, axis, bond.kernel_weight, bond.reference, 1.0);
-        const double to = projectBond(target.force_state, axis, bond.kernel_weight, bond.reference, -1.0);
+        ParticleVector3 reference;
+        for (int k = 0; k < 3; ++k)
+            reference.component[k] = -bond.reference_distance * bond.direction.component[k];
+        const double from = projectBond(source.force_state, axis, bond.kernel_weight, reference, 1.0);
+        const double to = projectBond(target.force_state, axis, bond.kernel_weight, reference, -1.0);
         force += (from - to) * target.volume;
     }
     force_density[i].component[axis] = force;
+}
+
+__device__ ParticleVector3 difference(const ParticleVector3 &lhs, const ParticleVector3 &rhs)
+{
+    ParticleVector3 result;
+    for (int k = 0; k < 3; ++k)
+        result.component[k] = lhs.component[k] - rhs.component[k];
+    return result;
+}
+
+__device__ double dot(const ParticleVector3 &a, const ParticleVector3 &b)
+{
+    return a.component[0] * b.component[0] +
+        (a.component[1] * b.component[1] + a.component[2] * b.component[2]);
+}
+
+__device__ ShapeHessian3 averageDeformation(const NosbPDCorrectionSite &source, const NosbPDCorrectionSite &target)
+{
+    ShapeHessian3 average;
+    for (int a = 0; a < 3; ++a)
+        for (int b = 0; b < 3; ++b)
+            average.derivative[a][b] = 0.5 * (source.deformation.derivative[a][b] + target.deformation.derivative[a][b]);
+    return average;
+}
+
+__device__ bool correctionApplies(NosbPDStabilizationParameters parameters, const NosbPDCorrectionSite &source)
+{
+    return source.active && !(source.damage >= parameters.damage_cutoff);
+}
+
+__device__ bool correctionApplies(NosbPDDampingParameters, const NosbPDCorrectionSite &source)
+{
+    return source.active;
+}
+
+__device__ bool accumulateCorrection(NosbPDStabilizationParameters parameters,
+                                      const NosbPDCorrectionSite &source, const NosbPDCorrectionSite &target,
+                                      const NosbPDBondGeometry &bond, ParticleVector3 &force)
+{
+    if (!target.active || target.damage >= parameters.damage_cutoff)
+        return true;
+
+    const auto current = difference(target.position, source.position);
+    const double length = sqrt(dot(current, current));
+    if (!isfinite(length) || length <= parameters.collapsed_length_ratio * bond.reference_distance)
+        return false;
+
+    const auto deformation = averageDeformation(source, target);
+    ParticleVector3 reference, error;
+    for (int k = 0; k < 3; ++k)
+        reference.component[k] = -bond.reference_distance * bond.direction.component[k];
+    for (int k = 0; k < 3; ++k)
+        error.component[k] = projectBond(deformation, k, 1.0, reference, 1.0) - current.component[k];
+    const double projection = dot(error, current);
+    const double scale = parameters.stiffness * projection / (bond.reference_distance * length) * target.volume;
+    for (int k = 0; k < 3; ++k)
+        force.component[k] -= scale * current.component[k];
+    return true;
+}
+
+__device__ bool accumulateCorrection(NosbPDDampingParameters parameters,
+                                      const NosbPDCorrectionSite &source, const NosbPDCorrectionSite &target,
+                                      const NosbPDBondGeometry &bond, ParticleVector3 &force)
+{
+    const double inverse_distance = double(parameters.dimensions) / bond.reference_distance;
+    const auto position_jump = difference(source.position, target.position);
+    const auto velocity_jump = difference(source.velocity, target.velocity);
+    const double strain_rate = inverse_distance * inverse_distance * dot(position_jump, velocity_jump);
+    const double stress_scale = 0.5 * parameters.density * parameters.sound_speed * strain_rate * parameters.smoothing_length;
+    const double weight = bond.kernel_weight * parameters.inverse_kernel_at_origin;
+    const double gradient = bond.kernel_derivative * target.volume;
+    auto stress = averageDeformation(source, target);
+    for (int a = 0; a < 3; ++a)
+        for (int b = 0; b < 3; ++b)
+            stress.derivative[a][b] = gradient * ((parameters.factor * weight) * (stress.derivative[a][b] * stress_scale));
+    for (int k = 0; k < 3; ++k)
+        force.component[k] += projectBond(stress, k, 1.0, bond.direction, 1.0);
+    return true;
+}
+
+template <class Parameters>
+__global__ void assembleCorrectionForce(const std::size_t *offsets, const NosbPDBondGeometry *bonds,
+                                        const NosbPDCorrectionSite *sites, const std::uint8_t *live,
+                                        std::size_t rows, Parameters parameters, NosbPDCorrectionForce *force)
+{
+    const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= rows)
+        return;
+
+    const auto &source = sites[i];
+    NosbPDCorrectionForce row{};
+    const auto end = correctionApplies(parameters, source) ? offsets[i + 1] : offsets[i];
+    for (auto entry = offsets[i]; entry < end; ++entry)
+    {
+        if (!live[entry])
+            continue;
+        const auto &bond = bonds[entry];
+        if (!accumulateCorrection(parameters, source, sites[bond.particle], bond, row.density))
+        {
+            row.collapsed = true;
+            break;
+        }
+    }
+    force[i] = row;
 }
 
 class CudaNosbPDBonds final : public NosbPDBondBatch
@@ -159,7 +266,43 @@ class CudaNosbPDBonds final : public NosbPDBondBatch
         download(force_density, force_density_, "NOSB-PD internal force density");
     }
 
+    void assembleStabilization(const std::vector<NosbPDCorrectionSite> &sites,
+                               const std::vector<std::uint8_t> &bond_live,
+                               NosbPDStabilizationParameters parameters,
+                               std::vector<NosbPDCorrectionForce> &force) override
+    {
+        assembleCorrection(sites, bond_live, parameters, force);
+    }
+
+    void assembleDamping(const std::vector<NosbPDCorrectionSite> &sites,
+                         const std::vector<std::uint8_t> &bond_live,
+                         NosbPDDampingParameters parameters,
+                         std::vector<NosbPDCorrectionForce> &force) override
+    {
+        assembleCorrection(sites, bond_live, parameters, force);
+    }
+
   private:
+    template <class Parameters>
+    void assembleCorrection(const std::vector<NosbPDCorrectionSite> &sites,
+                            const std::vector<std::uint8_t> &bond_live, Parameters parameters,
+                            std::vector<NosbPDCorrectionForce> &force)
+    {
+        validate(sites.size(), bond_live.size());
+        force.resize(rows_);
+        if (rows_ == 0)
+            return;
+
+        const auto blocks = static_cast<unsigned>((rows_ - 1) / threads_ + 1);
+        upload(correction_sites_, sites, "NOSB-PD correction sites");
+        upload(live_, bond_live, "NOSB-PD live bond flags before force correction");
+        correction_force_.reserve(rows_);
+        assembleCorrectionForce<<<blocks, threads_>>>(offsets_.get(), bonds_.get(), correction_sites_.get(),
+            live_.get(), rows_, parameters, correction_force_.get());
+        check(cudaGetLastError(), "assemble NOSB-PD force correction");
+        download(force, correction_force_, "NOSB-PD correction forces");
+    }
+
     void validate(std::size_t sites, std::size_t bonds) const
     {
         if (!configured_ || sites != site_count_ || bonds != bond_count_)
@@ -174,6 +317,8 @@ class CudaNosbPDBonds final : public NosbPDBondBatch
     DeviceBuffer<NosbPDKinematicSite> sites_;
     DeviceBuffer<NosbPDForceSite> force_sites_;
     DeviceBuffer<ParticleVector3> force_density_;
+    DeviceBuffer<NosbPDCorrectionSite> correction_sites_;
+    DeviceBuffer<NosbPDCorrectionForce> correction_force_;
     DeviceBuffer<std::uint8_t> live_;
     DeviceBuffer<NosbPDDeformationTensors> tensors_;
 };

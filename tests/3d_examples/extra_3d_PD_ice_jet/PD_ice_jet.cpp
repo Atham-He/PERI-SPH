@@ -209,8 +209,10 @@ int main(int ac, char *av[]) try
     solid_dynamics::NosbPDDeformationWithExecution<solid_dynamics::NosbPDSecondStepPlastic>
         nosbpd_second_step_plastic(plate_inner_relation, &pd_bonds);
     std::cout << "NOSB-PD internal force backend " << (pd_bonds.onDevice() ? "cuda_fp64" : "cpu_fp64") << std::endl;
-    InteractionDynamics<solid_dynamics::LittleWoodHourGlassControl> hourglass_control(plate_inner_relation);
-    InteractionDynamics<solid_dynamics::PairNumericalDampingforPD> numerical_damping(plate_inner_relation);
+    solid_dynamics::NosbPDStabilizationWithExecution hourglass_control(pd_bonds);
+    solid_dynamics::NosbPDDampingWithExecution numerical_damping(pd_bonds);
+    std::cout << "NOSB-PD stabilization backend " << (pd_bonds.onDevice() ? "cuda_fp64" : "cpu_fp64")
+              << "; damping " << (numerical_damping.onDevice() ? "cuda_fp64" : "cpu_fp64") << std::endl;
     solid_dynamics::NosbPDInternalForceWithExecution nosbpd_third_step(pd_bonds);
     solid_dynamics::NosbPDStepWithExecution<solid_dynamics::NosbPDFourthStep> nosbpd_fourth_step(plate, pd_time_integration.get());
     /** normal direction updated from the PD deformation gradient;

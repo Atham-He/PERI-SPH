@@ -9,8 +9,8 @@ namespace SPH::peridynamics
 struct NosbPDBondGeometry
 {
     std::size_t particle;
-    ParticleVector3 reference;
-    double kernel_weight;
+    ParticleVector3 direction;
+    double reference_distance, kernel_weight, kernel_derivative;
 };
 
 struct NosbPDKinematicSite
@@ -32,6 +32,31 @@ struct NosbPDDeformationTensors
     ShapeHessian3 full, increment, midpoint;
 };
 
+struct NosbPDCorrectionSite
+{
+    ParticleVector3 position, velocity;
+    ShapeHessian3 deformation;
+    double volume, damage;
+    bool active;
+};
+
+struct NosbPDStabilizationParameters
+{
+    double stiffness, damage_cutoff, collapsed_length_ratio;
+};
+
+struct NosbPDDampingParameters
+{
+    double density, sound_speed, smoothing_length, factor, inverse_kernel_at_origin;
+    int dimensions;
+};
+
+struct NosbPDCorrectionForce
+{
+    ParticleVector3 density;
+    bool collapsed;
+};
+
 class NosbPDBondBatch
 {
   public:
@@ -46,6 +71,14 @@ class NosbPDBondBatch
     virtual void assembleInternalForce(const std::vector<NosbPDForceSite> &sites,
                                        const std::vector<std::uint8_t> &bond_live,
                                        std::vector<ParticleVector3> &force_density) = 0;
+    virtual void assembleStabilization(const std::vector<NosbPDCorrectionSite> &sites,
+                                       const std::vector<std::uint8_t> &bond_live,
+                                       NosbPDStabilizationParameters parameters,
+                                       std::vector<NosbPDCorrectionForce> &force) = 0;
+    virtual void assembleDamping(const std::vector<NosbPDCorrectionSite> &sites,
+                                 const std::vector<std::uint8_t> &bond_live,
+                                 NosbPDDampingParameters parameters,
+                                 std::vector<NosbPDCorrectionForce> &force) = 0;
 };
 
 std::unique_ptr<NosbPDBondBatch> makeCudaNosbPDBonds();

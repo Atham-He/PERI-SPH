@@ -163,10 +163,16 @@ class NosbPDBondWorkspace
     BaseInnerRelation &relation() const { return relation_; }
     void evaluateDeformation(Real dt, Matd *full, Matd *increment, Matd *midpoint);
     void evaluateInternalForce(Real reference_density, Vecd *acceleration, Vecd *force);
+    void evaluateStabilization(peridynamics::NosbPDStabilizationParameters parameters, Real reference_density,
+                               Vecd *acceleration, Vecd *force);
+    void evaluateDamping(peridynamics::NosbPDDampingParameters parameters, Real reference_density,
+                         Vecd *acceleration, Vecd *force);
 
   private:
     void configure(std::size_t count, std::size_t bound);
     void refreshLiveBonds(std::size_t count, std::size_t bound);
+    void gatherCorrectionSites(bool damping);
+    void publishCorrection(bool stabilization, Real damage_cutoff, Real reference_density, Vecd *acceleration, Vecd *force);
 
     BaseInnerRelation &relation_;
     std::unique_ptr<peridynamics::NosbPDBondBatch> backend_;
@@ -176,6 +182,8 @@ class NosbPDBondWorkspace
     std::vector<std::uint8_t> bond_live_;
     std::vector<peridynamics::NosbPDDeformationTensors> tensors_;
     std::vector<peridynamics::ParticleVector3> force_density_;
+    std::vector<peridynamics::NosbPDCorrectionSite> correction_sites_;
+    std::vector<peridynamics::NosbPDCorrectionForce> correction_force_;
     std::size_t bound_ = 0;
 };
 
@@ -412,6 +420,19 @@ class ProjectedPairStabilization : public LocalDynamics, public DataDelegateInne
     Matd *F_;
 };
 
+class NosbPDStabilizationWithExecution : public InteractionDynamics<ProjectedPairStabilization>
+{
+    using Base = InteractionDynamics<ProjectedPairStabilization>;
+
+  public:
+    NosbPDStabilizationWithExecution(NosbPDBondWorkspace &workspace, Real coefficient = 0.5, Real damage_cutoff = 0.1)
+        : Base(workspace.relation(), coefficient, damage_cutoff), workspace_(workspace) {}
+    void runMainStep(Real dt) override;
+
+  private:
+    NosbPDBondWorkspace &workspace_;
+};
+
 using LittleWoodHourGlassControl = ProjectedPairStabilization;
 
 /**
@@ -433,6 +454,20 @@ class PairNumericalDampingforPD : public LocalDynamics, public DataDelegateInner
     Real *Vol_;
     Vecd *pos_, *vel_, *acc_, *damping_force_;
     Matd *F_;
+};
+
+class NosbPDDampingWithExecution : public InteractionDynamics<PairNumericalDampingforPD>
+{
+    using Base = InteractionDynamics<PairNumericalDampingforPD>;
+
+  public:
+    explicit NosbPDDampingWithExecution(NosbPDBondWorkspace &workspace);
+    bool onDevice() const { return supported_ && workspace_.onDevice(); }
+    void runMainStep(Real dt) override;
+
+  private:
+    NosbPDBondWorkspace &workspace_;
+    bool supported_;
 };
 } // namespace solid_dynamics
 } // namespace SPH

@@ -3,6 +3,7 @@
 #include "dpc_point_batch.h"
 #include "pd_bonded_interface_batch.h"
 #include "pd_crack_projection.h"
+#include "pd_solid_time_step.h"
 #include "pd_spatial_derivatives.h"
 
 #include <string_view>
@@ -38,6 +39,7 @@ class PeriExecution
     std::unique_ptr<BondedInterfaceBatch> makeBondedInterface() const;
     std::unique_ptr<SpatialDerivativeBatch> makeSpatialDerivatives() const;
     std::unique_ptr<dpc::PointBatch> makeDpcPoints(const dpc::Model &model) const;
+    std::unique_ptr<SolidTimeStepBatch> makeSolidTimeStep(const std::vector<double> &mass) const;
 
   private:
     PeriExecutionMode mode_;

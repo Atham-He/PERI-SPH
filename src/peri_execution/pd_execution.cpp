@@ -68,4 +68,15 @@ std::unique_ptr<dpc::PointBatch> PeriExecution::makeDpcPoints(const dpc::Model &
     return nullptr;
 }
 
+std::unique_ptr<SolidTimeStepBatch> PeriExecution::makeSolidTimeStep(const std::vector<double> &mass) const
+{
+#if defined(PERI_SPH_HAS_CUDA)
+    if (mode_ == PeriExecutionMode::GPU)
+        return makeCudaSolidTimeStep(mass);
+#else
+    (void)mass;
+#endif
+    return nullptr;
+}
+
 }

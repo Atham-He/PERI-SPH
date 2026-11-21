@@ -71,6 +71,8 @@ foreach(SNSNI_FILE
         ${PERI_SHARED}/peridynamics/pd_column_face_surface.h
         ${PERI_SHARED}/peridynamics/pd_execution.h
         ${PERI_SHARED}/../peri_execution/pd_execution.cpp
+        ${PERI_SHARED}/peridynamics/pd_solid_time_step.h
+        ${PERI_SHARED}/../peri_execution/pd_solid_time_step_cuda.cu
         ${PERI_SHARED}/../peri_execution/dpc_point_cuda.cu
         ${PERI_SHARED}/peridynamics/pd_spatial_derivatives.h
         ${PERI_SHARED}/peridynamics/pd_spatial_derivatives_cuda.cu

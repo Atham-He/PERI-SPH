@@ -397,17 +397,164 @@ class SnsniPlasticSolid
  */
 class SnsniCentralDifference
 {
- public:
-    using Field=StdVec<Vecd>;Field displacement,velocity,acceleration;
-    const StdVec<Real>&mass;Real damping_loss=0;size_t steps=0;
-    explicit SnsniCentralDifference(const StdVec<Real>&m):displacement(m.size(),Vecd::Zero()),velocity(displacement),acceleration(displacement),mass(m){}
-    Real kinetic()const{Real v=0;for(size_t j=0;j<mass.size();++j)v+=.5*mass[j]*velocity[j].squaredNorm();return v;}
-    template<class Evaluate>void step(Real dt,Real damping,Evaluate&&evaluate)
+  public:
+    using Field=StdVec<Vecd>;
+    Field displacement,velocity,acceleration;
+    const StdVec<Real> &mass;
+    Real damping_loss=0;
+    size_t steps=0;
+
+    explicit SnsniCentralDifference(const StdVec<Real> &m)
+        : displacement(m.size(),Vecd::Zero()), velocity(displacement), acceleration(displacement), mass(m) {}
+
+    SnsniCentralDifference(const StdVec<Real> &m, const peridynamics::PeriExecution &execution)
+        : SnsniCentralDifference(m)
     {
-        Real factor=std::exp(-.5*damping*dt);
-        tbb::parallel_for(size_t(0),mass.size(),[&](size_t j){velocity[j]*=factor;velocity[j]+=.5*dt*acceleration[j];displacement[j]+=dt*velocity[j];});
-        Field force;evaluate(displacement,velocity,force);
-        tbb::parallel_for(size_t(0),mass.size(),[&](size_t j){acceleration[j]=force[j]/mass[j];velocity[j]+=.5*dt*acceleration[j];velocity[j]*=factor;});++steps;
+        device_time_step_=execution.makeSolidTimeStep(mass);
+    }
+
+    bool hasDeviceTimeStep() const noexcept { return device_time_step_!=nullptr; }
+
+    Real kinetic() const
+    {
+        Real energy=0;
+        for(size_t j=0;j<mass.size();++j)
+            energy+=.5*mass[j]*velocity[j].squaredNorm();
+        return energy;
+    }
+
+    template<class Evaluate>
+    void step(Real dt, Real damping, Evaluate &&evaluate)
+    {
+        const Real factor=std::exp(-.5*damping*dt);
+        if (device_time_step_)
+            predictOnDevice(dt,factor,acceleration,peridynamics::SolidKickInput::Acceleration,displacement,velocity);
+        else
+            tbb::parallel_for(size_t(0),mass.size(),[&](size_t j)
+            {
+                velocity[j]*=factor;
+                velocity[j]+=.5*dt*acceleration[j];
+                displacement[j]+=dt*velocity[j];
+            });
+
+        Field force;
+        evaluate(displacement,velocity,force);
+        if (device_time_step_)
+            finishOnDevice(dt,factor,velocity,force,Field{},mass.size(),peridynamics::SolidKickInput::Acceleration);
+        else
+            tbb::parallel_for(size_t(0),mass.size(),[&](size_t j)
+            {
+                acceleration[j]=force[j]/mass[j];
+                velocity[j]+=.5*dt*acceleration[j];
+                velocity[j]*=factor;
+            });
+        ++steps;
+    }
+
+    // Split form for intermediate contact operators and trial step rejection.
+    Real predictForceStep(Real dt, Real factor, const Field &force, Field &next_displacement, Field &half_velocity)
+    {
+        if (device_time_step_)
+            return predictOnDevice(dt,factor,force,peridynamics::SolidKickInput::Force,next_displacement,half_velocity);
+
+        Real damped_kinetic=0;
+        half_velocity=velocity;
+        next_displacement=displacement;
+        for (size_t j=0;j<mass.size();++j)
+        {
+            half_velocity[j]*=factor;
+            damped_kinetic+=.5*mass[j]*half_velocity[j].squaredNorm();
+            half_velocity[j]+=.5*dt*force[j]/mass[j];
+            next_displacement[j]+=dt*half_velocity[j];
+        }
+        return damped_kinetic;
+    }
+
+    Real finishForceStep(Real dt, Real factor, const Field &half_velocity, const Field &force,
+                         const Field &additional_force, size_t additional_start)
+    {
+        if (additional_start>mass.size() || additional_force.size()>mass.size()-additional_start)
+            throw std::invalid_argument("Additional solid force lies outside the particle range");
+        if (device_time_step_)
+            return finishOnDevice(dt,factor,half_velocity,force,additional_force,additional_start,peridynamics::SolidKickInput::Force);
+
+        Real undamped_kinetic=0;
+        for (size_t j=0;j<mass.size();++j)
+        {
+            velocity[j]=half_velocity[j]+.5*dt*force[j]/mass[j];
+            undamped_kinetic+=.5*mass[j]*velocity[j].squaredNorm();
+            velocity[j]*=factor;
+            const Vecd additional=additionalForce(additional_force,additional_start,j);
+            acceleration[j]=(force[j]+additional)/mass[j];
+        }
+        return undamped_kinetic;
+    }
+
+  private:
+    using Input=peridynamics::SolidKickInput;
+    std::unique_ptr<peridynamics::SolidTimeStepBatch> device_time_step_;
+    std::vector<peridynamics::SolidDriftInput> drift_input_;
+    std::vector<peridynamics::SolidDriftResult> drift_output_;
+    std::vector<peridynamics::SolidFinishInput> finish_input_;
+    std::vector<peridynamics::SolidFinishResult> finish_output_;
+
+    static peridynamics::ParticleVector3 pack(const Vecd &v) { return {{v[0],v[1],v[2]}}; }
+    static Vecd unpack(const peridynamics::ParticleVector3 &v)
+    {
+        return Vecd(v.component[0],v.component[1],v.component[2]);
+    }
+
+    static Vecd additionalForce(const Field &force, size_t start, size_t particle)
+    {
+        if (particle>=start && particle-start<force.size())
+            return force[particle-start];
+        return Vecd::Zero();
+    }
+
+    Real predictOnDevice(Real dt, Real factor, const Field &drive, Input mode,
+                         Field &next_displacement, Field &half_velocity)
+    {
+        const size_t count=mass.size();
+        if (drive.size()!=count)
+            throw std::invalid_argument("Solid drift drive does not match the particle count");
+        drift_input_.resize(count);
+        for (size_t j=0;j<count;++j)
+            drift_input_[j]={pack(displacement[j]),pack(velocity[j]),pack(drive[j])};
+        device_time_step_->predict(drift_input_,dt,factor,mode,drift_output_);
+        if (drift_output_.size()!=count)
+            throw std::logic_error("Solid time stepping backend returned an incomplete drift");
+        next_displacement.resize(count);
+        half_velocity.resize(count);
+        Real damped_kinetic=0;
+        for (size_t j=0;j<count;++j)
+        {
+            next_displacement[j]=unpack(drift_output_[j].displacement);
+            half_velocity[j]=unpack(drift_output_[j].half_velocity);
+            damped_kinetic+=drift_output_[j].damped_kinetic;
+        }
+        return damped_kinetic;
+    }
+
+    Real finishOnDevice(Real dt, Real factor, const Field &half_velocity, const Field &force,
+                        const Field &additional_force, size_t additional_start, Input mode)
+    {
+        const size_t count=mass.size();
+        if (half_velocity.size()!=count || force.size()!=count)
+            throw std::invalid_argument("Solid final kick fields do not match the particle count");
+        finish_input_.resize(count);
+        for (size_t j=0;j<count;++j)
+            finish_input_[j]={pack(half_velocity[j]),pack(force[j]),pack(additionalForce(additional_force,additional_start,j))};
+        device_time_step_->finish(finish_input_,dt,factor,mode,finish_output_);
+        if (finish_output_.size()!=count)
+            throw std::logic_error("Solid time stepping backend returned an incomplete final kick");
+        Real undamped_kinetic=0;
+        for (size_t j=0;j<count;++j)
+        {
+            velocity[j]=unpack(finish_output_[j].velocity);
+            acceleration[j]=unpack(finish_output_[j].acceleration);
+            undamped_kinetic+=finish_output_[j].undamped_kinetic;
+        }
+        return undamped_kinetic;
     }
 };
 }

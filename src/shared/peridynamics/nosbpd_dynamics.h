@@ -30,6 +30,7 @@
 #include <Eigen/Eigenvalues>
 
 #include "pd_nosb_bond_batch.h"
+#include "pd_nosb_elastic_batch.h"
 #include "pd_solid_time_step.h"
 #include "dynamics_algorithms.h"
 
@@ -212,6 +213,19 @@ class NosbPDDeformationWithExecution : public InteractionWithUpdate<Stage>
 
   private:
     NosbPDBondWorkspace *workspace_;
+};
+
+class NosbPDElasticWithExecution : public NosbPDDeformationWithExecution<NosbPDSecondStep>
+{
+  public:
+    NosbPDElasticWithExecution(BaseInnerRelation &relation, NosbPDBondWorkspace *workspace,
+                               std::unique_ptr<peridynamics::NosbPDElasticBatch> backend);
+    void exec(Real dt = 0.0) override;
+
+  private:
+    std::unique_ptr<peridynamics::NosbPDElasticBatch> backend_;
+    std::vector<peridynamics::NosbPDElasticSite> sites_;
+    std::vector<peridynamics::NosbPDElasticResult> results_;
 };
 
 /**

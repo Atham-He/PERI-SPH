@@ -11,6 +11,7 @@
  */
 
 #include "pd_materials.h"
+#include "pd_hughes_winget.h"
 
 #include "base_particles.hpp"
 #include "pd_numerics.h"
@@ -115,19 +116,7 @@ void HughesWingetSolid::initializeLocalParameters(BaseParticles *base_particles)
 //=================================================================================================//
 Matd HughesWingetSolid::StressHW(Matd &G, Matd &stress_old, size_t particle_index_i)
 {
-    /** symmetric part of G: rate of deformation tensor */
-    Matd Gsymm = (G + G.transpose()) * 0.5;
-    /** antisymmetric (skew) part of G: rate of rotation tensor */
-    Matd Gskew = (G - G.transpose()) * 0.5;
-
-    Matd delta_sigma = lambda0_ * Gsymm.trace() * Matd::Identity() + 2.0 * G0_ * Gsymm;
-
-    Matd R = Matd::Identity() - Gskew * 0.5;
-    Matd Q = Matd::Identity() + R.inverse() * Gskew;
-
-    Matd trial_sigma = Q * stress_old * Q.transpose();
-
-    return delta_sigma + trial_sigma;
+    return peridynamics::hughesWingetStress(G, stress_old, lambda0_, G0_);
 }
 //=================================================================================================//
 Real HughesWingetSolid::PairNumericalDamping(Real strain_rate, Real smoothing_length)

@@ -16,6 +16,7 @@ if(PERI_SPH_ENABLE_CUDA)
         dpc_point_cuda.cu
         pd_solid_time_step_cuda.cu
         pd_nosb_bond_cuda.cu
+        pd_nosb_elastic_cuda.cu
         pd_fluid_traction_cuda.cu
         pd_fluid_acoustic_cuda.cu
         pd_fluid_viscosity_cuda.cu
@@ -23,7 +24,7 @@ if(PERI_SPH_ENABLE_CUDA)
     set_target_properties(sphinxsys_peri_execution PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED YES)
     target_compile_options(sphinxsys_peri_execution PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
     target_compile_definitions(sphinxsys_peri_execution PRIVATE PERI_SPH_HAS_CUDA=1)
-    set_source_files_properties(dpc_point_cuda.cu "${PERI_EXECUTION_HEADERS}/pd_spatial_derivatives_cuda.cu"
+    set_source_files_properties(dpc_point_cuda.cu pd_nosb_elastic_cuda.cu "${PERI_EXECUTION_HEADERS}/pd_spatial_derivatives_cuda.cu"
         PROPERTIES COMPILE_OPTIONS "--expt-relaxed-constexpr")
     target_link_libraries(sphinxsys_peri_execution PRIVATE CUDA::cudart_static Eigen3::Eigen)
 endif()

@@ -42,6 +42,7 @@ class HughesWingetSolid : public LinearElasticSolid
     /** Hughes-Winget incremental update of the Cauchy stress
      * with the Eulerian velocity gradient G (finite rotation objective). */
     virtual Matd StressHW(Matd &velocity_gradient, Matd &stress_old, size_t particle_index_i);
+    Real FirstLameParameter() const { return lambda0_; }
     /** Kelvin-Voigt type damping stress for bond-pair interaction. */
     virtual Real PairNumericalDamping(Real strain_rate, Real smoothing_length);
     /** bulk modulus used by the Littlewood hourglass control. */

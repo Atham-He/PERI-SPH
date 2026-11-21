@@ -423,7 +423,9 @@ void NosbPDSecondStep::update(size_t index_i, Real dt)
         /** guard BEFORE inverting: a nearly singular F (volume collapsed to a
          * few percent, beyond the resolution limit) produces an exploding
          * inverse and NaN contamination through the bond network. */
-        if (!std::isfinite(detF) || !std::isfinite(detF_half) || detF < 0.05 || detF_half < 0.05)
+        if (!std::isfinite(detF) || !std::isfinite(detF_half) ||
+            detF < peridynamics::nosb_minimum_deformation_determinant ||
+            detF_half < peridynamics::nosb_minimum_deformation_determinant)
         {
             particles_->getVariableDataByName<int>("NumericalFailureReason")[index_i] = 3;
             peridynamics::numericalFailure(sph_body_->Name(), index_i, "DeformationGradient determinant below 0.05");
@@ -443,6 +445,69 @@ void NosbPDSecondStep::update(size_t index_i, Real dt)
     else
     {
         stress_[index_i] = Matd::Zero();
+    }
+}
+//=================================================================================================//
+NosbPDElasticWithExecution::NosbPDElasticWithExecution(
+    BaseInnerRelation &relation, NosbPDBondWorkspace *workspace,
+    std::unique_ptr<peridynamics::NosbPDElasticBatch> backend)
+    : NosbPDDeformationWithExecution<NosbPDSecondStep>(relation, workspace), backend_(std::move(backend))
+{
+    // A derived material may override StressHW and must keep virtual dispatch.
+    if (typeid(hw_solid_) != typeid(HughesWingetSolid))
+        backend_.reset();
+}
+
+void NosbPDElasticWithExecution::exec(Real dt)
+{
+    using namespace peridynamics;
+    if (!backend_)
+    {
+        NosbPDDeformationWithExecution<NosbPDSecondStep>::exec(dt);
+        return;
+    }
+
+    InteractionDynamics<NosbPDSecondStep>::exec(dt);
+    const auto count = particles_->TotalRealParticles();
+    sites_.resize(count);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        if (particleLive_[i] != 1)
+        {
+            sites_[i] = {};
+            continue;
+        }
+        sites_[i] = {packNosbPDTensor(shape_K_1_[i]), packNosbPDTensor(N_[i]), packNosbPDTensor(N_deltaU_[i]),
+                     packNosbPDTensor(N_half_[i]), packNosbPDTensor(stress_[i]), true};
+    }
+
+    backend_->update(sites_, hw_solid_.FirstLameParameter(), hw_solid_.ShearModulus(), Dimensions, results_);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        const auto &result = results_[i];
+        if (result.status == NosbPDElasticStatus::Inactive)
+        {
+            stress_[i].setZero();
+            continue;
+        }
+        F_[i] = unpackNosbPDTensor(result.deformation);
+        F_delta_[i] = unpackNosbPDTensor(result.deformation_delta);
+        F_half_[i] = unpackNosbPDTensor(result.deformation_half);
+        if (result.status == NosbPDElasticStatus::NonFiniteGradient)
+        {
+            particles_->getVariableDataByName<int>("NumericalFailureReason")[i] = 2;
+            numericalFailure(sph_body_->Name(), i, "non-finite DeformationGradient");
+        }
+        if (result.status == NosbPDElasticStatus::InvalidDeterminant)
+        {
+            particles_->getVariableDataByName<int>("NumericalFailureReason")[i] = 3;
+            numericalFailure(sph_body_->Name(), i, "DeformationGradient determinant below 0.05");
+        }
+        F_1_[i] = unpackNosbPDTensor(result.inverse);
+        F_1_half_[i] = unpackNosbPDTensor(result.inverse_half);
+        stress_[i] = unpackNosbPDTensor(result.stress);
+        PK1_[i] = unpackNosbPDTensor(result.piola);
+        T0_[i] = unpackNosbPDTensor(result.force_state);
     }
 }
 //=================================================================================================//
@@ -529,7 +594,9 @@ void NosbPDSecondStepPlastic::update(size_t index_i, Real dt)
         Real detF = F_[index_i].determinant();
         Real detF_half = F_half_[index_i].determinant();
         /** guard BEFORE inverting: see NosbPDSecondStep::update. */
-        if (!std::isfinite(detF) || !std::isfinite(detF_half) || detF < 0.05 || detF_half < 0.05)
+        if (!std::isfinite(detF) || !std::isfinite(detF_half) ||
+            detF < peridynamics::nosb_minimum_deformation_determinant ||
+            detF_half < peridynamics::nosb_minimum_deformation_determinant)
         {
             particles_->getVariableDataByName<int>("NumericalFailureReason")[index_i] = 3;
             peridynamics::numericalFailure(sph_body_->Name(), index_i, "DeformationGradient determinant below 0.05");

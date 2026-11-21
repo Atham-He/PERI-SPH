@@ -244,7 +244,10 @@ int main(int argc, char **argv)
     std::cout << "NOSB-PD position Verlet backend " << (pd_time_integration ? "cuda_fp64" : "cpu_fp64") << std::endl;
     solid_dynamics::NosbPDBondWorkspace pd_bonds(shell_inner, execution->makeNosbPDBonds());
     std::cout << "NOSB-PD internal force backend " << (pd_bonds.onDevice() ? "cuda_fp64" : "cpu_fp64") << std::endl;
-    auto constitutive = peridynamics::makePDConstitutiveDynamics(shell_inner, &pd_bonds);
+    auto pd_elastic = material_options.model == "elastic" ? execution->makeNosbPDElastic() : nullptr;
+    if (material_options.model == "elastic")
+        std::cout << "NOSB-PD elastic stress backend " << (pd_elastic ? "cuda_fp64" : "cpu_fp64") << std::endl;
+    auto constitutive = peridynamics::makePDConstitutiveDynamics(shell_inner, &pd_bonds, std::move(pd_elastic));
     auto fracture = peridynamics::makePDFracture(shell_inner, material_options, fracture_options);
     solid_dynamics::NosbPDStabilizationWithExecution hourglass(pd_bonds, hourglass_coefficient, hourglass_damage_cutoff);
     solid_dynamics::NosbPDDampingWithExecution pd_damping(pd_bonds);

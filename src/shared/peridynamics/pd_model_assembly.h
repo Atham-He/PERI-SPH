@@ -37,7 +37,8 @@ struct PDConstitutiveDynamics
 /** Select by the actual material type. The optional commit runs once after
  * the final drift, never during observation. No geometry-specific rule. */
 inline PDConstitutiveDynamics makePDConstitutiveDynamics(
-    BaseInnerRelation &relation, solid_dynamics::NosbPDBondWorkspace *bond_workspace = nullptr)
+    BaseInnerRelation &relation, solid_dynamics::NosbPDBondWorkspace *bond_workspace = nullptr,
+    std::unique_ptr<NosbPDElasticBatch> elastic_backend = nullptr)
 {
     auto &material = relation.getSPHBody().getMatterMaterial();
     PDConstitutiveDynamics dynamics;
@@ -54,8 +55,8 @@ inline PDConstitutiveDynamics makePDConstitutiveDynamics(
     {
         if (!dynamic_cast<HughesWingetSolid *>(&material))
             throw std::invalid_argument("PD constitutive assembly requires a supported PD material");
-        dynamics.force = makeUnique<solid_dynamics::NosbPDDeformationWithExecution<solid_dynamics::NosbPDSecondStep>>(
-            relation, bond_workspace);
+        dynamics.force = makeUnique<solid_dynamics::NosbPDElasticWithExecution>(
+            relation, bond_workspace, std::move(elastic_backend));
     }
     return dynamics;
 }

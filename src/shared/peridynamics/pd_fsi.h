@@ -134,6 +134,8 @@ class FluidNeighborCache
 class SPHViscosityWorkspace
 {
   public:
+    explicit SPHViscosityWorkspace(const FluidNeighborConfiguration *configuration) : cache_(configuration) {}
+
     enum class Form { Inner, Wall, ReverseWall };
 
     void clearTargets() { targets_.clear(); }
@@ -152,9 +154,16 @@ class SPHViscosityWorkspace
         std::size_t bound;
         Real viscosity, smoothing_length;
     };
+    void configure(FluidViscosityBatch &backend, std::size_t count);
+
+    FluidNeighborCache cache_;
+    const FluidViscosityBatch *configured_backend_ = nullptr;
+    std::unique_ptr<FluidViscosityStencil> stencil_;
     std::vector<Target> targets_;
     std::vector<std::vector<std::size_t>> site_ids_;
+    std::vector<std::pair<std::size_t, std::size_t>> target_sources_;
     FluidViscousRows rows_;
+    std::vector<FluidViscousSite> sites_;
     std::vector<ParticleVector3> forces_;
 };
 
@@ -165,8 +174,9 @@ class ViscousInteractionWithUpdate : public InteractionWithUpdate<LocalDynamicsT
 
   public:
     template <class... Args>
-    explicit ViscousInteractionWithUpdate(FluidViscosityBatch *backend, Args &&...args)
-        : Base(std::forward<Args>(args)...), backend_(backend) {}
+    explicit ViscousInteractionWithUpdate(FluidViscosityBatch *backend, const FluidNeighborConfiguration *configuration,
+                                          Args &&...args)
+        : Base(std::forward<Args>(args)...), backend_(backend), workspace_(configuration) {}
 
   protected:
     void runMainStep(Real dt) override

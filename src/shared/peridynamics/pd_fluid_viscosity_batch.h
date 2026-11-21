@@ -18,18 +18,26 @@ struct FluidViscousPair
 
 struct FluidViscousRows
 {
-    // Source sites occupy the first offsets.size() - 1 entries. Other entries
-    // hold referenced ghost particles and sites on the opposite body.
-    std::vector<FluidViscousSite> sites;
     std::vector<std::size_t> offsets, inner_ends;
     std::vector<FluidViscousPair> pairs;
+};
+
+class FluidViscosityStencil
+{
+  public:
+    virtual ~FluidViscosityStencil() = default;
+    virtual void configure(const FluidViscousRows &rows, std::size_t site_count) = 0;
 };
 
 class FluidViscosityBatch
 {
   public:
     virtual ~FluidViscosityBatch() = default;
-    virtual void evaluate(const FluidViscousRows &rows, std::vector<ParticleVector3> &force) = 0;
+    virtual std::unique_ptr<FluidViscosityStencil> makeStencil() = 0;
+    // Source sites occupy the first entries. The remaining sites supply
+    // referenced ghosts and neighbors on the opposite body.
+    virtual void evaluate(const FluidViscosityStencil &stencil, const std::vector<FluidViscousSite> &sites,
+                          std::vector<ParticleVector3> &force) = 0;
 };
 
 std::unique_ptr<FluidViscosityBatch> makeCudaFluidViscosity();

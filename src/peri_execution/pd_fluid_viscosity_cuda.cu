@@ -45,6 +45,36 @@ __global__ void evaluateViscosity(const FluidViscousSite *sites, const std::size
         force[i].component[axis] = inner.component[axis] * source.volume + contact.component[axis] * source.volume;
 }
 
+class CudaViscosityStencil final : public FluidViscosityStencil
+{
+  public:
+    void configure(const FluidViscousRows &rows, std::size_t site_count) override
+    {
+        configured = false;
+        const auto count = rows.inner_ends.size();
+        if (rows.offsets.size() != count + 1 || rows.offsets.front() != 0 ||
+            rows.offsets.back() != rows.pairs.size() || count > site_count ||
+            std::any_of(rows.pairs.begin(), rows.pairs.end(),
+                        [site_count](const auto &pair) { return pair.target >= site_count; }))
+            throw std::invalid_argument("Invalid fluid viscosity stencil");
+        for (std::size_t i = 0; i < count; ++i)
+            if (rows.offsets[i] > rows.inner_ends[i] || rows.inner_ends[i] > rows.offsets[i + 1])
+                throw std::invalid_argument("Invalid inner/contact split in fluid viscosity stencil");
+
+        upload(offsets, rows.offsets, "fluid viscosity offsets");
+        upload(inner_ends, rows.inner_ends, "fluid viscosity inner offsets");
+        upload(pairs, rows.pairs, "fluid viscosity pairs");
+        row_count = count;
+        this->site_count = site_count;
+        configured = true;
+    }
+
+    std::size_t row_count = 0, site_count = 0;
+    bool configured = false;
+    DeviceBuffer<std::size_t> offsets, inner_ends;
+    DeviceBuffer<FluidViscousPair> pairs;
+};
+
 class CudaFluidViscosity final : public FluidViscosityBatch
 {
   public:
@@ -56,18 +86,18 @@ class CudaFluidViscosity final : public FluidViscosityBatch
         max_blocks_ = static_cast<std::size_t>(limit);
     }
 
-    void evaluate(const FluidViscousRows &rows, std::vector<ParticleVector3> &force) override
+    std::unique_ptr<FluidViscosityStencil> makeStencil() override
     {
-        const auto count = rows.inner_ends.size();
-        if (rows.offsets.size() != count + 1 || rows.offsets.front() != 0 ||
-            rows.offsets.back() != rows.pairs.size() || count > rows.sites.size() ||
-            std::any_of(rows.pairs.begin(), rows.pairs.end(),
-                        [&](const auto &pair) { return pair.target >= rows.sites.size(); }))
-            throw std::invalid_argument("Invalid fluid viscosity stencil");
-        for (std::size_t i = 0; i < count; ++i)
-            if (rows.offsets[i] > rows.inner_ends[i] || rows.inner_ends[i] > rows.offsets[i + 1])
-                throw std::invalid_argument("Invalid inner/contact split in fluid viscosity stencil");
+        return std::make_unique<CudaViscosityStencil>();
+    }
 
+    void evaluate(const FluidViscosityStencil &stencil, const std::vector<FluidViscousSite> &sites,
+                  std::vector<ParticleVector3> &force) override
+    {
+        const auto &geometry = dynamic_cast<const CudaViscosityStencil &>(stencil);
+        if (!geometry.configured || sites.size() != geometry.site_count)
+            throw std::logic_error("Fluid viscosity sites do not match the configured stencil");
+        const auto count = geometry.row_count;
         force.resize(count);
         if (count == 0)
             return;
@@ -76,13 +106,10 @@ class CudaFluidViscosity final : public FluidViscosityBatch
         const auto blocks = (count - 1) / threads + 1;
         if (blocks > max_blocks_)
             throw std::length_error("Fluid viscosity batch exceeds the device grid");
-        upload(sites_, rows.sites, "fluid viscosity sites");
-        upload(offsets_, rows.offsets, "fluid viscosity offsets");
-        upload(inner_ends_, rows.inner_ends, "fluid viscosity inner offsets");
-        upload(pairs_, rows.pairs, "fluid viscosity pairs");
+        upload(sites_, sites, "fluid viscosity sites");
         force_.reserve(count);
-        evaluateViscosity<<<static_cast<unsigned>(blocks), threads>>>(sites_.get(), offsets_.get(),
-            inner_ends_.get(), pairs_.get(), count, force_.get());
+        evaluateViscosity<<<static_cast<unsigned>(blocks), threads>>>(sites_.get(), geometry.offsets.get(),
+            geometry.inner_ends.get(), geometry.pairs.get(), count, force_.get());
         check(cudaGetLastError(), "evaluate fluid viscosity");
         download(force, force_, "fluid viscosity forces");
     }
@@ -90,8 +117,6 @@ class CudaFluidViscosity final : public FluidViscosityBatch
   private:
     std::size_t max_blocks_ = 0;
     DeviceBuffer<FluidViscousSite> sites_;
-    DeviceBuffer<std::size_t> offsets_, inner_ends_;
-    DeviceBuffer<FluidViscousPair> pairs_;
     DeviceBuffer<ParticleVector3> force_;
 };
 }

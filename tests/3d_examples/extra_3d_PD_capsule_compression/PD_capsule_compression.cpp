@@ -195,7 +195,7 @@ int main(int argc, char **argv)
     InteractionWithUpdate<fluid_dynamics::DensitySummationComplexFreeSurface> density_sum(fluid_inner, fluid_walls);
     auto viscosity_backend = execution->makeFluidViscosity();
     peridynamics::ViscousInteractionWithUpdate<fluid_dynamics::ViscousForceWithWallforPD>
-        fluid_viscosity(viscosity_backend.get(), fluid_inner, fluid_walls);
+        fluid_viscosity(viscosity_backend.get(), &fluid_configuration, fluid_inner, fluid_walls);
     std::cout << "Fluid viscosity backend " << (viscosity_backend ? "cuda_fp64" : "cpu_fp64") << std::endl;
     SimpleDynamics<fluid_dynamics::ContinuumVolumeUpdate> update_fluid_volume(liquid);
     SimpleDynamics<peridynamics::FluidKineticWork> fluid_work(liquid);
@@ -216,10 +216,10 @@ int main(int argc, char **argv)
     shell_pressure.setCoeffAcousticDamper(rho0_f, damping_c, fluid_horizon);
     shell_pressure.setAccelerationPressureFactor(pd_pressure_acceleration_factor);
     peridynamics::ViscousInteractionWithUpdate<solid_dynamics::ViscousForceFromFluidforPD>
-        shell_viscosity(viscosity_backend.get(), shell_fluid);
+        shell_viscosity(viscosity_backend.get(), &fluid_configuration, shell_fluid);
     InteractionWithUpdate<solid_dynamics::PressureForceFromFluid<decltype(density)>> upper_pressure(upper_fluid), lower_pressure(lower_fluid);
     peridynamics::ViscousInteractionWithUpdate<solid_dynamics::ViscousForceFromFluidWithExecution>
-        upper_viscosity(viscosity_backend.get(), upper_fluid), lower_viscosity(viscosity_backend.get(), lower_fluid);
+        upper_viscosity(viscosity_backend.get(), &fluid_configuration, upper_fluid), lower_viscosity(viscosity_backend.get(), &fluid_configuration, lower_fluid);
 
     InteractionDynamics<solid_dynamics::ContactRepulsionFactorforPD> contact_factor(shell_plates);
     InteractionDynamics<solid_dynamics::ContactRepulsionFromWallforPD> contact_force(shell_plates, plate_friction_mu, plate_friction_veps);

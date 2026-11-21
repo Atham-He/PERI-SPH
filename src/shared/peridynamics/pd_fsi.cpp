@@ -89,11 +89,11 @@ void SPHViscosityWorkspace::addTarget(Form form, const ParticleConfiguration &co
     targets_.push_back({form, &configuration, velocity, volume, bound, viscosity, smoothing_length});
 }
 
-void SPHViscosityWorkspace::evaluate(FluidViscosityBatch &backend, std::size_t count,
-                                    const Vecd *velocity, const Real *volume, Vecd *force)
+void SPHViscosityWorkspace::configure(FluidViscosityBatch &backend, std::size_t count)
 {
+    cache_.invalidate();
     constexpr auto missing = std::numeric_limits<std::size_t>::max();
-    rows_.sites.resize(count);
+    target_sources_.clear();
     rows_.offsets.assign(count + 1, 0);
     rows_.inner_ends.resize(count);
     rows_.pairs.clear();
@@ -108,7 +108,6 @@ void SPHViscosityWorkspace::evaluate(FluidViscosityBatch &backend, std::size_t c
 
     for (std::size_t i = 0; i < count; ++i)
     {
-        rows_.sites[i] = {packFluidVector(velocity[i]), volume[i]};
         rows_.inner_ends[i] = rows_.pairs.size();
         for (std::size_t k = 0; k < targets_.size(); ++k)
         {
@@ -127,8 +126,8 @@ void SPHViscosityWorkspace::evaluate(FluidViscosityBatch &backend, std::size_t c
                     auto &id = site_ids_[k].at(j - shared);
                     if (id == missing)
                     {
-                        id = rows_.sites.size();
-                        rows_.sites.push_back({packFluidVector(target.velocity[j]), target.volume[j]});
+                        id = count + target_sources_.size();
+                        target_sources_.emplace_back(k, j);
                     }
                     site = id;
                 }
@@ -149,7 +148,30 @@ void SPHViscosityWorkspace::evaluate(FluidViscosityBatch &backend, std::size_t c
         rows_.offsets[i + 1] = rows_.pairs.size();
     }
 
-    backend.evaluate(rows_, forces_);
+    if (!stencil_ || configured_backend_ != &backend)
+        stencil_ = backend.makeStencil();
+    stencil_->configure(rows_, count + target_sources_.size());
+    configured_backend_ = &backend;
+    cache_.configured(count);
+}
+
+void SPHViscosityWorkspace::evaluate(FluidViscosityBatch &backend, std::size_t count,
+                                    const Vecd *velocity, const Real *volume, Vecd *force)
+{
+    if (cache_.needsConfiguration(count) || configured_backend_ != &backend)
+        configure(backend, count);
+
+    sites_.resize(count + target_sources_.size());
+    for (std::size_t i = 0; i < count; ++i)
+        sites_[i] = {packFluidVector(velocity[i]), volume[i]};
+    for (std::size_t n = 0; n < target_sources_.size(); ++n)
+    {
+        const auto [body, particle] = target_sources_[n];
+        const auto &target = targets_[body];
+        sites_[count + n] = {packFluidVector(target.velocity[particle]), target.volume[particle]};
+    }
+
+    backend.evaluate(*stencil_, sites_, forces_);
     for (std::size_t i = 0; i < count; ++i)
         force[i] = unpackFluidVector(forces_[i]);
 }

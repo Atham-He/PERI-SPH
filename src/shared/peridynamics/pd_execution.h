@@ -7,6 +7,7 @@
 #include "pd_fluid_cfl_batch.h"
 #include "pd_fluid_traction_batch.h"
 #include "pd_fluid_viscosity_batch.h"
+#include "pd_nosb_deformation_batch.h"
 #include "pd_solid_time_step.h"
 #include "pd_spatial_derivatives.h"
 
@@ -47,6 +48,7 @@ class PeriExecution
     std::unique_ptr<dpc::PointBatch> makeDpcPoints(const dpc::Model &model) const;
     std::unique_ptr<SolidTimeStepBatch> makeSolidTimeStep(const std::vector<double> &mass) const;
     std::unique_ptr<PositionVerletBatch> makePositionVerlet() const;
+    std::unique_ptr<NosbPDDeformationBatch> makeNosbPDDeformation() const;
     std::unique_ptr<FluidTractionBatch> makeFluidTraction() const;
     std::unique_ptr<FluidAcousticBatch> makeFluidAcoustic() const;
     std::unique_ptr<FluidViscosityBatch> makeFluidViscosity() const;

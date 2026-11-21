@@ -29,6 +29,7 @@
 
 #include <Eigen/Eigenvalues>
 
+#include "pd_nosb_deformation_batch.h"
 #include "pd_solid_time_step.h"
 #include "dynamics_algorithms.h"
 
@@ -150,6 +151,51 @@ class NosbPDSecondStepPlastic : public LocalDynamics, public DataDelegateInner
     Matd *F_half_, *F_delta_, *F_1_, *F_1_half_;
     Matd *PK1_, *T0_, *stress_, *plastic_strain_;
     Real *plastic_work_;
+};
+
+class NosbPDDeformationWorkspace
+{
+  public:
+    NosbPDDeformationWorkspace(BaseInnerRelation &relation, std::unique_ptr<peridynamics::NosbPDDeformationBatch> backend)
+        : relation_(relation), backend_(std::move(backend)) {}
+
+    bool onDevice() const { return static_cast<bool>(backend_); }
+    void evaluate(Real dt, Matd *full, Matd *increment, Matd *midpoint);
+
+  private:
+    void configure(std::size_t count, std::size_t bound);
+
+    BaseInnerRelation &relation_;
+    std::unique_ptr<peridynamics::NosbPDDeformationBatch> backend_;
+    std::vector<std::size_t> offsets_, ghost_sources_;
+    std::vector<peridynamics::NosbPDKinematicSite> sites_;
+    std::vector<std::uint8_t> bond_live_;
+    std::vector<peridynamics::NosbPDDeformationTensors> tensors_;
+    std::size_t bound_ = 0;
+};
+
+template <class Stage>
+class NosbPDDeformationWithExecution : public InteractionWithUpdate<Stage>
+{
+    using Base = InteractionWithUpdate<Stage>;
+
+  public:
+    NosbPDDeformationWithExecution(BaseInnerRelation &relation,
+                                   std::unique_ptr<peridynamics::NosbPDDeformationBatch> backend)
+        : Base(relation), workspace_(relation, std::move(backend)) {}
+
+    bool onDevice() const { return workspace_.onDevice(); }
+
+    void runMainStep(Real dt) override
+    {
+        if (workspace_.onDevice())
+            workspace_.evaluate(dt, this->N_, this->N_deltaU_, this->N_half_);
+        else
+            Base::runMainStep(dt);
+    }
+
+  private:
+    NosbPDDeformationWorkspace workspace_;
 };
 
 /**

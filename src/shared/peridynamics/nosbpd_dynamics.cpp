@@ -78,7 +78,7 @@ void NosbPDShapeMatrix::update(size_t index_i, Real dt)
 //=================================================================================================//
 namespace
 {
-peridynamics::ParticleVector3 packPositionVerlet(const Vecd &value)
+peridynamics::ParticleVector3 packPDVector(const Vecd &value)
 {
     peridynamics::ParticleVector3 packed{};
     for (int axis = 0; axis < Dimensions; ++axis)
@@ -86,11 +86,20 @@ peridynamics::ParticleVector3 packPositionVerlet(const Vecd &value)
     return packed;
 }
 
-Vecd unpackPositionVerlet(const peridynamics::ParticleVector3 &value)
+Vecd unpackPDVector(const peridynamics::ParticleVector3 &value)
 {
     Vecd result;
     for (int axis = 0; axis < Dimensions; ++axis)
         result[axis] = value.component[axis];
+    return result;
+}
+
+Matd unpackNosbPDTensor(const peridynamics::ShapeHessian3 &tensor)
+{
+    Matd result;
+    for (int i = 0; i < Dimensions; ++i)
+        for (int j = 0; j < Dimensions; ++j)
+            result(i, j) = tensor.derivative[i][j];
     return result;
 }
 
@@ -140,13 +149,91 @@ void NosbPDFirstStep::evaluateDevice(peridynamics::PositionVerletBatch &backend,
     for (std::size_t i = 0; i < count; ++i)
     {
         prepare(i);
-        device_input_[i] = {packPositionVerlet(pos_[i]), packPositionVerlet(vel_[i])};
+        device_input_[i] = {packPDVector(pos_[i]), packPDVector(vel_[i])};
     }
     backend.start(device_input_, dt, device_output_);
     for (std::size_t i = 0; i < count; ++i)
-        pos_[i] = unpackPositionVerlet(device_output_[i]);
+        pos_[i] = unpackPDVector(device_output_[i]);
 }
 //=================================================================================================//
+void NosbPDDeformationWorkspace::configure(std::size_t count, std::size_t bound)
+{
+    using namespace peridynamics;
+    const auto missing = std::numeric_limits<std::size_t>::max();
+    std::vector<std::size_t> ghost_indices(bound - count, missing);
+    std::vector<NosbPDBondGeometry> bonds;
+    offsets_.clear();
+    ghost_sources_.clear();
+    std::vector<std::size_t> offsets(1, 0);
+    offsets.reserve(count + 1);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        const auto &row = relation_.inner_configuration_[i];
+        for (std::size_t n = 0; n < row.current_size_; ++n)
+        {
+            const auto j = row.j_[n];
+            auto target = j;
+            if (j >= count)
+            {
+                auto &slot = ghost_indices.at(j - count);
+                if (slot == missing)
+                {
+                    slot = count + ghost_sources_.size();
+                    ghost_sources_.push_back(j);
+                }
+                target = slot;
+            }
+            const Vecd reference = -row.r_ij_[n] * row.e_ij_[n];
+            bonds.push_back({target, packPDVector(reference), row.W_ij_[n]});
+        }
+        offsets.push_back(bonds.size());
+    }
+    bond_live_.resize(bonds.size());
+    backend_->configure(count + ghost_sources_.size(), offsets, bonds);
+    offsets_ = std::move(offsets);
+    bound_ = bound;
+}
+
+void NosbPDDeformationWorkspace::evaluate(Real dt, Matd *full, Matd *increment, Matd *midpoint)
+{
+    auto &particles = relation_.getSPHBody().getBaseParticles();
+    const auto count = particles.TotalRealParticles();
+    const auto bound = particles.ParticlesBound();
+    // Pack the frozen geometry on first use, after checkpoint restore.
+    if (offsets_.size() != count + 1 || bound_ != bound)
+        configure(count, bound);
+    const auto *position = particles.getVariableDataByName<Vecd>("Position");
+    const auto *velocity = particles.getVariableDataByName<Vecd>("Velocity");
+    const auto *volume = particles.getVariableDataByName<Real>("VolumetricMeasure");
+    const auto *active = particles.getVariableDataByName<int>("ParticleLive");
+
+    sites_.resize(count + ghost_sources_.size());
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        sites_[i] = {packPDVector(position[i]), packPDVector(velocity[i]), volume[i], active[i] == 1};
+        const auto &row = relation_.inner_configuration_[i];
+        if (row.current_size_ != offsets_[i + 1] - offsets_[i])
+            throw std::logic_error("NOSB-PD reference row changed after deformation workspace initialization");
+        for (std::size_t n = 0; n < row.current_size_; ++n)
+            bond_live_[offsets_[i] + n] = row.bondLive_[n];
+    }
+    for (std::size_t n = 0; n < ghost_sources_.size(); ++n)
+    {
+        const auto j = ghost_sources_[n];
+        sites_[count + n] = {packPDVector(position[j]), packPDVector(velocity[j]), volume[j], false};
+    }
+
+    backend_->evaluate(sites_, bond_live_, dt, tensors_);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        if (active[i] != 1)
+            continue;
+        full[i] = unpackNosbPDTensor(tensors_[i].full);
+        increment[i] = unpackNosbPDTensor(tensors_[i].increment);
+        midpoint[i] = unpackNosbPDTensor(tensors_[i].midpoint);
+    }
+}
+
 NosbPDSecondStep::
     NosbPDSecondStep(BaseInnerRelation &inner_relation)
     : LocalDynamics(inner_relation.getSPHBody()), DataDelegateInner(inner_relation),
@@ -588,9 +675,9 @@ void NosbPDFourthStep::evaluateDevice(peridynamics::PositionVerletBatch &backend
     const auto count = particles_->TotalRealParticles();
     device_input_.resize(count);
     for (std::size_t i = 0; i < count; ++i)
-        device_input_[i] = {packPositionVerlet(pos_[i]), packPositionVerlet(vel_[i]), packPositionVerlet(acc_[i]),
-                            packPositionVerlet(internal_[i]), packPositionVerlet(hg_[i]), packPositionVerlet(damping_[i]),
-                            packPositionVerlet(viscous_[i]), packPositionVerlet(friction_[i]), packPositionVerlet(acoustic_[i]),
+        device_input_[i] = {packPDVector(pos_[i]), packPDVector(vel_[i]), packPDVector(acc_[i]),
+                            packPDVector(internal_[i]), packPDVector(hg_[i]), packPDVector(damping_[i]),
+                            packPDVector(viscous_[i]), packPDVector(friction_[i]), packPDVector(acoustic_[i]),
                             mass_[i], boundary_power_[i], friction_boundary_power_[i]};
 
     backend.finish(device_input_, dt, device_output_);
@@ -605,9 +692,9 @@ void NosbPDFourthStep::evaluateDevice(peridynamics::PositionVerletBatch &backend
         acoustic_work_[i] += result.acoustic_work;
         boundary_work_[i] += result.boundary_work;
         friction_loss_[i] += result.friction_loss;
-        vel_[i] = unpackPositionVerlet(result.velocity);
+        vel_[i] = unpackPDVector(result.velocity);
         checkPositionVerletVelocity(*sph_body_, *particles_, i, vel_[i]);
-        pos_[i] = unpackPositionVerlet(result.position);
+        pos_[i] = unpackPDVector(result.position);
     }
 }
 //=================================================================================================//

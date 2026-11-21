@@ -171,7 +171,7 @@ std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesy
     candidate.point=slave_points;
     candidate.area=areas;
     candidate.stress_pairs={{anchors({Vecd::Zero()},-1).front(),anchors({Vecd::Zero()},1).front()}};
-    Growth growth(ref,bulk,port,ft,Gc,dp,K,{candidate},Growth::SurfaceLaw::ContactOnly,projection.get());
+    Growth growth(ref,bulk,port,ft,Gc,dp,K,{candidate},Growth::SurfaceLaw::ContactOnly,projection.get(),execution.makeCrackStrength());
     growth.affine_contact_traces=true;
     auto energy=[&](){
         bulk.evaluateAll();
@@ -496,7 +496,7 @@ std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesy
    for(size_t i=0;i<count;++i){s.x[i]=saved_x[i];s.v[i]=saved_v[i];}
    if(!passed)throw std::runtime_error("Cohesive history comparison or energy failed the prescribed unload check");
   }
-  auto automatic_growth=runAutomaticGrowthBenchmark(out,ref,bulk,port,intact_topology,s.x0,s.mass,s.x,s.v,acc,E,nu,ft,Gc,dp,t,K,nx,ny,projection.get());
+  auto automatic_growth=runAutomaticGrowthBenchmark(out,ref,bulk,port,intact_topology,s.x0,s.mass,s.x,s.v,acc,E,nu,ft,Gc,dp,t,K,nx,ny,projection.get(),execution.makeCrackStrength());
  if(automatic_growth.completed_only){std::ofstream report(out/"acceptance.json");report<<R"({"geometry_status":"PASSED","overall_status":"DYNAMIC_STAGE_COMPLETE_GC_PENDING","capsule_restart_allowed":false})"<<'\n';std::cout<<"COMPLETED_DYNAMIC_CHECKPOINT_SAVED"<<std::endl;return 86;}
   bool pass=geometry_pass&&automatic_growth.passed;
  std::ofstream report(out/"acceptance.json");report<<std::setprecision(17)<<"{\"geometry_status\":\""<<(geometry_pass?"PASSED":"FAILED")<<"\",\"overall_status\":\""<<(pass?"PASSED":"FAILED")<<"\",\"capsule_restart_allowed\":false,\"growth_insertion_status\":\""<<(automatic_growth.passed?"PASSED":"FAILED")<<"\",\"fracture_checkpoint_roundtrip_passed\":true,\"corrupt_or_incompatible_checkpoint_rejected\":true,\"topology_cache_guards_passed\":true,\"specimens\":1,\"physical_particles\":"<<count<<",\"disconnected_components\":"<<component_count<<",\"broken_bond_pairs\":"<<broken<<",\"live_damage_history_preserved\":"<<(damage_history_preserved?"true":"false")<<",\"live_damage_energy_over_E_volume\":"<<live_damage_energy<<",\"live_damage_force_over_E_area\":"<<live_damage_force<<",\"live_bonds_crossing_precrack\":"<<bad_bonds<<",\"maximum_visual_opening_m\":0.0006,\"sliding_m\":"<<2*dp<<",\"bulk_energy_over_E_volume\":"<<max_bulk<<",\"contact_force_error_over_E_area\":"<<max_contact_error<<",\"sliding_force_over_E_area\":"<<max_slip<<",\"gap_error_over_spacing\":"<<max_gap_error<<",\"force_energy_relative_error\":"<<max_fd<<",\"force_balance\":"<<max_balance<<",\"torque_balance\":"<<max_torque<<",\"outside_projections\":"<<outside<<",\"explicit_undamped_steps\":200,\"explicit_dt_s\":"<<dt<<",\"explicit_energy_relative_drift\":"<<drift<<",\"cohesive_Gc_J_m2\":"<<work<<",\"cohesive_Gc_relative_error\":"<<gc_error<<",\"cohesive_peak_relative_error\":"<<strength_error<<",\"growth_topology_insertion_tested\":true,\"material_parameters_changed\":false,\"particles_deleted\":0}\n";

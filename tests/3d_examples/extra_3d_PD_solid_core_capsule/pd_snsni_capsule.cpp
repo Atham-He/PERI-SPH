@@ -162,8 +162,10 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells,const PeriExec
     auto bank=ExtrinsicCrackGrowth::readBank(fracture_bank_input,geometry);
     using SurfaceLaw=ExtrinsicCrackGrowth::SurfaceLaw;
     auto crack_projection=execution.makeCrackProjection();
+    auto crack_strength=execution.makeCrackStrength();
+    std::cout << "Crack strength screening backend " << (crack_strength ? "cuda_fp64" : "cpu_fp64") << std::endl;
     ExtrinsicCrackGrowth growth(sr,sb,pd_port,o.fracture_stress,o.fracture_energy,o.pd_spacing,Kcontact,bank,
-                                fracture_contact_only?SurfaceLaw::ContactOnly:SurfaceLaw::Cohesive,crack_projection.get());
+                                fracture_contact_only?SurfaceLaw::ContactOnly:SurfaceLaw::Cohesive,crack_projection.get(),std::move(crack_strength));
     growth.affine_contact_traces=affine_crack_contact&&recovery::checkpoint.resume.empty();
     cr.releasePreprocessingCache();
     size_t count=cn+sn;StdVec<Real>mass(count);Field X(count);

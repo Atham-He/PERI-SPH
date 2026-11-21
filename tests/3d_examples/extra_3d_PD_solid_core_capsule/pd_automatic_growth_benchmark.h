@@ -9,7 +9,7 @@ inline AutomaticGrowthAcceptance runAutomaticGrowthBenchmark(
     SolidForcePort&port,const PDLayeredFractureReference::TopologyState&intact,
     const StdVec<Vecd>&X,const Real*mass,Vecd*position,Vecd*velocity,Vecd*acc,
     Real E,Real nu,Real ft,Real Gc,Real dp,Real thickness,Real K,int nx,int ny,
-    CrackProjectionBatch *projection)
+    CrackProjectionBatch *projection, std::unique_ptr<CrackStrengthBatch> strength_backend)
 {
     using Growth=ExtrinsicCrackGrowth;using Field=std::vector<Vecd>;
     const size_t count=X.size(),columns=count/3;const Real L=nx*dp,Y=ny*dp;
@@ -22,7 +22,7 @@ inline AutomaticGrowthAcceptance runAutomaticGrowthBenchmark(
         for(Real a:{-1/std::sqrt(Real(3)),1/std::sqrt(Real(3))})for(size_t k=0;k<3;++k){c.point.push_back(Vecd(0,.5*(hi+lo)+.5*(hi-lo)*a,.5*thickness*rule.xi[k]));c.area.push_back(.5*(hi-lo)*.5*thickness*rule.weight[k]);}
         for(size_t layer=0;layer<3;++layer){size_t minus=count,plus=count;Real dm=1,dp2=1;Vecd q(0,.5*(lo+hi),.5*thickness*rule.xi[layer]);for(size_t j=layer*columns;j<(layer+1)*columns;++j){Real distance=(X[j]-q).squaredNorm();if(X[j][0]<0&&distance<dm){dm=distance;minus=j;}if(X[j][0]>0&&distance<dp2){dp2=distance;plus=j;}}c.stress_pairs.push_back({minus,plus});}bank.push_back(c);
     }
-    Growth growth(ref,bulk,port,ft,Gc,dp,K,bank,Growth::SurfaceLaw::Cohesive,projection);
+    Growth growth(ref,bulk,port,ft,Gc,dp,K,bank,Growth::SurfaceLaw::Cohesive,projection,std::move(strength_backend));
     Field force(count),v(count,Vecd::Zero()),inverse_mass(count),old_force;
     std::vector<bool>fixed(count);for(size_t i=0;i<count;++i){size_t ix=(i%columns)/ny;fixed[i]=ix==0||ix==size_t(nx-1);inverse_mass[i]=fixed[i]?Vecd::Zero():Vecd::Constant(1/mass[i]);}
     auto bulkForce=[&](){bulk.evaluateAll();port.clear();growth.applyContact();bulk.recomputeForces();tbb::parallel_for(size_t(0),count,[&](size_t i){force[i]=mass[i]*acc[i]+mass[i]*port.external[i];});};

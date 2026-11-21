@@ -63,6 +63,15 @@ std::unique_ptr<CrackProjectionBatch> PeriExecution::makeCrackProjection() const
     return nullptr;
 }
 
+std::unique_ptr<CrackStrengthBatch> PeriExecution::makeCrackStrength() const
+{
+#if defined(PERI_SPH_HAS_CUDA)
+    if (mode_ == PeriExecutionMode::GPU)
+        return makeCudaCrackStrength();
+#endif
+    return nullptr;
+}
+
 std::unique_ptr<BondedInterfaceBatch> PeriExecution::makeBondedInterface() const
 {
 #if defined(PERI_SPH_HAS_CUDA)

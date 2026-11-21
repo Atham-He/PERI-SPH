@@ -3,6 +3,7 @@
 #include "dpc_point_batch.h"
 #include "pd_bonded_interface_batch.h"
 #include "pd_crack_projection.h"
+#include "pd_crack_strength_batch.h"
 #include "pd_fluid_acoustic_batch.h"
 #include "pd_fluid_cfl_batch.h"
 #include "pd_fluid_traction_batch.h"
@@ -46,6 +47,7 @@ class PeriExecution
     bool bondedInterfaceOnDevice() const noexcept { return bonded_interface_; }
 
     std::unique_ptr<CrackProjectionBatch> makeCrackProjection() const;
+    std::unique_ptr<CrackStrengthBatch> makeCrackStrength() const;
     std::unique_ptr<BondedInterfaceBatch> makeBondedInterface() const;
     std::unique_ptr<SpatialDerivativeBatch> makeSpatialDerivatives() const;
     std::unique_ptr<dpc::PointBatch> makeDpcPoints(const dpc::Model &model) const;

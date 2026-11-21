@@ -3,6 +3,7 @@
 #include "pd_fracture_visible_surface.h"
 #include "pd_cohesive_surface_evolution.h"
 #include "pd_fracture_patch_partition.h"
+#include "pd_crack_strength_batch.h"
 #include <memory>
 #include <functional>
 #include <fstream>
@@ -26,6 +27,9 @@ namespace SPH::peridynamics {
  */
 class ExtrinsicCrackGrowth {
     CrackProjectionBatch *contact_projection_;
+    std::unique_ptr<CrackStrengthBatch> strength_backend_;
+    mutable std::vector<CrackStrengthState> strength_nodes_;
+    mutable std::vector<CrackStrengthResult> strength_results_;
 
  public:
     enum class SurfaceLaw { Cohesive, ContactOnly };
@@ -49,7 +53,7 @@ class ExtrinsicCrackGrowth {
     std::unique_ptr<CrackSurfaceContactNetwork>contact_network;
     Reference&reference;Bulk&bulk;SolidForcePort&port;
     Real ft,Gc,delta_f,spacing,contact_K;
-    std::vector<Candidate>candidates;std::vector<Patch>patches;
+    const std::vector<Candidate>candidates;std::vector<Patch>patches;
     bool affine_contact_traces=false;
     // Only retained until the first subsequent topology rebuild.
     StdVec<Vecd> affine_contact_transfer_positions;
@@ -61,10 +65,26 @@ class ExtrinsicCrackGrowth {
     std::string last_rejection;
     struct InsertionAudit {size_t candidate=0;Real area=0,old_energy=0,new_energy=0,old_bulk=0,new_bulk=0,old_cohesive=0,new_cohesive=0,old_contact=0,new_contact=0,new_dissipation=0,maximum_birth_gap=0,maximum_birth_velocity_jump=0,defect=0,fraction=0,old_stabilizer=0,new_stabilizer=0,total_defect=0;} last_insertion;
     ExtrinsicCrackGrowth(Reference&r,Bulk&b,SolidForcePort&p,Real strength,Real energy,Real dp,Real K,const std::vector<Candidate>&bank,
-                         SurfaceLaw law=SurfaceLaw::Cohesive,CrackProjectionBatch *contact_projection=nullptr)
-      :contact_projection_(contact_projection),surface_law(law),reference(r),bulk(b),port(p),ft(strength),Gc(energy),delta_f(2*energy/strength),spacing(dp),contact_K(K),candidates(bank),active(bank.size(),0){
+                         SurfaceLaw law=SurfaceLaw::Cohesive,CrackProjectionBatch *contact_projection=nullptr,
+                         std::unique_ptr<CrackStrengthBatch> strength_backend=nullptr)
+      :contact_projection_(contact_projection),strength_backend_(std::move(strength_backend)),surface_law(law),reference(r),bulk(b),port(p),ft(strength),Gc(energy),delta_f(2*energy/strength),spacing(dp),contact_K(K),candidates(bank),active(bank.size(),0){
         if(std::min({ft,Gc,spacing,contact_K})<=0)throw std::invalid_argument("Invalid extrinsic fracture inputs");
         for(const auto&c:bank){if(c.point.empty()||c.point.size()!=c.area.size()||c.barrier.empty()||c.stress_pairs.empty()||std::abs(c.normal.norm()-1)>1e-8)throw std::invalid_argument("Invalid crack candidate bank");for(auto ij:c.stress_pairs)if(ij.first>=port.count||ij.second>=port.count)throw std::invalid_argument("Crack strength sample index");}
+        if (strength_backend_)
+        {
+            std::vector<CrackStrengthCandidate> geometry;
+            std::vector<CrackStrengthPair> pairs;
+            geometry.reserve(candidates.size());
+            for (const auto &candidate : candidates)
+            {
+                const auto begin = pairs.size();
+                for (const auto &pair : candidate.stress_pairs)
+                    pairs.push_back({pair.first, pair.second});
+                geometry.push_back({{candidate.normal[0], candidate.normal[1], candidate.normal[2]}, begin, pairs.size()});
+            }
+            strength_backend_->configure(port.count, geometry, pairs);
+            strength_nodes_.resize(port.count);
+        }
     }
     Field positions()const{return Field(port.position,port.position+port.count);}
     void rebuildTraces()
@@ -126,8 +146,65 @@ class ExtrinsicCrackGrowth {
         }
         CohesiveSurfaceEvolution model(ft,Gc,quadrature());
         for(size_t k=0;k<history.size();++k){auto g=model.kinematics(k,q);Real A=model.quadrature[k].area;stored+=A*model.stored(g.jump,history[k].kappa);dissipated+=A*model.dissipation(history[k].kappa);max_gap=std::max(max_gap,std::max(g.normal_gap,Real(0)));failed_quadrature+=history[k].kappa>=delta_f;}}
-    Real strengthRatio(size_t k)const {const auto&c=candidates[k];Real maximum=0;for(auto ij:c.stress_pairs){Matd P=.5*(bulk.P[ij.first]+bulk.P[ij.second]),F=.5*(bulk.F[ij.first]+bulk.F[ij.second]);Vecd n=F.determinant()*F.inverse().transpose()*c.normal;if(!n.allFinite()||n.norm()==0)throw std::runtime_error("Invalid current crack initiation normal");n.normalize();Vecd T=P*c.normal;Real normal=T.dot(n);if(normal>0)maximum=std::max(maximum,T.norm()/ft);}return maximum;}
-    size_t select()const {size_t best=candidates.size();Real ratio=1;for(size_t k=0;k<candidates.size();++k)if(!active[k]){Real r=strengthRatio(k);if(r>=ratio){ratio=r;best=k;}}return best;}
+    CrackStrengthState strengthNode(size_t i) const
+    {
+        CrackStrengthState state;
+        for (int a = 0; a < 3; ++a)
+            for (int b = 0; b < 3; ++b)
+            {
+                state.deformation[a][b] = bulk.F[i](a,b);
+                state.piola[a][b] = bulk.P[i](a,b);
+            }
+        return state;
+    }
+
+    Real strengthRatio(size_t k) const
+    {
+        const auto &candidate = candidates[k];
+        Real maximum = 0;
+        for (const auto &pair : candidate.stress_pairs)
+        {
+            const Matd P = .5 * (bulk.P[pair.first] + bulk.P[pair.second]);
+            const Matd F = .5 * (bulk.F[pair.first] + bulk.F[pair.second]);
+            Vecd normal = F.determinant() * F.inverse().transpose() * candidate.normal;
+            if (!normal.allFinite() || normal.norm() == 0)
+                throw std::runtime_error("Invalid current crack initiation normal");
+            normal.normalize();
+            const Vecd traction = P * candidate.normal;
+            if (traction.dot(normal) > 0)
+                maximum = std::max(maximum, traction.norm() / ft);
+        }
+        return maximum;
+    }
+
+    size_t select() const
+    {
+        if (strength_backend_)
+        {
+            for (size_t i = 0; i < strength_nodes_.size(); ++i)
+                strength_nodes_[i] = strengthNode(i);
+            strength_backend_->evaluate(strength_nodes_, active, ft, strength_results_);
+            if (strength_results_.size() != candidates.size())
+                throw std::logic_error("Crack strength backend returned an incomplete batch");
+        }
+
+        size_t best = candidates.size();
+        Real maximum = 1;
+        for (size_t k = 0; k < candidates.size(); ++k)
+        {
+            if (active[k])
+                continue;
+            if (strength_backend_ && !strength_results_[k].valid)
+                throw std::runtime_error("Invalid current crack initiation normal");
+            const Real ratio = strength_backend_ ? Real(strength_results_[k].ratio) : strengthRatio(k);
+            if (ratio >= maximum)
+            {
+                maximum = ratio;
+                best = k;
+            }
+        }
+        return best;
+    }
     Patch makePatch(size_t k,const StdVec<Vecd>&minus_values={},const StdVec<Vecd>&plus_values={},
                     const StdVec<Vecd>&minus_velocity={},const StdVec<Vecd>&plus_velocity={},
                     std::shared_ptr<const FractureIntegrationPatch> integration={}){

@@ -14,6 +14,7 @@ if(PERI_SPH_ENABLE_CUDA)
         "${PERI_EXECUTION_HEADERS}/pd_bonded_interface_cuda.cu"
         "${PERI_EXECUTION_HEADERS}/pd_spatial_derivatives_cuda.cu"
         dpc_point_cuda.cu
+        pd_crack_strength_cuda.cu
         pd_solid_time_step_cuda.cu
         pd_nosb_bond_cuda.cu
         pd_nosb_elastic_cuda.cu

@@ -197,11 +197,28 @@ class PDFluidAcousticWorkspace
                              std::unique_ptr<peridynamics::FluidAcousticBatch> backend, Real acceleration_factor);
     bool onDevice() const { return static_cast<bool>(backend_); }
 
+    // Keep this scope within one fixed neighbor configuration. Begin a new
+    // scope after rebuilding or restoring the relations, or sorting particles.
+    class FixedConfiguration
+    {
+      public:
+        ~FixedConfiguration();
+        FixedConfiguration(const FixedConfiguration &) = delete;
+        FixedConfiguration &operator=(const FixedConfiguration &) = delete;
+
+      private:
+        friend class PDFluidAcousticWorkspace;
+        explicit FixedConfiguration(PDFluidAcousticWorkspace &workspace);
+        PDFluidAcousticWorkspace &workspace_;
+    };
+    [[nodiscard]] FixedConfiguration reuseConfiguration() { return FixedConfiguration(*this); }
+
   private:
     friend class PDFluidPressureHalf;
     friend class PDFluidDensityHalf;
     friend class PDFluidVelocityDivergence;
     friend class PDFluidAcousticDamping;
+    void configure(std::size_t count, std::size_t bound);
     void compute(peridynamics::FluidAcousticStage stage);
     void evaluateHalf(peridynamics::FluidAcousticStage stage);
 
@@ -213,8 +230,11 @@ class PDFluidAcousticWorkspace
     StdVec<Real> wall_acceleration_factors_;
     std::vector<peridynamics::FluidAcousticSite> fluid_sites_;
     std::vector<peridynamics::FluidAcousticWall> wall_sites_;
-    std::vector<std::size_t> ghost_indices_;
+    std::vector<std::size_t> ghost_indices_, ghost_sources_;
     std::vector<std::vector<std::size_t>> wall_indices_;
+    std::vector<std::pair<std::size_t, std::size_t>> wall_sources_;
+    std::size_t scope_depth_ = 0, configured_count_ = 0;
+    bool configuration_ready_ = false;
     peridynamics::FluidAcousticStencil inner_stencil_, wall_stencil_;
     std::vector<peridynamics::FluidAcousticResult> results_;
 };

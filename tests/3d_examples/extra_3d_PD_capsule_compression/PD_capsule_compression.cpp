@@ -549,7 +549,7 @@ int main(int argc, char **argv)
                 if (with_liquid && reinitialize_density) {density_sum.exec(); check_fluid();}
                 Real Dt = peridynamics::boundedTimeStep(with_liquid ? advection_step.exec() : pd_dt * 20, {target_time - time});
                 Real advection_end = time + Dt;
-                while (time < advection_end)
+                for (const auto configuration = acoustic.reuseConfiguration(); time < advection_end;)
                 {
                     Real solid_dt = shell_step.exec();
                     // Bound the explicit fluid-solid exchange as well as the fluid acoustic CFL.

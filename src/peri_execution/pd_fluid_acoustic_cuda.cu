@@ -193,50 +193,62 @@ class CudaFluidAcoustic final : public FluidAcousticBatch
         max_blocks_ = static_cast<std::size_t>(maximum);
     }
 
-    void evaluate(FluidAcousticStage half, std::size_t count, const std::vector<FluidAcousticSite> &sites,
-                  const std::vector<FluidAcousticWall> &walls, const FluidAcousticStencil &inner,
-                  const FluidAcousticStencil &wall, FluidAcousticCoefficients coefficients,
+    void configure(std::size_t count, std::size_t fluid_sites, std::size_t wall_sites,
+                   const FluidAcousticStencil &inner, const FluidAcousticStencil &wall) override
+    {
+        configured_ = false;
+        if (count > fluid_sites || !validStencil(inner, count, fluid_sites) || !validStencil(wall, count, wall_sites))
+            throw std::invalid_argument("Invalid fluid acoustic stencil");
+        if (count && (count - 1) / threads_ + 1 > max_blocks_)
+            throw std::length_error("Fluid acoustic batch exceeds the device grid");
+        inner_.uploadRows(inner);
+        wall_.uploadRows(wall);
+        count_ = count;
+        fluid_sites_ = fluid_sites;
+        wall_sites_ = wall_sites;
+        configured_ = true;
+    }
+
+    void evaluate(FluidAcousticStage stage, const std::vector<FluidAcousticSite> &sites,
+                  const std::vector<FluidAcousticWall> &walls, FluidAcousticCoefficients coefficients,
                   std::vector<FluidAcousticResult> &result) override
     {
-        if (count > sites.size() || !validStencil(inner, count, sites.size()) || !validStencil(wall, count, walls.size()))
-            throw std::invalid_argument("Invalid fluid acoustic stencil");
+        if (!configured_ || sites.size() != fluid_sites_ || walls.size() != wall_sites_)
+            throw std::logic_error("Fluid acoustic sites do not match the configured stencil");
+
+        const auto count = count_;
         result.resize(count);
         if (count == 0)
             return;
-
-        constexpr unsigned threads = 128;
-        const auto blocks = (count - 1) / threads + 1;
-        if (blocks > max_blocks_)
-            throw std::length_error("Fluid acoustic batch exceeds the device grid");
         upload(sites_, sites, "fluid acoustic sites");
         upload(walls_, walls, "fluid acoustic walls");
-        inner_.uploadRows(inner);
-        wall_.uploadRows(wall);
         result_.reserve(count);
 
-        const auto grid = static_cast<unsigned>(blocks);
-        switch (half)
+        const auto grid = static_cast<unsigned>((count - 1) / threads_ + 1);
+        switch (stage)
         {
         case FluidAcousticStage::Pressure:
-            evaluateAcoustic<true><<<grid, threads>>>(sites_.get(), walls_.get(),
+            evaluateAcoustic<true><<<grid, threads_>>>(sites_.get(), walls_.get(),
                 inner_.offsets.get(), inner_.neighbors.get(), wall_.offsets.get(), wall_.neighbors.get(),
                 count, coefficients, result_.get());
             break;
         case FluidAcousticStage::Density:
-            evaluateAcoustic<false><<<grid, threads>>>(sites_.get(), walls_.get(),
+            evaluateAcoustic<false><<<grid, threads_>>>(sites_.get(), walls_.get(),
                 inner_.offsets.get(), inner_.neighbors.get(), wall_.offsets.get(), wall_.neighbors.get(),
                 count, coefficients, result_.get());
             break;
         case FluidAcousticStage::Divergence:
-            evaluateAcousticCorrection<false><<<grid, threads>>>(sites_.get(), walls_.get(),
+            evaluateAcousticCorrection<false><<<grid, threads_>>>(sites_.get(), walls_.get(),
                 inner_.offsets.get(), inner_.neighbors.get(), wall_.offsets.get(), wall_.neighbors.get(),
                 count, result_.get());
             break;
         case FluidAcousticStage::Damping:
-            evaluateAcousticCorrection<true><<<grid, threads>>>(sites_.get(), walls_.get(),
+            evaluateAcousticCorrection<true><<<grid, threads_>>>(sites_.get(), walls_.get(),
                 inner_.offsets.get(), inner_.neighbors.get(), wall_.offsets.get(), wall_.neighbors.get(),
                 count, result_.get());
             break;
+        default:
+            throw std::invalid_argument("Invalid fluid acoustic stage");
         }
 
         check(cudaGetLastError(), "evaluate fluid acoustic interactions");
@@ -244,7 +256,10 @@ class CudaFluidAcoustic final : public FluidAcousticBatch
     }
 
   private:
+    static constexpr unsigned threads_ = 128;
     std::size_t max_blocks_ = 0;
+    std::size_t count_ = 0, fluid_sites_ = 0, wall_sites_ = 0;
+    bool configured_ = false;
     DeviceStencil inner_, wall_;
     DeviceBuffer<FluidAcousticSite> sites_;
     DeviceBuffer<FluidAcousticWall> walls_;

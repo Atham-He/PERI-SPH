@@ -260,7 +260,7 @@ int main(int ac, char *av[]) try
             plate_update_normal.exec();
 
             Real relaxation_time = 0.0;
-            while (relaxation_time < Dt)
+            for (const auto configuration = acoustic.reuseConfiguration(); relaxation_time < Dt;)
             {
                 /** fluid relaxation and force computation. */
                 pressure_relaxation.exec(dt);

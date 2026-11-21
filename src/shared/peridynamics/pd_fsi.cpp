@@ -234,27 +234,26 @@ void PDFluidDensityHalf::runMainStep(Real dt)
         Base::runMainStep(dt);
 }
 
-void PDFluidAcousticWorkspace::compute(peridynamics::FluidAcousticStage stage)
+PDFluidAcousticWorkspace::FixedConfiguration::FixedConfiguration(PDFluidAcousticWorkspace &workspace)
+    : workspace_(workspace)
 {
-    using namespace peridynamics;
-    const bool pressure = stage == FluidAcousticStage::Pressure;
-    const bool density_stage = stage == FluidAcousticStage::Density;
-    const bool damping = stage == FluidAcousticStage::Damping;
-    const bool gather_velocity = density_stage || stage == FluidAcousticStage::Divergence;
-    auto &particles = inner_.getSPHBody().getBaseParticles();
-    const auto count = particles.TotalRealParticles();
-    const auto *volume = particles.getVariableDataByName<Real>("VolumetricMeasure");
-    const auto *density = pressure || density_stage ? particles.getVariableDataByName<Real>("Density") : nullptr;
-    const auto *p = pressure ? particles.getVariableDataByName<Real>("Pressure") : nullptr;
-    const auto *mass = pressure ? particles.getVariableDataByName<Real>("Mass") : nullptr;
-    const auto *velocity = gather_velocity ? particles.getVariableDataByName<Vecd>("Velocity") : nullptr;
-    const auto *prior = pressure ? particles.getVariableDataByName<Vecd>("ForcePrior") : nullptr;
-    const auto *divergence = damping ? particles.getVariableDataByName<Real>("VelocityDivergence") : nullptr;
+    if (workspace_.scope_depth_++ == 0)
+        workspace_.configuration_ready_ = false;
+}
 
+PDFluidAcousticWorkspace::FixedConfiguration::~FixedConfiguration()
+{
+    --workspace_.scope_depth_;
+}
+
+void PDFluidAcousticWorkspace::configure(std::size_t count, std::size_t bound)
+{
+    using peridynamics::FluidAcousticStencil;
     constexpr auto missing = std::numeric_limits<std::size_t>::max();
-    fluid_sites_.resize(count);
-    wall_sites_.clear();
-    ghost_indices_.assign(particles.ParticlesBound() - count, missing);
+    configuration_ready_ = false;
+    ghost_indices_.assign(bound - count, missing);
+    ghost_sources_.clear();
+    wall_sources_.clear();
     const auto resetStencil = [count](FluidAcousticStencil &stencil)
     {
         stencil.offsets.assign(count + 1, 0);
@@ -263,12 +262,12 @@ void PDFluidAcousticWorkspace::compute(peridynamics::FluidAcousticStage stage)
     resetStencil(inner_stencil_);
     resetStencil(wall_stencil_);
 
+    wall_indices_.resize(wall_.contact_particles_.size());
+    for (std::size_t k = 0; k < wall_indices_.size(); ++k)
+        wall_indices_[k].assign(wall_.contact_particles_[k]->ParticlesBound(), missing);
+
     for (std::size_t i = 0; i < count; ++i)
     {
-        fluid_sites_[i] = {velocity ? packFluidVector(velocity[i]) : ParticleVector3{},
-                           prior ? packFluidVector(prior[i]) : ParticleVector3{}, volume[i],
-                           density ? density[i] : Real(0), p ? p[i] : Real(0),
-                           mass ? mass[i] : Real(0), divergence ? divergence[i] : Real(0)};
         const auto &neighbors = inner_.inner_configuration_[i];
         for (std::size_t n = 0; n < neighbors.current_size_; ++n)
         {
@@ -279,9 +278,8 @@ void PDFluidAcousticWorkspace::compute(peridynamics::FluidAcousticStage stage)
                 auto &slot = ghost_indices_.at(j - count);
                 if (slot == missing)
                 {
-                    slot = fluid_sites_.size();
-                    fluid_sites_.push_back({velocity ? packFluidVector(velocity[j]) : ParticleVector3{},
-                        {}, volume[j], 0, p ? p[j] : Real(0), 0, divergence ? divergence[j] : Real(0)});
+                    slot = count + ghost_sources_.size();
+                    ghost_sources_.push_back(j);
                 }
                 target = slot;
             }
@@ -289,6 +287,62 @@ void PDFluidAcousticWorkspace::compute(peridynamics::FluidAcousticStage stage)
                                                neighbors.r_ij_[n], neighbors.dW_ij_[n]});
         }
         inner_stencil_.offsets[i + 1] = inner_stencil_.neighbors.size();
+
+        for (std::size_t k = 0; k < wall_indices_.size(); ++k)
+        {
+            const auto &contact = wall_.contact_configuration_[k][i];
+            for (std::size_t n = 0; n < contact.current_size_; ++n)
+            {
+                const auto j = contact.j_[n];
+                auto &target = wall_indices_[k].at(j);
+                if (target == missing)
+                {
+                    target = wall_sources_.size();
+                    wall_sources_.emplace_back(k, j);
+                }
+                wall_stencil_.neighbors.push_back({target, packFluidVector(contact.e_ij_[n]),
+                                                   contact.r_ij_[n], contact.dW_ij_[n]});
+            }
+        }
+        wall_stencil_.offsets[i + 1] = wall_stencil_.neighbors.size();
+    }
+    backend_->configure(count, count + ghost_sources_.size(), wall_sources_.size(), inner_stencil_, wall_stencil_);
+    configured_count_ = count;
+    configuration_ready_ = true;
+}
+
+void PDFluidAcousticWorkspace::compute(peridynamics::FluidAcousticStage stage)
+{
+    using namespace peridynamics;
+    const bool pressure = stage == FluidAcousticStage::Pressure;
+    const bool density_stage = stage == FluidAcousticStage::Density;
+    const bool damping = stage == FluidAcousticStage::Damping;
+    const bool gather_velocity = density_stage || stage == FluidAcousticStage::Divergence;
+    auto &particles = inner_.getSPHBody().getBaseParticles();
+    const auto count = particles.TotalRealParticles();
+    if (scope_depth_ == 0 || !configuration_ready_ || configured_count_ != count)
+        configure(count, particles.ParticlesBound());
+
+    const auto *volume = particles.getVariableDataByName<Real>("VolumetricMeasure");
+    const auto *density = pressure || density_stage ? particles.getVariableDataByName<Real>("Density") : nullptr;
+    const auto *p = pressure ? particles.getVariableDataByName<Real>("Pressure") : nullptr;
+    const auto *mass = pressure ? particles.getVariableDataByName<Real>("Mass") : nullptr;
+    const auto *velocity = gather_velocity ? particles.getVariableDataByName<Vecd>("Velocity") : nullptr;
+    const auto *prior = pressure ? particles.getVariableDataByName<Vecd>("ForcePrior") : nullptr;
+    const auto *divergence = damping ? particles.getVariableDataByName<Real>("VelocityDivergence") : nullptr;
+
+    fluid_sites_.resize(count + ghost_sources_.size());
+    for (std::size_t i = 0; i < count; ++i)
+        fluid_sites_[i] = {velocity ? packFluidVector(velocity[i]) : ParticleVector3{},
+                           prior ? packFluidVector(prior[i]) : ParticleVector3{}, volume[i],
+                           density ? density[i] : Real(0), p ? p[i] : Real(0),
+                           mass ? mass[i] : Real(0), divergence ? divergence[i] : Real(0)};
+    for (std::size_t n = 0; n < ghost_sources_.size(); ++n)
+    {
+        const auto j = ghost_sources_[n];
+        fluid_sites_[count + n] = {velocity ? packFluidVector(velocity[j]) : ParticleVector3{},
+                                   {}, volume[j], 0, p ? p[j] : Real(0), 0,
+                                   divergence ? divergence[j] : Real(0)};
     }
 
     struct WallFields
@@ -298,7 +352,6 @@ void PDFluidAcousticWorkspace::compute(peridynamics::FluidAcousticStage stage)
     };
     StdVec<WallFields> wall_fields;
     wall_fields.reserve(wall_.contact_particles_.size());
-    wall_indices_.resize(wall_.contact_particles_.size());
     for (std::size_t k = 0; k < wall_.contact_particles_.size(); ++k)
     {
         auto *wall_particles = wall_.contact_particles_[k];
@@ -307,35 +360,18 @@ void PDFluidAcousticWorkspace::compute(peridynamics::FluidAcousticStage stage)
                                gather_velocity ? solid.AverageVelocity(wall_particles) : nullptr,
                                pressure ? solid.AverageAcceleration(wall_particles) : nullptr,
                                density_stage ? wall_particles->getVariableDataByName<Vecd>("NormalDirection") : nullptr});
-        wall_indices_[k].assign(wall_particles->ParticlesBound(), missing);
     }
-
-    for (std::size_t i = 0; i < count; ++i)
+    wall_sites_.resize(wall_sources_.size());
+    for (std::size_t n = 0; n < wall_sources_.size(); ++n)
     {
-        for (std::size_t k = 0; k < wall_.contact_configuration_.size(); ++k)
-        {
-            const auto &neighbors = wall_.contact_configuration_[k][i];
-            const auto &fields = wall_fields[k];
-            for (std::size_t n = 0; n < neighbors.current_size_; ++n)
-            {
-                const auto j = neighbors.j_[n];
-                auto &target = wall_indices_[k].at(j);
-                if (target == missing)
-                {
-                    target = wall_sites_.size();
-                    wall_sites_.push_back({fields.velocity ? packFluidVector(fields.velocity[j]) : ParticleVector3{},
-                        fields.acceleration ? packFluidVector(fields.acceleration[j]) : ParticleVector3{},
-                        fields.normal ? packFluidVector(fields.normal[j]) : ParticleVector3{},
-                        fields.volume[j], wall_acceleration_factors_[k]});
-                }
-                wall_stencil_.neighbors.push_back({target, packFluidVector(neighbors.e_ij_[n]),
-                                                   neighbors.r_ij_[n], neighbors.dW_ij_[n]});
-            }
-        }
-        wall_stencil_.offsets[i + 1] = wall_stencil_.neighbors.size();
+        const auto [k, j] = wall_sources_[n];
+        const auto &fields = wall_fields[k];
+        wall_sites_[n] = {fields.velocity ? packFluidVector(fields.velocity[j]) : ParticleVector3{},
+                          fields.acceleration ? packFluidVector(fields.acceleration[j]) : ParticleVector3{},
+                          fields.normal ? packFluidVector(fields.normal[j]) : ParticleVector3{},
+                          fields.volume[j], wall_acceleration_factors_[k]};
     }
-
-    backend_->evaluate(stage, count, fluid_sites_, wall_sites_, inner_stencil_, wall_stencil_, coefficients_, results_);
+    backend_->evaluate(stage, fluid_sites_, wall_sites_, coefficients_, results_);
 }
 
 void PDFluidAcousticWorkspace::evaluateHalf(peridynamics::FluidAcousticStage stage)

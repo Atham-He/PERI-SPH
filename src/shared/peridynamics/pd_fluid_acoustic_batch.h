@@ -48,13 +48,12 @@ class FluidAcousticBatch
 {
   public:
     virtual ~FluidAcousticBatch() = default;
-    // The first count fluid sites are the source rows. Remaining sites are
-    // referenced neighbors owned by the fluid relation, such as ghosts.
-    virtual void evaluate(FluidAcousticStage half, std::size_t count,
-                          const std::vector<FluidAcousticSite> &sites,
-                          const std::vector<FluidAcousticWall> &walls,
-                          const FluidAcousticStencil &inner, const FluidAcousticStencil &wall,
-                          FluidAcousticCoefficients coefficients,
+    // The first count fluid sites are source rows; the rest are referenced
+    // ghosts. The neighbor geometry stays fixed until the next configure call.
+    virtual void configure(std::size_t count, std::size_t fluid_sites, std::size_t wall_sites,
+                           const FluidAcousticStencil &inner, const FluidAcousticStencil &wall) = 0;
+    virtual void evaluate(FluidAcousticStage stage, const std::vector<FluidAcousticSite> &sites,
+                          const std::vector<FluidAcousticWall> &walls, FluidAcousticCoefficients coefficients,
                           std::vector<FluidAcousticResult> &result) = 0;
 };
 

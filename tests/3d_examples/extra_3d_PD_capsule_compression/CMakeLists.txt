@@ -10,7 +10,7 @@ file(MAKE_DIRECTORY ${BUILD_INPUT_PATH})
 add_executable(${PROJECT_NAME})
 aux_source_directory(. DIR_SRCS)
 target_sources(${PROJECT_NAME} PRIVATE ${DIR_SRCS})
-target_link_libraries(${PROJECT_NAME} sphinxsys_3d)
+target_link_libraries(${PROJECT_NAME} sphinxsys_3d SPHinXsys::peri_execution)
 set_target_properties(${PROJECT_NAME} PROPERTIES VS_DEBUGGER_WORKING_DIRECTORY "${EXECUTABLE_OUTPUT_PATH}")
 
 add_test(NAME ${PROJECT_NAME}

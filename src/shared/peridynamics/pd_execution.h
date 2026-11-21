@@ -3,6 +3,7 @@
 #include "dpc_point_batch.h"
 #include "pd_bonded_interface_batch.h"
 #include "pd_crack_projection.h"
+#include "pd_fluid_traction_batch.h"
 #include "pd_solid_time_step.h"
 #include "pd_spatial_derivatives.h"
 
@@ -18,6 +19,7 @@ enum class PeriExecutionMode
 };
 
 PeriExecutionMode parsePeriExecution(std::string_view input);
+PeriExecutionMode takePeriExecutionOption(int &argc, char **argv);
 
 class PeriExecution
 {
@@ -40,6 +42,7 @@ class PeriExecution
     std::unique_ptr<SpatialDerivativeBatch> makeSpatialDerivatives() const;
     std::unique_ptr<dpc::PointBatch> makeDpcPoints(const dpc::Model &model) const;
     std::unique_ptr<SolidTimeStepBatch> makeSolidTimeStep(const std::vector<double> &mass) const;
+    std::unique_ptr<FluidTractionBatch> makeFluidTraction() const;
 
   private:
     PeriExecutionMode mode_;

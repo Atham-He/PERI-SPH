@@ -227,6 +227,18 @@ PressureForceFromFluidforPD<RiemannSolverType>::
         contact_vel_.push_back(contact_particles_[k]->getVariableDataByName<Vecd>("Velocity"));
         contact_force_prior_.push_back(contact_particles_[k]->getVariableDataByName<Vecd>("ForcePrior"));
         riemann_solvers_.push_back(RiemannSolverType(*contact_fluids_[k], *contact_fluids_[k]));
+        Real impedance=0., inverse_sound=0.;
+        if constexpr (std::is_same_v<RiemannSolverType,AcousticRiemannSolver>)
+        {
+            // This relation supplies the same fluid material on each side
+            // of the Riemann interface.
+            const Real rho0=contact_fluids_[k]->ReferenceDensity();
+            const Real rho_c0=rho0*contact_fluids_[k]->ReferenceSoundSpeed();
+            const Real impedance_sum=rho_c0+rho_c0;
+            impedance=2.*rho_c0*rho_c0*(1./impedance_sum);
+            inverse_sound=.5*(rho0+rho0)*(impedance_sum/(rho_c0*rho_c0+rho_c0*rho_c0));
+        }
+        acoustic_coefficients_.emplace_back(impedance,inverse_sound);
     }
 }
 //=================================================================================================//
@@ -267,6 +279,82 @@ void PressureForceFromFluidforPD<RiemannSolverType>::interaction(size_t index_i,
                      Vol_[index_i] * dW_ijV_j;
         }
     }
+    publishTraction(index_i,force,acoustic_damper,p_from_f,sum_w);
+}
+
+namespace
+{
+peridynamics::ParticleVector3 packTractionVector(const Vecd &input)
+{
+    peridynamics::ParticleVector3 x{};
+    for (int k=0;k<Dimensions;++k)
+        x.component[k]=input[k];
+    return x;
+}
+
+Vecd unpackTractionVector(const peridynamics::ParticleVector3 &input)
+{
+    Vecd x;
+    for (int k=0;k<Dimensions;++k)
+        x[k]=input.component[k];
+    return x;
+}
+}
+
+template<class RiemannSolverType>
+void PressureForceFromFluidforPD<RiemannSolverType>::evaluateDevice(peridynamics::FluidTractionBatch &backend)
+{
+    using namespace peridynamics;
+    const size_t count=particles_->TotalRealParticles();
+    solid_rows_.resize(count);
+    row_offsets_.assign(count+1,0);
+    traction_neighbors_.clear();
+    fluid_sites_.clear();
+    fluid_indices_.resize(contact_particles_.size());
+    constexpr size_t missing=std::numeric_limits<size_t>::max();
+    for (size_t k=0;k<contact_particles_.size();++k)
+        fluid_indices_[k].assign(contact_particles_[k]->ParticlesBound(),missing);
+
+    for (size_t i=0;i<count;++i)
+    {
+        solid_rows_[i]={packTractionVector(n_[i]),packTractionVector(vel_ave_[i]),
+                        packTractionVector(acc_ave_[i]),Vol_[i]};
+        for (size_t k=0;k<contact_configuration_.size();++k)
+        {
+            const auto &neighbors=(*contact_configuration_[k])[i];
+            for (size_t n=0;n<neighbors.current_size_;++n)
+            {
+                const size_t j=neighbors.j_[n];
+                auto &fluid_id=fluid_indices_[k].at(j);
+                if (fluid_id==missing)
+                {
+                    fluid_id=fluid_sites_.size();
+                    const auto [impedance,inverse_sound]=acoustic_coefficients_[k];
+                    fluid_sites_.push_back({packTractionVector(contact_vel_[k][j]),
+                        packTractionVector(contact_force_prior_[k][j]),contact_mass_[k][j],contact_rho_[k][j],
+                        contact_p_[k][j],contact_u_div_[k][j],contact_Vol_[k][j],impedance,inverse_sound});
+                }
+                traction_neighbors_.push_back({fluid_id,packTractionVector(neighbors.e_ij_[n]),
+                    neighbors.r_ij_[n],neighbors.W_ij_[n],neighbors.dW_ij_[n]});
+            }
+        }
+        row_offsets_[i+1]=traction_neighbors_.size();
+    }
+    backend.evaluate(solid_rows_,fluid_sites_,row_offsets_,traction_neighbors_,acceleration_factor_,traction_result_);
+    if (traction_result_.size()!=count)
+        throw std::logic_error("PD fluid traction backend returned an incomplete force field");
+    for (size_t i=0;i<count;++i)
+    {
+        const auto &result=traction_result_[i];
+        publishTraction(i,unpackTractionVector(result.pressure_force),unpackTractionVector(result.acoustic_force),
+                        result.pressure,result.kernel_weight);
+    }
+}
+
+template<class RiemannSolverType>
+void PressureForceFromFluidforPD<RiemannSolverType>::publishTraction(
+    size_t index_i,const Vecd &force,const Vecd &acoustic_damper,Real p_from_f,Real sum_w)
+{
     acoustic_force_from_fluid_[index_i] = coeff_acoustic_damper_ * acoustic_damper;
     force_from_fluid_[index_i] = force + acoustic_force_from_fluid_[index_i];
     /** isolate a non-finite fluid force (e.g. from a blown-up fluid

@@ -61,7 +61,14 @@ def parameters(path):
         if line:
             key, value = line.split("=", 1)
             token = value.strip()
-            result[key.strip()] = float(token == "true") if token in ("true", "false") else float(token)
+            if token in ("true", "false"):
+                value = float(token == "true")
+            else:
+                try:
+                    value = float(token)
+                except ValueError:
+                    value = token
+            result[key.strip()] = value
     return result
 
 

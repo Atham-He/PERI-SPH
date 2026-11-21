@@ -2,6 +2,7 @@
  * PD shell + WCSPH core. Parameters and numerical diagnostics are saved per run.
  * Reference PD neighborhoods remain fixed; contact neighborhoods evolve.
  */
+#include <optional>
 #include "sphinxsys.h"
 #include "pd_case_config.h"
 #include "pd_checkpoint.h"
@@ -137,7 +138,9 @@ static Vecd sumVector(SPHBody &body, const std::string &name)
 int main(int argc, char **argv)
 {
     auto config = parameters();peridynamics::CheckpointOptions checkpoint_options;
-    try {checkpoint_options.parse(argc,argv);config.parse(argc, argv); resolveModels(config); validateParameters();}
+    std::optional<peridynamics::PeriExecution> execution;
+    try {execution.emplace(peridynamics::takePeriExecutionOption(argc,argv));
+         checkpoint_options.parse(argc,argv);config.parse(argc, argv); resolveModels(config); validateParameters();}
     catch (const std::exception &e) {std::cerr << e.what() << std::endl; return 2;}
     if(checkpoint_options.describe_only)
     {std::cout << "{\"format\":1,\"full_pd_state\":true,\"default_threads\":" << checkpoint_options.threads
@@ -200,7 +203,8 @@ int main(int argc, char **argv)
     Real fluid_horizon = liquid.getSPHAdaptation().getKernel()->CutOffRadius();
     inner_damping.setCoeffAcousticDamper(rho0_f, damping_c, fluid_horizon);
     wall_damping.setCoeffAcousticDamper(rho0_f, damping_c, fluid_horizon);
-    InteractionDynamics<solid_dynamics::PressureForceFromFluidforPD<AcousticRiemannSolver>> shell_pressure(shell_fluid);
+    solid_dynamics::PDFluidPressureCoupling<AcousticRiemannSolver> shell_pressure(shell_fluid,*execution);
+    std::cout<<"PD fluid pressure backend "<<(shell_pressure.onDevice()?"cuda_fp64":"cpu_fp64")<<std::endl;
     shell_pressure.setCoeffAcousticDamper(rho0_f, damping_c, fluid_horizon);
     shell_pressure.setAccelerationPressureFactor(pd_pressure_acceleration_factor);
     InteractionWithUpdate<solid_dynamics::ViscousForceFromFluidforPD> shell_viscosity(shell_fluid);

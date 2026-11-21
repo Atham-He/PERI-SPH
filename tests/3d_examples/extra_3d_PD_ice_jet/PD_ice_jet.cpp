@@ -124,8 +124,9 @@ class WaterInitialCondition
 };
 
 // the main program with commandline options
-int main(int ac, char *av[])
+int main(int ac, char *av[]) try
 {
+    const peridynamics::PeriExecution execution(peridynamics::takePeriExecutionOption(ac,av));
     //----------------------------------------------------------------------
     //	Build up an SPHSystem.
     //----------------------------------------------------------------------
@@ -185,7 +186,8 @@ int main(int ac, char *av[])
     //	Algorithms of FSI.
     //----------------------------------------------------------------------
     SimpleDynamics<NormalDirectionFromBodyShape> plate_normal_direction(plate);
-    InteractionDynamics<solid_dynamics::PressureForceFromFluidforPD<>> fluid_pressure_force_on_plate(plate_water_contact);
+    solid_dynamics::PDFluidPressureCoupling<> fluid_pressure_force_on_plate(plate_water_contact,execution);
+    std::cout<<"PD fluid pressure backend "<<(fluid_pressure_force_on_plate.onDevice()?"cuda_fp64":"cpu_fp64")<<std::endl;
     fluid_pressure_force_on_plate.setCoeffAcousticDamper(rho0_f, c_f, water_block.getSPHAdaptation().getKernel()->CutOffRadius());
     solid_dynamics::AverageVelocityAndAcceleration average_velocity_and_acceleration(plate);
     /** zero-gravity baseline for PDAccelerationPrior: the fluid pressure force
@@ -323,4 +325,9 @@ int main(int ac, char *av[])
     std::cout << "Total wall time for computation: " << tt.seconds() << " seconds." << std::endl;
 
     return 0;
+}
+catch (const std::exception &error)
+{
+    std::cerr<<error.what()<<std::endl;
+    return 2;
 }

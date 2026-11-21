@@ -13,6 +13,23 @@ PeriExecutionMode parsePeriExecution(std::string_view input)
     throw std::invalid_argument("PERI-SPH execution must be cpu or gpu");
 }
 
+PeriExecutionMode takePeriExecutionOption(int &argc, char **argv)
+{
+    PeriExecutionMode mode=PeriExecutionMode::Default;
+    int remaining=1;
+    for (int i=1;i<argc;++i)
+    {
+        const std::string_view argument(argv[i]);
+        if (argument.substr(0,12)=="--execution=")
+            mode=parsePeriExecution(argument.substr(12));
+        else
+            argv[remaining++]=argv[i];
+    }
+    argc=remaining;
+    argv[argc]=nullptr;
+    return mode;
+}
+
 PeriExecution::PeriExecution(PeriExecutionMode mode, LegacyGpuSelection legacy)
     : mode_(mode), crack_projection_(mode == PeriExecutionMode::GPU || legacy.crack_projection),
       bonded_interface_(mode == PeriExecutionMode::GPU || legacy.bonded_interface)
@@ -75,6 +92,15 @@ std::unique_ptr<SolidTimeStepBatch> PeriExecution::makeSolidTimeStep(const std::
         return makeCudaSolidTimeStep(mass);
 #else
     (void)mass;
+#endif
+    return nullptr;
+}
+
+std::unique_ptr<FluidTractionBatch> PeriExecution::makeFluidTraction() const
+{
+#if defined(PERI_SPH_HAS_CUDA)
+    if (mode_ == PeriExecutionMode::GPU)
+        return makeCudaFluidTraction();
 #endif
     return nullptr;
 }

@@ -29,6 +29,8 @@
 #include "base_particle_dynamics.h"
 #include "contact_body_relation.h"
 #include "pd_materials.h"
+#include "pd_execution.h"
+#include "dynamics_algorithms.h"
 #include "riemann_solver.h"
 #include "adaptation.h"
 #include "fluid_integration.hpp"
@@ -259,8 +261,11 @@ class PressureForceFromFluidforPD : public LocalDynamics, public DataDelegateCon
         acceleration_factor_=value;
     }
     void interaction(size_t index_i, Real dt = 0.0);
+    void evaluateDevice(peridynamics::FluidTractionBatch &backend);
 
   protected:
+    void publishTraction(size_t index, const Vecd &pressure_force, const Vecd &acoustic_force,
+                         Real pressure_sum, Real kernel_weight);
     HughesWingetSolid &hw_solid_;
     Real coeff_acoustic_damper_ = 0.0;
     Real acceleration_factor_ = 1;
@@ -272,7 +277,39 @@ class PressureForceFromFluidforPD : public LocalDynamics, public DataDelegateCon
     StdVec<Real *> contact_rho_, contact_p_, contact_u_div_, contact_mass_, contact_Vol_;
     StdVec<Vecd *> contact_vel_, contact_force_prior_;
     StdVec<RiemannSolverType> riemann_solvers_;
+
+  private:
+    StdVec<peridynamics::FluidTractionSolid> solid_rows_;
+    StdVec<peridynamics::FluidTractionFluid> fluid_sites_;
+    StdVec<peridynamics::FluidTractionNeighbor> traction_neighbors_;
+    StdVec<peridynamics::FluidTractionResult> traction_result_;
+    StdVec<size_t> row_offsets_;
+    StdVec<StdVec<size_t>> fluid_indices_;
+    StdVec<std::pair<Real,Real>> acoustic_coefficients_;
 };
+
+template<class RiemannSolverType = NoRiemannSolver>
+class PDFluidPressureCoupling : public InteractionDynamics<PressureForceFromFluidforPD<RiemannSolverType>>
+{
+  public:
+    using Base=InteractionDynamics<PressureForceFromFluidforPD<RiemannSolverType>>;
+    PDFluidPressureCoupling(BaseContactRelation &relation, const peridynamics::PeriExecution &execution)
+        : Base(relation), backend_(execution.makeFluidTraction()) {}
+
+    bool onDevice() const noexcept { return backend_!=nullptr; }
+
+    void runMainStep(Real dt) override
+    {
+        if (backend_)
+            this->evaluateDevice(*backend_);
+        else
+            Base::runMainStep(dt);
+    }
+
+  private:
+    std::unique_ptr<peridynamics::FluidTractionBatch> backend_;
+};
+
 using PressureForceAccelerationFromFluidforPD = PressureForceFromFluidforPD<NoRiemannSolver>;
 } // namespace solid_dynamics
 } // namespace SPH

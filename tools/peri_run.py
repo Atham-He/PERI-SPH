@@ -4,6 +4,7 @@ import argparse
 import csv
 from datetime import datetime, timezone
 import hashlib
+from itertools import islice
 import json
 import math
 import os
@@ -207,7 +208,15 @@ def launch(args):
     repo = Path(__file__).resolve().parents[1]
     files = source_snapshot_files(repo)
     target_case = repo / "tests/3d_examples" / executable.stem
-    stale = [str(p.relative_to(repo)) for p in files if (p.is_relative_to(repo / "src/shared") or p.is_relative_to(repo / "src/for_3D_build") or p.is_relative_to(target_case)) and p.suffix in (".cpp", ".h", ".hpp", ".hxx") and p.stat().st_mtime > executable.stat().st_mtime + 0.001]
+    compile_roots = [repo / "src/shared", repo / "src/for_3D_build", target_case]
+    compile_suffixes = {".cpp", ".h", ".hpp", ".hxx"}
+    if getattr(args, "execution", None) == "gpu":
+        compile_roots.append(repo / "src/peri_execution")
+        compile_suffixes.update({".cu", ".cuh"})
+    binary_time = executable.stat().st_mtime
+    stale = [str(p.relative_to(repo)) for p in files
+             if p.suffix in compile_suffixes and any(p.is_relative_to(root) for root in compile_roots)
+             and p.stat().st_mtime > binary_time + 0.001]
     if stale:
         raise ValueError("source is newer than the executable; rebuild before running: " + stale[0])
     # Do not create a seemingly dispatched run when source preflight already fails.
@@ -301,6 +310,12 @@ def resume(args):
 
 def execute(args, run_dir, metadata, frozen_executable, checkpoint=None):
     previous_controls=metadata.get("run_controls",{})
+    execution = getattr(args, "execution", None) or previous_controls.get("execution")
+    capabilities = metadata.get("checkpoint_capabilities", {})
+    advertised_modes = capabilities.get("execution_modes")
+    if execution and advertised_modes is not None and execution not in advertised_modes:
+        raise ValueError(f"sealed executable does not support execution={execution}; supported modes: "
+                         + ", ".join(advertised_modes))
     if args.checkpoint_seconds is None:args.checkpoint_seconds=previous_controls.get("checkpoint_seconds",600)
     if args.checkpoint_steps is None:args.checkpoint_steps=previous_controls.get("checkpoint_steps",0)
     if not math.isfinite(args.checkpoint_seconds) or args.checkpoint_seconds < 0 or args.checkpoint_steps < 0 or (args.threads is not None and args.threads < 1):
@@ -309,9 +324,13 @@ def execute(args, run_dir, metadata, frozen_executable, checkpoint=None):
     if capable and args.threads is None:
         args.threads=metadata.get("run_controls",{}).get("threads") or metadata.get("checkpoint_capabilities",{}).get("default_threads")
     metadata["run_controls"]={"threads":args.threads,"checkpoint_seconds":args.checkpoint_seconds,"checkpoint_steps":args.checkpoint_steps}
+    if execution:
+        metadata["run_controls"]["execution"] = execution
     if not capable and (checkpoint is not None or args.checkpoint_steps or args.stop_after_checkpoint):
         raise ValueError("executable does not support full PD checkpoints")
     command=[str(frozen_executable),"--case-config","case.cfg","--state_recording="+("false" if args.no_states else "true")]
+    if execution:
+        command.append("--execution=" + execution)
     if capable:
         command += ["--pd-checkpoint-seconds="+str(args.checkpoint_seconds),"--pd-checkpoint-steps="+str(args.checkpoint_steps)]
         if args.stop_after_checkpoint: command.append("--pd-stop-after-checkpoint")
@@ -321,14 +340,18 @@ def execute(args, run_dir, metadata, frozen_executable, checkpoint=None):
         old=run_dir/"output/resume_info.json"
         old.rename(old.with_name("resume_info-attempt-"+str(len(metadata.get("attempts",[])))+".json"))
     attempt={"started_at_utc":datetime.now(timezone.utc).isoformat(),"command":command,"resume_requested":str(checkpoint) if checkpoint else None}
+    if execution:
+        attempt["execution"] = execution
     metadata.setdefault("attempts",[]).append(attempt)
     metadata.pop("live_audit_failure",None);metadata.pop("finished_at_utc",None);metadata.pop("return_code",None)
     metadata["status"]="restoring" if checkpoint else "running"
     def save_metadata():
         path=run_dir/"run_manifest.json";temporary=path.with_suffix(".json.tmp")
         temporary.write_text(json.dumps(metadata,indent=2)+"\n");temporary.replace(path)
-    with (run_dir/"run.log").open("a" if checkpoint else "w",encoding="utf-8") as log:
+    log_path = run_dir / "run.log"
+    with log_path.open("a" if checkpoint else "w",encoding="utf-8") as log:
         if checkpoint: log.write("\nRESUME ATTEMPT "+attempt["started_at_utc"]+"\n");log.flush()
+        attempt_log_start = os.fstat(log.fileno()).st_size
         process=subprocess.Popen(command,cwd=run_dir,stdout=log,stderr=subprocess.STDOUT)
         metadata["solver_pid"]=process.pid
         if sys.platform.startswith("linux"):
@@ -349,6 +372,13 @@ def execute(args, run_dir, metadata, frozen_executable, checkpoint=None):
                 (run_dir/"live_audit.json").write_text(json.dumps(live,indent=2,allow_nan=False)+"\n")
                 if live["status"]=="failed":
                     metadata["live_audit_failure"]=live["reason"];process.kill();process.wait();break
+    with log_path.open("rb") as log:
+        log.seek(attempt_log_start)
+        prefix = b"PERI-SPH execution backend "
+        for line in islice(log, 20):
+            if line.startswith(prefix):
+                attempt["execution_backend"] = line[len(prefix):].decode("utf-8", errors="replace").strip()
+                break
     attempt.update(finished_at_utc=datetime.now(timezone.utc).isoformat(),return_code=process.returncode)
     metadata.update(finished_at_utc=attempt["finished_at_utc"],return_code=process.returncode)
     if process.returncode==75:
@@ -397,6 +427,8 @@ def main():
         operational.add_argument("--checkpoint-steps",type=int)
         operational.add_argument("--stop-after-checkpoint",action="store_true")
         operational.add_argument("--threads",type=int)
+        operational.add_argument("--execution", choices=("cpu", "gpu"),
+                                 help="select the solver backend; resume defaults to the saved run setting")
     check = commands.add_parser("verify")
     check.add_argument("--run-dir", type=Path, required=True)
     check.add_argument("--require-damage", action="store_true")

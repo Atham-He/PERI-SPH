@@ -143,10 +143,17 @@ int main(int argc, char **argv)
     try {execution.emplace(peridynamics::takePeriExecutionOption(argc,argv));
          checkpoint_options.parse(argc,argv);config.parse(argc, argv); resolveModels(config); validateParameters();}
     catch (const std::exception &e) {std::cerr << e.what() << std::endl; return 2;}
-    if(checkpoint_options.describe_only)
-    {std::cout << "{\"format\":1,\"full_pd_state\":true,\"default_threads\":" << checkpoint_options.threads
-        << ",\"material_model\":\"" << material_options.model << "\",\"hardening_model\":\"" << material_options.hardening_model
-        << "\",\"fracture_model\":\"" << fracture_options.model << "\"}\n";return 0;}
+    if (checkpoint_options.describe_only)
+    {
+        std::cout << "{\"format\":1,\"full_pd_state\":true,\"default_threads\":" << checkpoint_options.threads
+                  << ",\"material_model\":\"" << material_options.model << "\",\"hardening_model\":\"" << material_options.hardening_model
+                  << "\",\"fracture_model\":\"" << fracture_options.model << "\",\"execution_modes\":[\"cpu\"";
+        if (peridynamics::PeriExecution::hasCudaBackend())
+            std::cout << ",\"gpu\"";
+        std::cout << "]}\n";
+        return 0;
+    }
+    std::cout << "PERI-SPH execution backend " << execution->backendName() << std::endl;
     Real extent = 6 * capsule_radius_out;
     peridynamics::CheckpointOutputGuard output_guard(!checkpoint_options.resume.empty());
     SPHSystem system(BoundingBoxd(Vecd(-extent, -extent, -extent), Vecd(extent, 2 * extent, extent)), resolution_ref, checkpoint_options.threads);

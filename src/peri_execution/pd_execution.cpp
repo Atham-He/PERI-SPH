@@ -36,9 +36,16 @@ PeriExecution::PeriExecution(PeriExecutionMode mode, LegacyGpuSelection legacy)
 {
     if (mode == PeriExecutionMode::CPU && (crack_projection_ || bonded_interface_))
         throw std::invalid_argument("execution=cpu conflicts with GPU diagnostic flags");
-#if !defined(PERI_SPH_HAS_CUDA)
-    if (crack_projection_ || bonded_interface_)
+    if ((crack_projection_ || bonded_interface_) && !hasCudaBackend())
         throw std::invalid_argument("GPU execution requires a build with PERI_SPH_ENABLE_CUDA=ON");
+}
+
+bool PeriExecution::hasCudaBackend() noexcept
+{
+#if defined(PERI_SPH_HAS_CUDA)
+    return true;
+#else
+    return false;
 #endif
 }
 

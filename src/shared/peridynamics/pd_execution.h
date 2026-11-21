@@ -37,6 +37,7 @@ class PeriExecution
     explicit PeriExecution(PeriExecutionMode mode,
                            LegacyGpuSelection legacy = {false, false});
 
+    static bool hasCudaBackend() noexcept;
     const char *backendName() const noexcept;
     bool bondedInterfaceOnDevice() const noexcept { return bonded_interface_; }
 

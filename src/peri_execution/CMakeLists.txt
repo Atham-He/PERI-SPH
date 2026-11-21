@@ -15,7 +15,8 @@ if(PERI_SPH_ENABLE_CUDA)
         "${PERI_EXECUTION_HEADERS}/pd_spatial_derivatives_cuda.cu"
         dpc_point_cuda.cu
         pd_solid_time_step_cuda.cu
-        pd_fluid_traction_cuda.cu)
+        pd_fluid_traction_cuda.cu
+        pd_fluid_acoustic_cuda.cu)
     set_target_properties(sphinxsys_peri_execution PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED YES)
     target_compile_options(sphinxsys_peri_execution PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
     target_compile_definitions(sphinxsys_peri_execution PRIVATE PERI_SPH_HAS_CUDA=1)

@@ -129,6 +129,61 @@ class Integration1stHalfWithWallforPD : public Integration1stHalfInnerRiemann
   protected:
     PressureWallTermsforPD wall_terms_;
 };
+
+class PDFluidAcousticWorkspace
+{
+  public:
+    PDFluidAcousticWorkspace(BaseInnerRelation &inner, BaseContactRelation &wall,
+                             std::unique_ptr<peridynamics::FluidAcousticBatch> backend, Real acceleration_factor);
+    bool onDevice() const { return static_cast<bool>(backend_); }
+
+  private:
+    friend class PDFluidPressureHalf;
+    friend class PDFluidDensityHalf;
+    void evaluate(peridynamics::FluidAcousticHalf half);
+
+    BaseInnerRelation &inner_;
+    BaseContactRelation &wall_;
+    Real acceleration_factor_;
+    std::unique_ptr<peridynamics::FluidAcousticBatch> backend_;
+    peridynamics::FluidAcousticCoefficients coefficients_{};
+    StdVec<Real> wall_acceleration_factors_;
+    std::vector<peridynamics::FluidAcousticSite> fluid_sites_;
+    std::vector<peridynamics::FluidAcousticWall> wall_sites_;
+    std::vector<std::size_t> ghost_indices_;
+    std::vector<std::vector<std::size_t>> wall_indices_;
+    peridynamics::FluidAcousticStencil inner_stencil_, wall_stencil_;
+    std::vector<peridynamics::FluidAcousticResult> results_;
+};
+
+class PDFluidPressureHalf : public Dynamics1Level<Integration1stHalfWithWallforPD>
+{
+    using Base = Dynamics1Level<Integration1stHalfWithWallforPD>;
+
+  public:
+    explicit PDFluidPressureHalf(PDFluidAcousticWorkspace &workspace);
+
+  protected:
+    void runMainStep(Real dt) override;
+
+  private:
+    PDFluidAcousticWorkspace &workspace_;
+};
+
+class PDFluidDensityHalf : public Dynamics1Level<Integration2ndHalfWithWallRiemann>
+{
+    using Base = Dynamics1Level<Integration2ndHalfWithWallRiemann>;
+
+  public:
+    explicit PDFluidDensityHalf(PDFluidAcousticWorkspace &workspace);
+
+  protected:
+    void runMainStep(Real dt) override;
+
+  private:
+    PDFluidAcousticWorkspace &workspace_;
+};
+
 /**
  * @class VelocityDivergenceInner
  * @brief Velocity divergence of fluid particles from inner interactions,

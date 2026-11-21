@@ -105,4 +105,12 @@ std::unique_ptr<FluidTractionBatch> PeriExecution::makeFluidTraction() const
     return nullptr;
 }
 
+std::unique_ptr<FluidAcousticBatch> PeriExecution::makeFluidAcoustic() const
+{
+#if defined(PERI_SPH_HAS_CUDA)
+    if (mode_ == PeriExecutionMode::GPU)
+        return makeCudaFluidAcoustic();
+#endif
+    return nullptr;
+}
 }

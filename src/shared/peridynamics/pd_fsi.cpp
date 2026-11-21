@@ -44,6 +44,30 @@ void ContactRelationSelectKernel::updateConfiguration()
     }
 }
 //=================================================================================================//
+namespace
+{
+peridynamics::ParticleVector3 packFluidVector(const Vecd &input)
+{
+    peridynamics::ParticleVector3 x{};
+    for (int k = 0; k < Dimensions; ++k)
+        x.component[k] = input[k];
+    return x;
+}
+
+Vecd unpackFluidVector(const peridynamics::ParticleVector3 &input)
+{
+    Vecd x;
+    for (int k = 0; k < Dimensions; ++k)
+        x[k] = input.component[k];
+    return x;
+}
+Real pdWallAccelerationFactor(SPHBody &body, Real factor)
+{
+    return dynamic_cast<HughesWingetSolid *>(&body.getMatterMaterial()) ? factor : 1;
+}
+
+}
+
 namespace fluid_dynamics
 {
 PressureWallTermsforPD::PressureWallTermsforPD(BaseContactRelation &relation, Real factor)
@@ -52,7 +76,7 @@ PressureWallTermsforPD::PressureWallTermsforPD(BaseContactRelation &relation, Re
     if (!std::isfinite(factor) || factor < 0 || factor > 1)
         throw std::invalid_argument("wall acceleration pressure factor must be in [0,1]");
     for (auto *body : contact_bodies_)
-        acceleration_factors_.push_back(dynamic_cast<HughesWingetSolid *>(&body->getMatterMaterial()) ? factor : 1);
+        acceleration_factors_.push_back(pdWallAccelerationFactor(*body, factor));
 }
 void PressureWallTermsforPD::interaction(size_t i, Real)
 {
@@ -71,6 +95,167 @@ void PressureWallTermsforPD::interaction(size_t i, Real)
         }
     }
     force_[i]+=force*Vol_[i]; drho_dt_[i]+=rho_dissipation*rho_[i];
+}
+
+PDFluidAcousticWorkspace::PDFluidAcousticWorkspace(BaseInnerRelation &inner, BaseContactRelation &wall,
+                                                   std::unique_ptr<peridynamics::FluidAcousticBatch> backend, Real acceleration_factor)
+    : inner_(inner), wall_(wall), acceleration_factor_(acceleration_factor), backend_(std::move(backend))
+{
+    if (&inner.getSPHBody() != &wall.getSPHBody())
+        throw std::invalid_argument("Fluid acoustic relations must share their source body");
+    if (!std::isfinite(acceleration_factor) || acceleration_factor < 0 || acceleration_factor > 1)
+        throw std::invalid_argument("wall acceleration pressure factor must be in [0,1]");
+    if (!backend_)
+        return;
+
+    auto &fluid = dynamic_cast<Fluid &>(inner.getSPHBody().getMatterMaterial());
+    const Real density = fluid.ReferenceDensity();
+    const Real z = density * fluid.ReferenceSoundSpeed();
+    const Real z_squared = math::pow(z, Real(2));
+    const Real inverse_impedance = (z + z) / (z_squared + z_squared);
+    coefficients_ = {inverse_impedance, 2.0 * z * z * (1.0 / (z + z)),
+                     0.5 * (density + density) * inverse_impedance};
+    for (auto *body : wall.contact_bodies_)
+        wall_acceleration_factors_.push_back(pdWallAccelerationFactor(*body, acceleration_factor));
+}
+
+PDFluidPressureHalf::PDFluidPressureHalf(PDFluidAcousticWorkspace &workspace)
+    : Base(workspace.inner_, workspace.wall_, workspace.acceleration_factor_), workspace_(workspace) {}
+
+void PDFluidPressureHalf::runMainStep(Real dt)
+{
+    if (workspace_.onDevice())
+        workspace_.evaluate(peridynamics::FluidAcousticHalf::Pressure);
+    else
+        Base::runMainStep(dt);
+}
+
+PDFluidDensityHalf::PDFluidDensityHalf(PDFluidAcousticWorkspace &workspace)
+    : Base(workspace.inner_, workspace.wall_), workspace_(workspace) {}
+
+void PDFluidDensityHalf::runMainStep(Real dt)
+{
+    if (workspace_.onDevice())
+        workspace_.evaluate(peridynamics::FluidAcousticHalf::Density);
+    else
+        Base::runMainStep(dt);
+}
+
+void PDFluidAcousticWorkspace::evaluate(peridynamics::FluidAcousticHalf half)
+{
+    using namespace peridynamics;
+    const bool pressure = half == FluidAcousticHalf::Pressure;
+    auto &particles = inner_.getSPHBody().getBaseParticles();
+    const auto count = particles.TotalRealParticles();
+    const auto *volume = particles.getVariableDataByName<Real>("VolumetricMeasure");
+    const auto *density = particles.getVariableDataByName<Real>("Density");
+    const auto *p = particles.getVariableDataByName<Real>("Pressure");
+    const auto *mass = particles.getVariableDataByName<Real>("Mass");
+    const auto *velocity = particles.getVariableDataByName<Vecd>("Velocity");
+    const auto *prior = particles.getVariableDataByName<Vecd>("ForcePrior");
+    auto *force = particles.getVariableDataByName<Vecd>("Force");
+    auto *density_rate = particles.getVariableDataByName<Real>("DensityChangeRate");
+
+    constexpr auto missing = std::numeric_limits<std::size_t>::max();
+    fluid_sites_.resize(count);
+    wall_sites_.clear();
+    ghost_indices_.assign(particles.ParticlesBound() - count, missing);
+    const auto resetStencil = [count](FluidAcousticStencil &stencil)
+    {
+        stencil.offsets.assign(count + 1, 0);
+        stencil.neighbors.clear();
+    };
+    resetStencil(inner_stencil_);
+    resetStencil(wall_stencil_);
+
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        fluid_sites_[i] = {pressure ? ParticleVector3{} : packFluidVector(velocity[i]),
+                           pressure ? packFluidVector(prior[i]) : ParticleVector3{},
+                           volume[i], density[i], pressure ? p[i] : Real(0), pressure ? mass[i] : Real(0)};
+        const auto &neighbors = inner_.inner_configuration_[i];
+        for (std::size_t n = 0; n < neighbors.current_size_; ++n)
+        {
+            const auto j = neighbors.j_[n];
+            auto target = j;
+            if (j >= count)
+            {
+                auto &slot = ghost_indices_.at(j - count);
+                if (slot == missing)
+                {
+                    slot = fluid_sites_.size();
+                    fluid_sites_.push_back({pressure ? ParticleVector3{} : packFluidVector(velocity[j]),
+                        {}, volume[j], 0, pressure ? p[j] : Real(0), 0});
+                }
+                target = slot;
+            }
+            inner_stencil_.neighbors.push_back({target, packFluidVector(neighbors.e_ij_[n]),
+                                               neighbors.r_ij_[n], neighbors.dW_ij_[n]});
+        }
+        inner_stencil_.offsets[i + 1] = inner_stencil_.neighbors.size();
+    }
+
+    struct WallFields
+    {
+        const Real *volume;
+        const Vecd *velocity, *acceleration, *normal;
+    };
+    StdVec<WallFields> wall_fields;
+    wall_fields.reserve(wall_.contact_particles_.size());
+    wall_indices_.resize(wall_.contact_particles_.size());
+    for (std::size_t k = 0; k < wall_.contact_particles_.size(); ++k)
+    {
+        auto *wall_particles = wall_.contact_particles_[k];
+        auto &solid = dynamic_cast<Solid &>(wall_.contact_bodies_[k]->getMatterMaterial());
+        wall_fields.push_back({wall_particles->getVariableDataByName<Real>("VolumetricMeasure"),
+                               pressure ? nullptr : solid.AverageVelocity(wall_particles),
+                               pressure ? solid.AverageAcceleration(wall_particles) : nullptr,
+                               pressure ? nullptr : wall_particles->getVariableDataByName<Vecd>("NormalDirection")});
+        wall_indices_[k].assign(wall_particles->ParticlesBound(), missing);
+    }
+
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        for (std::size_t k = 0; k < wall_.contact_configuration_.size(); ++k)
+        {
+            const auto &neighbors = wall_.contact_configuration_[k][i];
+            const auto &fields = wall_fields[k];
+            for (std::size_t n = 0; n < neighbors.current_size_; ++n)
+            {
+                const auto j = neighbors.j_[n];
+                auto &target = wall_indices_[k].at(j);
+                if (target == missing)
+                {
+                    target = wall_sites_.size();
+                    wall_sites_.push_back({pressure ? ParticleVector3{} : packFluidVector(fields.velocity[j]),
+                        pressure ? packFluidVector(fields.acceleration[j]) : ParticleVector3{},
+                        pressure ? ParticleVector3{} : packFluidVector(fields.normal[j]),
+                        fields.volume[j], wall_acceleration_factors_[k]});
+                }
+                wall_stencil_.neighbors.push_back({target, packFluidVector(neighbors.e_ij_[n]),
+                                                   neighbors.r_ij_[n], neighbors.dW_ij_[n]});
+            }
+        }
+        wall_stencil_.offsets[i + 1] = wall_stencil_.neighbors.size();
+    }
+
+    backend_->evaluate(half, count, fluid_sites_, wall_sites_, inner_stencil_, wall_stencil_, coefficients_, results_);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        const auto &row = results_[i];
+        if (pressure)
+        {
+            force[i] += unpackFluidVector(row.inner_force);
+            density_rate[i] = row.inner_density_rate;
+        }
+        else
+        {
+            force[i] = unpackFluidVector(row.inner_force);
+            density_rate[i] += row.inner_density_rate;
+        }
+        force[i] += unpackFluidVector(row.wall_force);
+        density_rate[i] += row.wall_density_rate;
+    }
 }
 
 //=================================================================================================//
@@ -282,25 +467,6 @@ void PressureForceFromFluidforPD<RiemannSolverType>::interaction(size_t index_i,
     publishTraction(index_i,force,acoustic_damper,p_from_f,sum_w);
 }
 
-namespace
-{
-peridynamics::ParticleVector3 packTractionVector(const Vecd &input)
-{
-    peridynamics::ParticleVector3 x{};
-    for (int k=0;k<Dimensions;++k)
-        x.component[k]=input[k];
-    return x;
-}
-
-Vecd unpackTractionVector(const peridynamics::ParticleVector3 &input)
-{
-    Vecd x;
-    for (int k=0;k<Dimensions;++k)
-        x[k]=input.component[k];
-    return x;
-}
-}
-
 template<class RiemannSolverType>
 void PressureForceFromFluidforPD<RiemannSolverType>::evaluateDevice(peridynamics::FluidTractionBatch &backend)
 {
@@ -317,8 +483,8 @@ void PressureForceFromFluidforPD<RiemannSolverType>::evaluateDevice(peridynamics
 
     for (size_t i=0;i<count;++i)
     {
-        solid_rows_[i]={packTractionVector(n_[i]),packTractionVector(vel_ave_[i]),
-                        packTractionVector(acc_ave_[i]),Vol_[i]};
+        solid_rows_[i]={packFluidVector(n_[i]),packFluidVector(vel_ave_[i]),
+                        packFluidVector(acc_ave_[i]),Vol_[i]};
         for (size_t k=0;k<contact_configuration_.size();++k)
         {
             const auto &neighbors=(*contact_configuration_[k])[i];
@@ -330,11 +496,11 @@ void PressureForceFromFluidforPD<RiemannSolverType>::evaluateDevice(peridynamics
                 {
                     fluid_id=fluid_sites_.size();
                     const auto [impedance,inverse_sound]=acoustic_coefficients_[k];
-                    fluid_sites_.push_back({packTractionVector(contact_vel_[k][j]),
-                        packTractionVector(contact_force_prior_[k][j]),contact_mass_[k][j],contact_rho_[k][j],
+                    fluid_sites_.push_back({packFluidVector(contact_vel_[k][j]),
+                        packFluidVector(contact_force_prior_[k][j]),contact_mass_[k][j],contact_rho_[k][j],
                         contact_p_[k][j],contact_u_div_[k][j],contact_Vol_[k][j],impedance,inverse_sound});
                 }
-                traction_neighbors_.push_back({fluid_id,packTractionVector(neighbors.e_ij_[n]),
+                traction_neighbors_.push_back({fluid_id,packFluidVector(neighbors.e_ij_[n]),
                     neighbors.r_ij_[n],neighbors.W_ij_[n],neighbors.dW_ij_[n]});
             }
         }
@@ -346,7 +512,7 @@ void PressureForceFromFluidforPD<RiemannSolverType>::evaluateDevice(peridynamics
     for (size_t i=0;i<count;++i)
     {
         const auto &result=traction_result_[i];
-        publishTraction(i,unpackTractionVector(result.pressure_force),unpackTractionVector(result.acoustic_force),
+        publishTraction(i,unpackFluidVector(result.pressure_force),unpackFluidVector(result.acoustic_force),
                         result.pressure,result.kernel_weight);
     }
 }

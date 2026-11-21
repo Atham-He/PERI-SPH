@@ -185,8 +185,10 @@ int main(int argc, char **argv)
     ComplexRelation fluid_complex(fluid_inner, fluid_walls);
 
     SimpleDynamics<NormalDirectionFromBodyShape> shell_normals(shell), lower_normals(lower), upper_normals(upper);
-    Dynamics1Level<fluid_dynamics::Integration1stHalfWithWallforPD> pressure(fluid_inner, fluid_walls, pd_pressure_acceleration_factor);
-    Dynamics1Level<fluid_dynamics::Integration2ndHalfWithWallRiemann> density(fluid_inner, fluid_walls);
+    fluid_dynamics::PDFluidAcousticWorkspace acoustic(fluid_inner, fluid_walls, execution->makeFluidAcoustic(), pd_pressure_acceleration_factor);
+    fluid_dynamics::PDFluidPressureHalf pressure(acoustic);
+    fluid_dynamics::PDFluidDensityHalf density(acoustic);
+    std::cout << "Fluid acoustic interactions backend " << (acoustic.onDevice() ? "cuda_fp64" : "cpu_fp64") << std::endl;
     InteractionWithUpdate<fluid_dynamics::DensitySummationComplexFreeSurface> density_sum(fluid_inner, fluid_walls);
     InteractionWithUpdate<fluid_dynamics::ViscousForceWithWallforPD> fluid_viscosity(fluid_inner, fluid_walls);
     SimpleDynamics<fluid_dynamics::ContinuumVolumeUpdate> update_fluid_volume(liquid);

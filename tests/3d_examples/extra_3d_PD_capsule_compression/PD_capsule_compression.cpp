@@ -247,7 +247,12 @@ int main(int argc, char **argv)
     auto pd_elastic = material_options.model == "elastic" ? execution->makeNosbPDElastic() : nullptr;
     if (material_options.model == "elastic")
         std::cout << "NOSB-PD elastic stress backend " << (pd_elastic ? "cuda_fp64" : "cpu_fp64") << std::endl;
-    auto constitutive = peridynamics::makePDConstitutiveDynamics(shell_inner, &pd_bonds, std::move(pd_elastic));
+    const bool uses_j2 = material_options.model == "j2" || material_options.model == "viscoplastic";
+    auto pd_j2 = uses_j2 ? execution->makeNosbPDJ2() : nullptr;
+    if (uses_j2)
+        std::cout << "NOSB-PD J2 stress backend " << (pd_j2 ? "cuda_fp64" : "cpu_fp64") << std::endl;
+    auto constitutive = peridynamics::makePDConstitutiveDynamics(
+        shell_inner, &pd_bonds, std::move(pd_elastic), std::move(pd_j2));
     auto fracture = peridynamics::makePDFracture(shell_inner, material_options, fracture_options);
     solid_dynamics::NosbPDStabilizationWithExecution hourglass(pd_bonds, hourglass_coefficient, hourglass_damage_cutoff);
     solid_dynamics::NosbPDDampingWithExecution pd_damping(pd_bonds);

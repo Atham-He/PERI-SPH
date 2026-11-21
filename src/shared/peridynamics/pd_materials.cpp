@@ -15,26 +15,21 @@
 
 #include "base_particles.hpp"
 #include "pd_numerics.h"
-#include <functional>
+#include "pd_plastic_multiplier.h"
 
 namespace SPH
 {
 namespace
 {
-Real solvePlasticMultiplier(const std::function<Real(Real)> &residual, Real lower, Real upper, Real scale)
+template <class Residual>
+Real solvePlasticMultiplier(const Residual &residual, Real lower, Real upper, Real scale)
 {
-    for (int i = 0; residual(upper) > 0.0 && i < 64; ++i) upper = 2.0 * upper + 1e-16;
-    if (!std::isfinite(residual(upper)) || residual(upper) > 0.0)
-        throw std::runtime_error("PD constitutive return mapping: failed to bracket plastic multiplier");
-    for (int i = 0; i < 100; ++i)
-    {
-        Real mid = 0.5 * (lower + upper);
-        Real value = residual(mid);
-        if (!std::isfinite(value)) throw std::runtime_error("PD constitutive return mapping: non-finite residual");
-        if (std::abs(value) <= 1e-11 * std::max(scale, Real(1))) return mid;
-        if (value > 0.0) lower = mid; else upper = mid;
-    }
-    throw std::runtime_error("PD constitutive return mapping: local solve did not converge");
+    using namespace peridynamics;
+    Real multiplier = 0;
+    const auto status = bracketPlasticMultiplier(residual, lower, upper, scale, multiplier);
+    if (status != PlasticMultiplierStatus::Accepted)
+        throwPlasticMultiplierFailure(status);
+    return multiplier;
 }
 } // namespace
 //=================================================================================================//

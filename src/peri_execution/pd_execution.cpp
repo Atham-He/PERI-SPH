@@ -121,6 +121,15 @@ std::unique_ptr<NosbPDElasticBatch> PeriExecution::makeNosbPDElastic() const
     return nullptr;
 }
 
+std::unique_ptr<NosbPDJ2Batch> PeriExecution::makeNosbPDJ2() const
+{
+#if defined(PERI_SPH_HAS_CUDA)
+    if (mode_ == PeriExecutionMode::GPU)
+        return makeCudaNosbPDJ2();
+#endif
+    return nullptr;
+}
+
 std::unique_ptr<PositionVerletBatch> PeriExecution::makePositionVerlet() const
 {
 #if defined(PERI_SPH_HAS_CUDA)

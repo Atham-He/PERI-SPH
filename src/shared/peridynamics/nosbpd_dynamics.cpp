@@ -11,6 +11,7 @@
  */
 
 #include "nosbpd_dynamics.h"
+#include "pd_plastic_multiplier.h"
 #include "pd_numerics.h"
 
 #include "adaptation.h"
@@ -577,55 +578,136 @@ void NosbPDSecondStepPlastic::interaction(size_t index_i, Real dt)
     }
 }
 //=================================================================================================//
+Real NosbPDSecondStepPlastic::prepareKinematics(std::size_t index_i, Matd &gradient)
+{
+    F_[index_i] = N_[index_i] * shape_K_1_[index_i];
+    F_delta_[index_i] = N_deltaU_[index_i] * shape_K_1_[index_i];
+    F_half_[index_i] = N_half_[index_i] * shape_K_1_[index_i];
+
+    /** NaN isolation: see NosbPDSecondStep::update. */
+    if (!F_[index_i].allFinite() || !F_half_[index_i].allFinite())
+    {
+        particles_->getVariableDataByName<int>("NumericalFailureReason")[index_i] = 2;
+        peridynamics::numericalFailure(sph_body_->Name(), index_i, "non-finite DeformationGradient");
+    }
+    Real detF = F_[index_i].determinant();
+    Real detF_half = F_half_[index_i].determinant();
+    /** guard BEFORE inverting: see NosbPDSecondStep::update. */
+    if (!std::isfinite(detF) || !std::isfinite(detF_half) ||
+        detF < peridynamics::nosb_minimum_deformation_determinant ||
+        detF_half < peridynamics::nosb_minimum_deformation_determinant)
+    {
+        particles_->getVariableDataByName<int>("NumericalFailureReason")[index_i] = 3;
+        peridynamics::numericalFailure(sph_body_->Name(), index_i, "DeformationGradient determinant below 0.05");
+    }
+    F_1_[index_i] = F_[index_i].inverse();
+    F_1_half_[index_i] = F_half_[index_i].inverse();
+    /** G: Eulerian velocity gradient tensor */
+    gradient = F_delta_[index_i] * F_1_half_[index_i];
+    return detF;
+}
+
+void NosbPDSecondStepPlastic::publishPlasticState(std::size_t index_i, Real detF, const Matd &rotated_plastic)
+{
+    // End-point stress plastic work includes hardening and rate dependence;
+    // it is not labelled as heat or as a calibrated fracture energy.
+    plastic_work_[index_i] += Vol_[index_i] * detF *
+        stress_[index_i].cwiseProduct(plastic_strain_[index_i] - rotated_plastic).sum();
+    /** PK1: the first Piola-Kirchhoff stress tensor */
+    Matd PK1 = detF * F_1_[index_i] * stress_[index_i];
+    PK1_[index_i] = PK1.transpose();
+    /** T0_: peridynamic force state */
+    T0_[index_i] = PK1_[index_i] * shape_K_1_[index_i];
+}
+
 void NosbPDSecondStepPlastic::update(size_t index_i, Real dt)
 {
-    if (particleLive_[index_i] == 1)
+    if (particleLive_[index_i] != 1)
     {
-        F_[index_i] = N_[index_i] * shape_K_1_[index_i];
-        F_delta_[index_i] = N_deltaU_[index_i] * shape_K_1_[index_i];
-        F_half_[index_i] = N_half_[index_i] * shape_K_1_[index_i];
-
-        /** NaN isolation: see NosbPDSecondStep::update. */
-        if (!F_[index_i].allFinite() || !F_half_[index_i].allFinite())
-        {
-            particles_->getVariableDataByName<int>("NumericalFailureReason")[index_i] = 2;
-            peridynamics::numericalFailure(sph_body_->Name(), index_i, "non-finite DeformationGradient");
-        }
-        Real detF = F_[index_i].determinant();
-        Real detF_half = F_half_[index_i].determinant();
-        /** guard BEFORE inverting: see NosbPDSecondStep::update. */
-        if (!std::isfinite(detF) || !std::isfinite(detF_half) ||
-            detF < peridynamics::nosb_minimum_deformation_determinant ||
-            detF_half < peridynamics::nosb_minimum_deformation_determinant)
-        {
-            particles_->getVariableDataByName<int>("NumericalFailureReason")[index_i] = 3;
-            peridynamics::numericalFailure(sph_body_->Name(), index_i, "DeformationGradient determinant below 0.05");
-        }
-        F_1_[index_i] = F_[index_i].inverse();
-        F_1_half_[index_i] = F_half_[index_i].inverse();
-        /** G: Eulerian velocity gradient tensor */
-        Matd G = F_delta_[index_i] * F_1_half_[index_i];
-        /** return-mapping (convex cutting-plane) with Hughes-Winget objectivity;
-         * dt passed so that rate-dependent (visco-plastic) materials can
-         * evaluate the overstress term. */
-        Matd skew = 0.5 * (G - G.transpose());
-        Matd Q = Matd::Identity() + (Matd::Identity() - 0.5 * skew).inverse() * skew;
-        Matd rotated_plastic = Q * plastic_strain_[index_i] * Q.transpose();
-        stress_[index_i] = plastic_solid_.
-            PlasticConstitutiveRelation(G, stress_[index_i], plastic_strain_[index_i], index_i, dt);
-        // End-point stress plastic work includes hardening and rate dependence;
-        // it is not labelled as heat or as a calibrated fracture energy.
-        plastic_work_[index_i] += Vol_[index_i] * detF *
-            stress_[index_i].cwiseProduct(plastic_strain_[index_i] - rotated_plastic).sum();
-        /** PK1: the first Piola-Kirchhoff stress tensor */
-        Matd PK1 = detF * F_1_[index_i] * stress_[index_i];
-        PK1_[index_i] = PK1.transpose();
-        /** T0_: peridynamic force state */
-        T0_[index_i] = PK1_[index_i] * shape_K_1_[index_i];
+        stress_[index_i].setZero();
+        return;
     }
-    else
+
+    Matd gradient;
+    const Real detF = prepareKinematics(index_i, gradient);
+    const Matd skew = 0.5 * (gradient - gradient.transpose());
+    const Matd rotation = Matd::Identity() + (Matd::Identity() - 0.5 * skew).inverse() * skew;
+    const Matd rotated_plastic = rotation * plastic_strain_[index_i] * rotation.transpose();
+    stress_[index_i] = plastic_solid_.PlasticConstitutiveRelation(
+        gradient, stress_[index_i], plastic_strain_[index_i], index_i, dt);
+    publishPlasticState(index_i, detF, rotated_plastic);
+}
+
+NosbPDJ2WithExecution::NosbPDJ2WithExecution(
+    BaseInnerRelation &relation, NosbPDBondWorkspace *workspace, std::unique_ptr<peridynamics::NosbPDJ2Batch> backend)
+    : NosbPDDeformationWithExecution<NosbPDSecondStepPlastic>(relation, workspace), backend_(std::move(backend))
+{
+    const auto &actual = typeid(plastic_solid_);
+    const bool viscous = actual == typeid(ViscoPlasticSolidforPD);
+    if (!backend_ || (!viscous && actual != typeid(J2PlasticityforPD)))
     {
-        stress_[index_i] = Matd::Zero();
+        backend_.reset();
+        return;
+    }
+
+    auto &material = static_cast<J2PlasticityforPD &>(plastic_solid_);
+    const auto &hardening = material.HardeningParameters();
+    parameters_ = {material.FirstLameParameter(), material.ShearModulus(), material.YieldStress(),
+                   hardening.linearModulus(), hardening.saturationIncrement(), hardening.saturationRate(),
+                   material.KinematicHardeningModulus(),
+                   viscous ? static_cast<ViscoPlasticSolidforPD &>(material).Viscosity() : Real(0),
+                   TinyReal, hardening.law() == PDIsotropicHardening::Law::Legacy};
+    alpha_ = particles_->getVariableDataByName<Real>("IsotropicHardeningParam");
+    kinematic_ = particles_->getVariableDataByName<Matd>("KinematicHardeningParam");
+}
+
+void NosbPDJ2WithExecution::exec(Real dt)
+{
+    using namespace peridynamics;
+    if (!backend_)
+    {
+        NosbPDDeformationWithExecution<NosbPDSecondStepPlastic>::exec(dt);
+        return;
+    }
+
+    InteractionDynamics<NosbPDSecondStepPlastic>::exec(dt);
+    const auto count = particles_->TotalRealParticles();
+    sites_.resize(count);
+    determinants_.resize(count);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        if (particleLive_[i] != 1)
+        {
+            sites_[i] = {};
+            continue;
+        }
+
+        Matd gradient;
+        determinants_[i] = prepareKinematics(i, gradient);
+        sites_[i] = {packNosbPDTensor(gradient), packNosbPDTensor(stress_[i]), packNosbPDTensor(plastic_strain_[i]),
+                     packNosbPDTensor(kinematic_[i]), alpha_[i], true};
+    }
+
+    backend_->update(sites_, parameters_, dt, Dimensions, results_);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        const auto &result = results_[i];
+        if (result.status == NosbPDJ2Status::Inactive)
+        {
+            stress_[i].setZero();
+            continue;
+        }
+        if (result.status == NosbPDJ2Status::InvalidHistory)
+            throw std::invalid_argument("PD hardening: nonnegative finite equivalent plastic strain required");
+        if (result.status == NosbPDJ2Status::InvalidViscousStep)
+            throw std::invalid_argument("ViscoPlasticSolidforPD requires a positive time increment");
+        if (result.status == NosbPDJ2Status::ReturnFailed)
+            throwPlasticMultiplierFailure(result.return_status);
+        stress_[i] = unpackNosbPDTensor(result.stress);
+        plastic_strain_[i] = unpackNosbPDTensor(result.plastic_strain);
+        kinematic_[i] = unpackNosbPDTensor(result.kinematic);
+        alpha_[i] = result.alpha;
+        publishPlasticState(i, determinants_[i], unpackNosbPDTensor(result.rotated_plastic_strain));
     }
 }
 //=================================================================================================//

@@ -5,6 +5,7 @@
 #include <optional>
 #include "sphinxsys.h"
 #include "pd_fluid_time_step.h"
+#include "pd_time_step_execution.h"
 #include "pd_case_config.h"
 #include "pd_checkpoint.h"
 #include <regex>
@@ -251,7 +252,9 @@ int main(int argc, char **argv)
               << "; damping " << (pd_damping.onDevice() ? "cuda_fp64" : "cpu_fp64") << std::endl;
     solid_dynamics::NosbPDInternalForceWithExecution third(pd_bonds);
     solid_dynamics::NosbPDStepWithExecution<solid_dynamics::NosbPDFourthStep> fourth(shell, pd_time_integration.get());
-    ReduceDynamics<solid_dynamics::PDTimeStep> shell_step(shell, pd_cfl);
+    auto solid_cfl = execution->makePDCfl();
+    solid_dynamics::PDTimeStepExecution shell_step(shell, solid_cfl.get(), pd_cfl);
+    std::cout << "NOSB-PD CFL backend " << (solid_cfl ? "cuda_fp64" : "cpu_fp64") << std::endl;
     SimpleDynamics<solid_dynamics::UpdateElasticNormalDirection> update_normals(shell);
     solid_dynamics::AverageVelocityAndAcceleration averages(shell);
     SimpleDynamics<solid_dynamics::PrescribedTranslation> move_upper(upper, 0, end_time, Vecd(0, -compression_distance, 0));

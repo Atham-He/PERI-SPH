@@ -1,4 +1,5 @@
 #include "pd_fluid_cfl_batch.h"
+#include "pd_solid_cfl_batch.h"
 #include "pd_cuda_buffer.cuh"
 
 #include <algorithm>
@@ -45,15 +46,27 @@ __device__ double candidate(const FluidAdvectionCflSite &site, double h)
         Maximum{}(speed_squared, acceleration_scale) : CUDART_INF;
 }
 
-template <class Site>
-__global__ void reduceSiteSpeeds(const Site *sites, std::size_t count, double initial, double h,
+struct PDWaveParameters
+{
+    double spacing, sound_speed;
+};
+
+__device__ double candidate(const PDCflSite &site, PDWaveParameters parameters)
+{
+    const auto wave = (parameters.sound_speed + sqrt(squaredNorm(site.velocity))) / parameters.spacing;
+    const auto acceleration = sqrt(sqrt(squaredNorm(site.acceleration)) / parameters.spacing);
+    return isfinite(wave) && isfinite(acceleration) ? Maximum{}(wave, acceleration) : CUDART_INF;
+}
+
+template <class Site, class Parameters>
+__global__ void reduceSiteSpeeds(const Site *sites, std::size_t count, double initial, Parameters parameters,
                                  double *block_values)
 {
     std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const auto stride = std::size_t(gridDim.x) * blockDim.x;
     double maximum = initial;
     for (; i < count; i += stride)
-        maximum = Maximum{}(maximum, candidate(sites[i], h));
+        maximum = Maximum{}(maximum, candidate(sites[i], parameters));
 
     __shared__ BlockReduce::TempStorage temp;
     const auto block_maximum = BlockReduce(temp).Reduce(maximum, Maximum{});
@@ -73,23 +86,12 @@ __global__ void reduceBlockSpeeds(const double *blocks, unsigned count, double i
         *result = aggregate;
 }
 
-class CudaFluidCfl final : public FluidCflBatch
+class CudaCflReduction
 {
   public:
-    double acousticMaximum(const std::vector<FluidAcousticCflSite> &sites, double initial) override
-    {
-        return evaluate(sites, acoustic_sites_, initial, 0.0);
-    }
-
-    double advectionMaximum(const std::vector<FluidAdvectionCflSite> &sites, double initial,
-                            double smoothing_length) override
-    {
-        return evaluate(sites, advection_sites_, initial, smoothing_length);
-    }
-
-  private:
-    template <class Site>
-    double evaluate(const std::vector<Site> &sites, DeviceBuffer<Site> &device, double initial, double h)
+    template <class Site, class Parameters>
+    double evaluate(const std::vector<Site> &sites, DeviceBuffer<Site> &device,
+                    double initial, Parameters parameters)
     {
         if (sites.empty())
             return initial;
@@ -98,32 +100,69 @@ class CudaFluidCfl final : public FluidCflBatch
         // large bodies. This cap limits only temporary storage.
         constexpr std::size_t max_blocks = 512;
         const auto blocks = static_cast<unsigned>(std::min(max_blocks, 1 + (sites.size() - 1) / block_size));
-        upload(device, sites, "fluid CFL inputs");
+        upload(device, sites, "CFL inputs");
         partial_.reserve(blocks);
 
-        reduceSiteSpeeds<<<blocks, block_size>>>(device.get(), sites.size(), initial, h, partial_.get());
-        check(cudaGetLastError(), "reduce fluid CFL per-particle bounds");
+        reduceSiteSpeeds<<<blocks, block_size>>>(device.get(), sites.size(), initial, parameters, partial_.get());
+        check(cudaGetLastError(), "reduce CFL per-particle bounds");
         const double *result = partial_.get();
         if (blocks > 1)
         {
             aggregate_.reserve(1);
             reduceBlockSpeeds<<<1, block_size>>>(partial_.get(), blocks, initial, aggregate_.get());
-            check(cudaGetLastError(), "reduce fluid CFL block bounds");
+            check(cudaGetLastError(), "reduce CFL block bounds");
             result = aggregate_.get();
         }
         double maximum = initial;
-        check(cudaMemcpy(&maximum, result, sizeof(maximum), cudaMemcpyDeviceToHost), "read fluid CFL maximum");
+        check(cudaMemcpy(&maximum, result, sizeof(maximum), cudaMemcpyDeviceToHost), "read CFL maximum");
         return maximum;
     }
 
+  private:
+    DeviceBuffer<double> partial_, aggregate_;
+};
+
+class CudaFluidCfl final : public FluidCflBatch
+{
+  public:
+    double acousticMaximum(const std::vector<FluidAcousticCflSite> &sites, double initial) override
+    {
+        return reduction_.evaluate(sites, acoustic_sites_, initial, 0.0);
+    }
+
+    double advectionMaximum(const std::vector<FluidAdvectionCflSite> &sites, double initial,
+                            double smoothing_length) override
+    {
+        return reduction_.evaluate(sites, advection_sites_, initial, smoothing_length);
+    }
+
+  private:
+    CudaCflReduction reduction_;
     DeviceBuffer<FluidAcousticCflSite> acoustic_sites_;
     DeviceBuffer<FluidAdvectionCflSite> advection_sites_;
-    DeviceBuffer<double> partial_, aggregate_;
+};
+
+class CudaPDCfl final : public PDCflBatch
+{
+  public:
+    double maximumInverseStep(const std::vector<PDCflSite> &sites, double initial,
+                              double spacing, double sound_speed) override
+    {
+        return reduction_.evaluate(sites, sites_, initial, PDWaveParameters{spacing, sound_speed});
+    }
+
+  private:
+    CudaCflReduction reduction_;
+    DeviceBuffer<PDCflSite> sites_;
 };
 }
 
 std::unique_ptr<FluidCflBatch> makeCudaFluidCfl()
 {
     return std::make_unique<CudaFluidCfl>();
+}
+std::unique_ptr<PDCflBatch> makeCudaPDCfl()
+{
+    return std::make_unique<CudaPDCfl>();
 }
 }

@@ -156,4 +156,13 @@ std::unique_ptr<FluidCflBatch> PeriExecution::makeFluidCfl() const
 #endif
     return nullptr;
 }
+std::unique_ptr<PDCflBatch> PeriExecution::makePDCfl() const
+{
+#if defined(PERI_SPH_HAS_CUDA)
+    if (mode_ == PeriExecutionMode::GPU)
+        return makeCudaPDCfl();
+#endif
+    return nullptr;
+}
+
 }

@@ -9,6 +9,7 @@
 #include "pd_fluid_viscosity_batch.h"
 #include "pd_nosb_bond_batch.h"
 #include "pd_solid_time_step.h"
+#include "pd_solid_cfl_batch.h"
 #include "pd_spatial_derivatives.h"
 
 #include <string_view>
@@ -53,6 +54,7 @@ class PeriExecution
     std::unique_ptr<FluidAcousticBatch> makeFluidAcoustic() const;
     std::unique_ptr<FluidViscosityBatch> makeFluidViscosity() const;
     std::unique_ptr<FluidCflBatch> makeFluidCfl() const;
+    std::unique_ptr<PDCflBatch> makePDCfl() const;
 
   private:
     PeriExecutionMode mode_;

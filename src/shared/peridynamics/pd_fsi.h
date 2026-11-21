@@ -200,7 +200,10 @@ class PDFluidAcousticWorkspace
   private:
     friend class PDFluidPressureHalf;
     friend class PDFluidDensityHalf;
-    void evaluate(peridynamics::FluidAcousticHalf half);
+    friend class PDFluidVelocityDivergence;
+    friend class PDFluidAcousticDamping;
+    void compute(peridynamics::FluidAcousticStage stage);
+    void evaluateHalf(peridynamics::FluidAcousticStage stage);
 
     BaseInnerRelation &inner_;
     BaseContactRelation &wall_;
@@ -304,6 +307,9 @@ class AcousticDamperInnerforPD : public LocalDynamics, public DataDelegateInner
     void interaction(size_t index_i, Real dt = 0.0);
 
   protected:
+    friend class PDFluidAcousticDamping;
+    void applyDamping(std::size_t i, const Vecd &sum, Real dt);
+
     Real coeff_acoustic_damper_ = 0.0;
     Real *Vol_, *rho_, *u_div_;
     Real *mass_, *work_;
@@ -330,11 +336,38 @@ class AcousticDamperWithWallforPD : public LocalDynamics, public DataDelegateCon
     void interaction(size_t index_i, Real dt = 0.0);
 
   protected:
+    friend class PDFluidAcousticDamping;
+    void applyDamping(std::size_t i, const Vecd &sum, Real dt);
+
     Real coeff_acoustic_damper_ = 0.0;
     Real *Vol_, *rho_, *u_div_;
     Real *mass_, *work_;
     Vecd *force_, *vel_;
     StdVec<Real *> contact_Vol_;
+};
+class PDFluidVelocityDivergence
+{
+  public:
+    explicit PDFluidVelocityDivergence(PDFluidAcousticWorkspace &workspace);
+    void exec(Real dt = 0.0);
+
+  private:
+    PDFluidAcousticWorkspace &workspace_;
+    InteractionDynamics<VelocityDivergenceInner> inner_;
+    InteractionDynamics<VelocityDivergenceWithWallforPD> wall_;
+};
+
+class PDFluidAcousticDamping
+{
+  public:
+    explicit PDFluidAcousticDamping(PDFluidAcousticWorkspace &workspace);
+    void setCoeffAcousticDamper(Real rho0, Real c0, Real h);
+    void exec(Real dt = 0.0);
+
+  private:
+    PDFluidAcousticWorkspace &workspace_;
+    InteractionDynamics<AcousticDamperInnerforPD> inner_;
+    InteractionDynamics<AcousticDamperWithWallforPD> wall_;
 };
 } // namespace fluid_dynamics
 

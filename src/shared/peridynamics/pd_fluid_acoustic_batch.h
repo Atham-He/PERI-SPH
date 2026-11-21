@@ -4,7 +4,7 @@
 
 namespace SPH::peridynamics
 {
-enum class FluidAcousticHalf { Pressure, Density };
+enum class FluidAcousticStage { Pressure, Density, Divergence, Damping };
 
 struct FluidAcousticCoefficients
 {
@@ -14,7 +14,7 @@ struct FluidAcousticCoefficients
 struct FluidAcousticSite
 {
     ParticleVector3 velocity, force_prior;
-    double volume, density, pressure, mass;
+    double volume, density, pressure, mass, divergence;
 };
 
 struct FluidAcousticWall
@@ -36,6 +36,8 @@ struct FluidAcousticStencil
     std::vector<FluidAcousticNeighbor> neighbors;
 };
 
+// Pressure and density use scaled increments. Divergence returns the two
+// unscaled rate sums, and damping returns the two unscaled vector sums.
 struct FluidAcousticResult
 {
     ParticleVector3 inner_force, wall_force;
@@ -48,7 +50,7 @@ class FluidAcousticBatch
     virtual ~FluidAcousticBatch() = default;
     // The first count fluid sites are the source rows. Remaining sites are
     // referenced neighbors owned by the fluid relation, such as ghosts.
-    virtual void evaluate(FluidAcousticHalf half, std::size_t count,
+    virtual void evaluate(FluidAcousticStage half, std::size_t count,
                           const std::vector<FluidAcousticSite> &sites,
                           const std::vector<FluidAcousticWall> &walls,
                           const FluidAcousticStencil &inner, const FluidAcousticStencil &wall,

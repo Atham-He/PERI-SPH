@@ -179,13 +179,11 @@ int main(int ac, char *av[]) try
     /** velocity divergence on the fluid side (after the 2nd half step).
      * Note: must be constructed before the acoustic damper,
      * which retrieves the registered VelocityDivergence variable. */
-    InteractionDynamics<fluid_dynamics::VelocityDivergenceInner> velocity_divergence_inner(water_block_inner);
-    InteractionDynamics<fluid_dynamics::VelocityDivergenceWithWallforPD> velocity_divergence_wall(water_plate_contact);
-    /** acoustic damper on the fluid side (after the 1st half step). */
-    InteractionDynamics<fluid_dynamics::AcousticDamperInnerforPD> acoustic_damper_inner(water_block_inner);
-    acoustic_damper_inner.setCoeffAcousticDamper(rho0_f, c_f, water_block.getSPHAdaptation().getKernel()->CutOffRadius());
-    InteractionDynamics<fluid_dynamics::AcousticDamperWithWallforPD> acoustic_damper_wall(water_plate_contact);
-    acoustic_damper_wall.setCoeffAcousticDamper(rho0_f, c_f, water_block.getSPHAdaptation().getKernel()->CutOffRadius());
+    fluid_dynamics::PDFluidAcousticWorkspace acoustic(water_block_inner, water_plate_contact,
+                                                       execution.makeFluidAcoustic(), 1.0);
+    fluid_dynamics::PDFluidVelocityDivergence velocity_divergence(acoustic);
+    fluid_dynamics::PDFluidAcousticDamping acoustic_damper(acoustic);
+    acoustic_damper.setCoeffAcousticDamper(rho0_f, c_f, water_block.getSPHAdaptation().getKernel()->CutOffRadius());
     //----------------------------------------------------------------------
     //	Algorithms of FSI.
     //----------------------------------------------------------------------
@@ -266,13 +264,11 @@ int main(int ac, char *av[]) try
             {
                 /** fluid relaxation and force computation. */
                 pressure_relaxation.exec(dt);
-                acoustic_damper_inner.exec(dt);
-                acoustic_damper_wall.exec(dt);
+                acoustic_damper.exec(dt);
                 initialize_a_pd_step.exec(dt);
                 fluid_pressure_force_on_plate.exec(dt);
                 density_relaxation.exec(dt);
-                velocity_divergence_inner.exec(dt);
-                velocity_divergence_wall.exec(dt);
+                velocity_divergence.exec(dt);
                 /** NOSB-PD subcycling. */
                 Real dt_s_sum = 0.0;
                 average_velocity_and_acceleration.initialize_displacement_.exec();

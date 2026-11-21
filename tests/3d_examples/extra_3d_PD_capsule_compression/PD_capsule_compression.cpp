@@ -204,14 +204,11 @@ int main(int argc, char **argv)
     std::cout << "Fluid CFL backend " << (fluid_cfl ? "cuda_fp64" : "cpu_fp64") << std::endl;
     SimpleDynamics<GravityForce<Gravity>> fluid_gravity(liquid, Gravity(Vecd(0, -gravity_g, 0)));
     SimpleDynamics<solid_dynamics::PDTimeStepInitialization> initialize_shell(shell, makeShared<Gravity>(Vecd(0, -gravity_g, 0)));
-    InteractionDynamics<fluid_dynamics::VelocityDivergenceInner> divergence(fluid_inner);
-    InteractionDynamics<fluid_dynamics::VelocityDivergenceWithWallforPD> wall_divergence(fluid_walls);
-    InteractionDynamics<fluid_dynamics::AcousticDamperInnerforPD> inner_damping(fluid_inner);
-    InteractionDynamics<fluid_dynamics::AcousticDamperWithWallforPD> wall_damping(fluid_walls);
+    fluid_dynamics::PDFluidVelocityDivergence divergence(acoustic);
+    fluid_dynamics::PDFluidAcousticDamping acoustic_damping(acoustic);
     Real damping_c = c_f * acoustic_damping_factor / 0.3;
     Real fluid_horizon = liquid.getSPHAdaptation().getKernel()->CutOffRadius();
-    inner_damping.setCoeffAcousticDamper(rho0_f, damping_c, fluid_horizon);
-    wall_damping.setCoeffAcousticDamper(rho0_f, damping_c, fluid_horizon);
+    acoustic_damping.setCoeffAcousticDamper(rho0_f, damping_c, fluid_horizon);
     solid_dynamics::PDFluidPressureCoupling<AcousticRiemannSolver> shell_pressure(shell_fluid,*execution);
     std::cout<<"PD fluid pressure backend "<<(shell_pressure.onDevice()?"cuda_fp64":"cpu_fp64")<<std::endl;
     shell_pressure.setCoeffAcousticDamper(rho0_f, damping_c, fluid_horizon);
@@ -564,12 +561,12 @@ int main(int argc, char **argv)
                         // Both directions of explicit viscous traction sample the same
                         // accepted-time velocities, before pressure changes the core.
                         fluid_viscosity.exec(); shell_viscosity.exec(); upper_viscosity.exec();
-                        divergence.exec(); wall_divergence.exec();
+                        divergence.exec();
                         pressure.exec(dt); fluid_work.exec(dt);
                         upper_pressure.exec();
                         plate_fluid_pressure_work += dt * compression_speed * sumVector(upper, "PressureForceFromFluid")[1];
                         plate_fluid_viscous_work += dt * compression_speed * sumVector(upper, "ViscousForceFromFluid")[1];
-                        inner_damping.exec(dt); wall_damping.exec(dt); check_fluid();
+                        acoustic_damping.exec(dt); check_fluid();
                     }
                     phase = "external shell loads";
                     initialize_shell.exec();

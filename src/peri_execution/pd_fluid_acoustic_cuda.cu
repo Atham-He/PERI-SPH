@@ -44,6 +44,14 @@ __device__ void addForce(ParticleVector3 &force, double scale, const ParticleVec
         force.component[axis] += scale * direction.component[axis];
 }
 
+__device__ ParticleVector3 mirroredVelocity(const ParticleVector3 &wall, const ParticleVector3 &fluid)
+{
+    ParticleVector3 ghost;
+    for (int axis = 0; axis < 3; ++axis)
+        ghost.component[axis] = 2.0 * wall.component[axis] - fluid.component[axis];
+    return ghost;
+}
+
 __device__ double dissipativePressure(double jump, FluidAcousticCoefficients coefficients)
 {
     // BaseAcousticRiemannSolver with its default TruncatedLinear limiter.
@@ -106,12 +114,10 @@ __global__ void evaluateAcoustic(const FluidAcousticSite *sites, const FluidAcou
         {
             const double facing = dot(pair.direction, target.normal);
             const double sign = (0.0 < facing) - (facing < 0.0);
-            ParticleVector3 ghost_velocity, normal;
+            const auto ghost_velocity = mirroredVelocity(target.average_velocity, source.velocity);
+            ParticleVector3 normal;
             for (int axis = 0; axis < 3; ++axis)
-            {
-                ghost_velocity.component[axis] = 2.0 * target.average_velocity.component[axis] - source.velocity.component[axis];
                 normal.component[axis] = sign * target.normal.component[axis];
-            }
             row.wall_density_rate += dot(difference(source.velocity, ghost_velocity), pair.direction) * gradient;
             const double jump = 2.0 * dot(difference(source.velocity, target.average_velocity), normal);
             addForce(row.wall_force, dissipativePressure(jump, coefficients) * gradient, normal);
@@ -125,6 +131,45 @@ __global__ void evaluateAcoustic(const FluidAcousticSite *sites, const FluidAcou
     }
     row.inner_density_rate *= source.density;
     row.wall_density_rate *= source.density;
+    result[i] = row;
+}
+
+template <bool damping>
+__global__ void evaluateAcousticCorrection(const FluidAcousticSite *sites, const FluidAcousticWall *walls,
+                                           const std::size_t *inner_offsets, const FluidAcousticNeighbor *inner,
+                                           const std::size_t *wall_offsets, const FluidAcousticNeighbor *wall,
+                                           std::size_t count, FluidAcousticResult *result)
+{
+    const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count)
+        return;
+
+    const auto &source = sites[i];
+    FluidAcousticResult row{};
+    for (auto n = inner_offsets[i]; n < inner_offsets[i + 1]; ++n)
+    {
+        const auto &pair = inner[n];
+        const auto &target = sites[pair.target];
+        if constexpr (damping)
+            addForce(row.inner_force, (source.divergence + target.divergence) * pair.kernel_derivative * target.volume,
+                     pair.direction);
+        else
+            row.inner_density_rate += dot(difference(source.velocity, target.velocity), pair.direction) *
+                pair.kernel_derivative * target.volume;
+    }
+    for (auto n = wall_offsets[i]; n < wall_offsets[i + 1]; ++n)
+    {
+        const auto &pair = wall[n];
+        const auto &target = walls[pair.target];
+        if constexpr (damping)
+            addForce(row.wall_force, (2.0 * source.divergence) * pair.kernel_derivative * target.volume, pair.direction);
+        else
+        {
+            const auto ghost = mirroredVelocity(target.average_velocity, source.velocity);
+            row.wall_density_rate += dot(difference(source.velocity, ghost), pair.direction) *
+                pair.kernel_derivative * target.volume;
+        }
+    }
     result[i] = row;
 }
 
@@ -148,7 +193,7 @@ class CudaFluidAcoustic final : public FluidAcousticBatch
         max_blocks_ = static_cast<std::size_t>(maximum);
     }
 
-    void evaluate(FluidAcousticHalf half, std::size_t count, const std::vector<FluidAcousticSite> &sites,
+    void evaluate(FluidAcousticStage half, std::size_t count, const std::vector<FluidAcousticSite> &sites,
                   const std::vector<FluidAcousticWall> &walls, const FluidAcousticStencil &inner,
                   const FluidAcousticStencil &wall, FluidAcousticCoefficients coefficients,
                   std::vector<FluidAcousticResult> &result) override
@@ -169,14 +214,30 @@ class CudaFluidAcoustic final : public FluidAcousticBatch
         wall_.uploadRows(wall);
         result_.reserve(count);
 
-        if (half == FluidAcousticHalf::Pressure)
-            evaluateAcoustic<true><<<static_cast<unsigned>(blocks), threads>>>(sites_.get(), walls_.get(),
+        const auto grid = static_cast<unsigned>(blocks);
+        switch (half)
+        {
+        case FluidAcousticStage::Pressure:
+            evaluateAcoustic<true><<<grid, threads>>>(sites_.get(), walls_.get(),
                 inner_.offsets.get(), inner_.neighbors.get(), wall_.offsets.get(), wall_.neighbors.get(),
                 count, coefficients, result_.get());
-        else
-            evaluateAcoustic<false><<<static_cast<unsigned>(blocks), threads>>>(sites_.get(), walls_.get(),
+            break;
+        case FluidAcousticStage::Density:
+            evaluateAcoustic<false><<<grid, threads>>>(sites_.get(), walls_.get(),
                 inner_.offsets.get(), inner_.neighbors.get(), wall_.offsets.get(), wall_.neighbors.get(),
                 count, coefficients, result_.get());
+            break;
+        case FluidAcousticStage::Divergence:
+            evaluateAcousticCorrection<false><<<grid, threads>>>(sites_.get(), walls_.get(),
+                inner_.offsets.get(), inner_.neighbors.get(), wall_.offsets.get(), wall_.neighbors.get(),
+                count, result_.get());
+            break;
+        case FluidAcousticStage::Damping:
+            evaluateAcousticCorrection<true><<<grid, threads>>>(sites_.get(), walls_.get(),
+                inner_.offsets.get(), inner_.neighbors.get(), wall_.offsets.get(), wall_.neighbors.get(),
+                count, result_.get());
+            break;
+        }
 
         check(cudaGetLastError(), "evaluate fluid acoustic interactions");
         download(result, result_, "fluid acoustic results");

@@ -186,7 +186,9 @@ int main(int argc, char **argv)
     ComplexRelation fluid_complex(fluid_inner, fluid_walls);
 
     SimpleDynamics<NormalDirectionFromBodyShape> shell_normals(shell), lower_normals(lower), upper_normals(upper);
-    fluid_dynamics::PDFluidAcousticWorkspace acoustic(fluid_inner, fluid_walls, execution->makeFluidAcoustic(), pd_pressure_acceleration_factor);
+    peridynamics::FluidNeighborConfiguration fluid_configuration;
+    fluid_dynamics::PDFluidAcousticWorkspace acoustic(fluid_inner, fluid_walls, execution->makeFluidAcoustic(),
+                                                       pd_pressure_acceleration_factor, &fluid_configuration);
     fluid_dynamics::PDFluidPressureHalf pressure(acoustic);
     fluid_dynamics::PDFluidDensityHalf density(acoustic);
     std::cout << "Fluid acoustic interactions backend " << (acoustic.onDevice() ? "cuda_fp64" : "cpu_fp64") << std::endl;
@@ -209,7 +211,7 @@ int main(int argc, char **argv)
     Real damping_c = c_f * acoustic_damping_factor / 0.3;
     Real fluid_horizon = liquid.getSPHAdaptation().getKernel()->CutOffRadius();
     acoustic_damping.setCoeffAcousticDamper(rho0_f, damping_c, fluid_horizon);
-    solid_dynamics::PDFluidPressureCoupling<AcousticRiemannSolver> shell_pressure(shell_fluid,*execution);
+    solid_dynamics::PDFluidPressureCoupling<AcousticRiemannSolver> shell_pressure(shell_fluid, *execution, &fluid_configuration);
     std::cout<<"PD fluid pressure backend "<<(shell_pressure.onDevice()?"cuda_fp64":"cpu_fp64")<<std::endl;
     shell_pressure.setCoeffAcousticDamper(rho0_f, damping_c, fluid_horizon);
     shell_pressure.setAccelerationPressureFactor(pd_pressure_acceleration_factor);
@@ -549,7 +551,7 @@ int main(int argc, char **argv)
                 if (with_liquid && reinitialize_density) {density_sum.exec(); check_fluid();}
                 Real Dt = peridynamics::boundedTimeStep(with_liquid ? advection_step.exec() : pd_dt * 20, {target_time - time});
                 Real advection_end = time + Dt;
-                for (const auto configuration = acoustic.reuseConfiguration(); time < advection_end;)
+                for (const auto configuration = fluid_configuration.reuse(); time < advection_end;)
                 {
                     Real solid_dt = shell_step.exec();
                     // Bound the explicit fluid-solid exchange as well as the fluid acoustic CFL.

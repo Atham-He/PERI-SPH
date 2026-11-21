@@ -70,6 +70,18 @@ Real pdWallAccelerationFactor(SPHBody &body, Real factor)
 
 namespace peridynamics
 {
+FluidNeighborConfiguration::Scope::Scope(FluidNeighborConfiguration &configuration)
+    : configuration_(configuration)
+{
+    if (configuration_.depth_++ == 0)
+        ++configuration_.generation_;
+}
+
+FluidNeighborConfiguration::Scope::~Scope()
+{
+    --configuration_.depth_;
+}
+
 void SPHViscosityWorkspace::addTarget(Form form, const ParticleConfiguration &configuration,
                                      const Vecd *velocity, const Real *volume, std::size_t bound,
                                      Real viscosity, Real smoothing_length)
@@ -191,8 +203,10 @@ void PressureWallTermsforPD::interaction(size_t i, Real)
 }
 
 PDFluidAcousticWorkspace::PDFluidAcousticWorkspace(BaseInnerRelation &inner, BaseContactRelation &wall,
-                                                   std::unique_ptr<peridynamics::FluidAcousticBatch> backend, Real acceleration_factor)
-    : inner_(inner), wall_(wall), acceleration_factor_(acceleration_factor), backend_(std::move(backend))
+                                                   std::unique_ptr<peridynamics::FluidAcousticBatch> backend, Real acceleration_factor,
+                                                   const peridynamics::FluidNeighborConfiguration *configuration)
+    : inner_(inner), wall_(wall), acceleration_factor_(acceleration_factor), backend_(std::move(backend)),
+      neighbor_cache_(configuration)
 {
     if (&inner.getSPHBody() != &wall.getSPHBody())
         throw std::invalid_argument("Fluid acoustic relations must share their source body");
@@ -234,23 +248,11 @@ void PDFluidDensityHalf::runMainStep(Real dt)
         Base::runMainStep(dt);
 }
 
-PDFluidAcousticWorkspace::FixedConfiguration::FixedConfiguration(PDFluidAcousticWorkspace &workspace)
-    : workspace_(workspace)
-{
-    if (workspace_.scope_depth_++ == 0)
-        workspace_.configuration_ready_ = false;
-}
-
-PDFluidAcousticWorkspace::FixedConfiguration::~FixedConfiguration()
-{
-    --workspace_.scope_depth_;
-}
-
 void PDFluidAcousticWorkspace::configure(std::size_t count, std::size_t bound)
 {
     using peridynamics::FluidAcousticStencil;
     constexpr auto missing = std::numeric_limits<std::size_t>::max();
-    configuration_ready_ = false;
+    neighbor_cache_.invalidate();
     ghost_indices_.assign(bound - count, missing);
     ghost_sources_.clear();
     wall_sources_.clear();
@@ -307,8 +309,7 @@ void PDFluidAcousticWorkspace::configure(std::size_t count, std::size_t bound)
         wall_stencil_.offsets[i + 1] = wall_stencil_.neighbors.size();
     }
     backend_->configure(count, count + ghost_sources_.size(), wall_sources_.size(), inner_stencil_, wall_stencil_);
-    configured_count_ = count;
-    configuration_ready_ = true;
+    neighbor_cache_.configured(count);
 }
 
 void PDFluidAcousticWorkspace::compute(peridynamics::FluidAcousticStage stage)
@@ -320,7 +321,7 @@ void PDFluidAcousticWorkspace::compute(peridynamics::FluidAcousticStage stage)
     const bool gather_velocity = density_stage || stage == FluidAcousticStage::Divergence;
     auto &particles = inner_.getSPHBody().getBaseParticles();
     const auto count = particles.TotalRealParticles();
-    if (scope_depth_ == 0 || !configuration_ready_ || configured_count_ != count)
+    if (neighbor_cache_.needsConfiguration(count))
         configure(count, particles.ParticlesBound());
 
     const auto *volume = particles.getVariableDataByName<Real>("VolumetricMeasure");
@@ -600,7 +601,8 @@ void ViscousForceFromFluidWithExecution::evaluateDevice(peridynamics::FluidVisco
 //=================================================================================================//
 template <class RiemannSolverType>
 PressureForceFromFluidforPD<RiemannSolverType>::
-    PressureForceFromFluidforPD(BaseContactRelation &contact_relation)
+    PressureForceFromFluidforPD(BaseContactRelation &contact_relation,
+                                const peridynamics::FluidNeighborConfiguration *configuration)
     : LocalDynamics(contact_relation.getSPHBody()), DataDelegateContact(contact_relation),
       hw_solid_(DynamicCast<HughesWingetSolid>(this, contact_relation.getSPHBody().getMatterMaterial())),
       Vol_(particles_->getVariableDataByName<Real>("VolumetricMeasure")),
@@ -610,7 +612,8 @@ PressureForceFromFluidforPD<RiemannSolverType>::
       n_(particles_->getVariableDataByName<Vecd>("NormalDirection")),
       force_from_fluid_(particles_->registerStateVariableData<Vecd>("PressureForceFromFluid")),
       acoustic_force_from_fluid_(particles_->getVariableDataByName<Vecd>("AcousticDampingForceFromFluid")),
-      pressure_from_fluid_(particles_->registerStateVariableData<Real>("PressureFromFluid"))
+      pressure_from_fluid_(particles_->registerStateVariableData<Real>("PressureFromFluid")),
+      neighbor_cache_(configuration)
 {
     particles_->addVariableToWrite<Vecd>("PressureForceFromFluid");
     particles_->addVariableToWrite<Real>("PressureFromFluid");
@@ -681,45 +684,66 @@ void PressureForceFromFluidforPD<RiemannSolverType>::interaction(size_t index_i,
 }
 
 template<class RiemannSolverType>
-void PressureForceFromFluidforPD<RiemannSolverType>::evaluateDevice(peridynamics::FluidTractionBatch &backend)
+void PressureForceFromFluidforPD<RiemannSolverType>::configureDevice(
+    peridynamics::FluidTractionBatch &backend, std::size_t count)
 {
-    using namespace peridynamics;
-    const size_t count=particles_->TotalRealParticles();
-    solid_rows_.resize(count);
-    row_offsets_.assign(count+1,0);
+    neighbor_cache_.invalidate();
+    row_offsets_.assign(count + 1, 0);
     traction_neighbors_.clear();
-    fluid_sites_.clear();
+    fluid_sources_.clear();
     fluid_indices_.resize(contact_particles_.size());
-    constexpr size_t missing=std::numeric_limits<size_t>::max();
-    for (size_t k=0;k<contact_particles_.size();++k)
-        fluid_indices_[k].assign(contact_particles_[k]->ParticlesBound(),missing);
+    constexpr auto missing = std::numeric_limits<std::size_t>::max();
+    for (std::size_t k = 0; k < contact_particles_.size(); ++k)
+        fluid_indices_[k].assign(contact_particles_[k]->ParticlesBound(), missing);
 
-    for (size_t i=0;i<count;++i)
+    for (std::size_t i = 0; i < count; ++i)
     {
-        solid_rows_[i]={packFluidVector(n_[i]),packFluidVector(vel_ave_[i]),
-                        packFluidVector(acc_ave_[i]),Vol_[i]};
-        for (size_t k=0;k<contact_configuration_.size();++k)
+        for (std::size_t k = 0; k < contact_configuration_.size(); ++k)
         {
-            const auto &neighbors=(*contact_configuration_[k])[i];
-            for (size_t n=0;n<neighbors.current_size_;++n)
+            const auto &neighbors = (*contact_configuration_[k])[i];
+            for (std::size_t n = 0; n < neighbors.current_size_; ++n)
             {
-                const size_t j=neighbors.j_[n];
-                auto &fluid_id=fluid_indices_[k].at(j);
-                if (fluid_id==missing)
+                const auto j = neighbors.j_[n];
+                auto &fluid_id = fluid_indices_[k].at(j);
+                if (fluid_id == missing)
                 {
-                    fluid_id=fluid_sites_.size();
-                    const auto [impedance,inverse_sound]=acoustic_coefficients_[k];
-                    fluid_sites_.push_back({packFluidVector(contact_vel_[k][j]),
-                        packFluidVector(contact_force_prior_[k][j]),contact_mass_[k][j],contact_rho_[k][j],
-                        contact_p_[k][j],contact_u_div_[k][j],contact_Vol_[k][j],impedance,inverse_sound});
+                    fluid_id = fluid_sources_.size();
+                    fluid_sources_.emplace_back(k, j);
                 }
-                traction_neighbors_.push_back({fluid_id,packFluidVector(neighbors.e_ij_[n]),
-                    neighbors.r_ij_[n],neighbors.W_ij_[n],neighbors.dW_ij_[n]});
+                traction_neighbors_.push_back({fluid_id, packFluidVector(neighbors.e_ij_[n]),
+                    neighbors.r_ij_[n], neighbors.W_ij_[n], neighbors.dW_ij_[n]});
             }
         }
-        row_offsets_[i+1]=traction_neighbors_.size();
+        row_offsets_[i + 1] = traction_neighbors_.size();
     }
-    backend.evaluate(solid_rows_,fluid_sites_,row_offsets_,traction_neighbors_,acceleration_factor_,traction_result_);
+
+    backend.configure(count, fluid_sources_.size(), row_offsets_, traction_neighbors_);
+    configured_backend_ = &backend;
+    neighbor_cache_.configured(count);
+}
+
+template<class RiemannSolverType>
+void PressureForceFromFluidforPD<RiemannSolverType>::evaluateDevice(peridynamics::FluidTractionBatch &backend)
+{
+    const auto count = particles_->TotalRealParticles();
+    if (neighbor_cache_.needsConfiguration(count) || configured_backend_ != &backend)
+        configureDevice(backend, count);
+
+    solid_rows_.resize(count);
+    for (std::size_t i = 0; i < count; ++i)
+        solid_rows_[i] = {packFluidVector(n_[i]), packFluidVector(vel_ave_[i]),
+                          packFluidVector(acc_ave_[i]), Vol_[i]};
+
+    fluid_sites_.resize(fluid_sources_.size());
+    for (std::size_t n = 0; n < fluid_sources_.size(); ++n)
+    {
+        const auto [k, j] = fluid_sources_[n];
+        const auto [impedance, inverse_sound] = acoustic_coefficients_[k];
+        fluid_sites_[n] = {packFluidVector(contact_vel_[k][j]), packFluidVector(contact_force_prior_[k][j]),
+                           contact_mass_[k][j], contact_rho_[k][j], contact_p_[k][j],
+                           contact_u_div_[k][j], contact_Vol_[k][j], impedance, inverse_sound};
+    }
+    backend.evaluate(solid_rows_, fluid_sites_, acceleration_factor_, traction_result_);
     if (traction_result_.size()!=count)
         throw std::logic_error("PD fluid traction backend returned an incomplete force field");
     for (size_t i=0;i<count;++i)

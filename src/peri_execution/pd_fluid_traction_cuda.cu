@@ -75,37 +75,51 @@ class CudaFluidTraction final : public FluidTractionBatch
         max_blocks_=static_cast<std::size_t>(maximum);
     }
 
+    void configure(std::size_t solid_sites, std::size_t fluid_sites,
+                   const std::vector<std::size_t> &offsets,
+                   const std::vector<FluidTractionNeighbor> &neighbors) override
+    {
+        configured_ = false;
+        if (offsets.size() != solid_sites + 1 || offsets.front() != 0 || offsets.back() != neighbors.size() ||
+            !std::is_sorted(offsets.begin(), offsets.end()) ||
+            std::any_of(neighbors.begin(), neighbors.end(), [=](const auto &n) { return n.fluid >= fluid_sites; }))
+            throw std::invalid_argument("Invalid PD fluid traction stencil");
+        if (solid_sites && (solid_sites - 1) / threads_ + 1 > max_blocks_)
+            throw std::length_error("PD fluid traction batch exceeds the device grid");
+
+        upload(offsets_, offsets, "fluid traction offsets");
+        upload(neighbors_, neighbors, "fluid traction neighbors");
+        solid_sites_ = solid_sites;
+        fluid_sites_ = fluid_sites;
+        configured_ = true;
+    }
+
     void evaluate(const std::vector<FluidTractionSolid> &solid,
                   const std::vector<FluidTractionFluid> &fluid,
-                  const std::vector<std::size_t> &offsets,
-                  const std::vector<FluidTractionNeighbor> &neighbors,
                   double acceleration_factor,
                   std::vector<FluidTractionResult> &result) override
     {
-        if (offsets.size()!=solid.size()+1 || offsets.front()!=0 || offsets.back()!=neighbors.size() ||
-            !std::is_sorted(offsets.begin(),offsets.end()) ||
-            std::any_of(neighbors.begin(),neighbors.end(),[&](const auto &n){return n.fluid>=fluid.size();}))
-            throw std::invalid_argument("Invalid PD fluid traction stencil");
+        if (!configured_ || solid.size() != solid_sites_ || fluid.size() != fluid_sites_)
+            throw std::logic_error("PD fluid traction sites do not match the configured stencil");
         result.resize(solid.size());
         if (solid.empty())
             return;
-        constexpr unsigned threads=128;
-        const auto blocks=(solid.size()-1)/threads+1;
-        if (blocks>max_blocks_)
-            throw std::length_error("PD fluid traction batch exceeds the device grid");
-        upload(solid_,solid,"fluid traction solid particles");
-        upload(fluid_,fluid,"fluid traction fluid particles");
-        upload(offsets_,offsets,"fluid traction offsets");
-        upload(neighbors_,neighbors,"fluid traction neighbors");
+
+        upload(solid_, solid, "fluid traction solid particles");
+        upload(fluid_, fluid, "fluid traction fluid particles");
         result_.reserve(solid.size());
-        evaluateTraction<<<static_cast<unsigned>(blocks),threads>>>(solid_.get(),fluid_.get(),offsets_.get(),
-            neighbors_.get(),solid.size(),acceleration_factor,result_.get());
-        check(cudaGetLastError(),"evaluate PD fluid traction");
-        download(result,result_,"PD fluid traction results");
+
+        const auto blocks = static_cast<unsigned>((solid.size() - 1) / threads_ + 1);
+        evaluateTraction<<<blocks, threads_>>>(solid_.get(), fluid_.get(), offsets_.get(),
+            neighbors_.get(), solid.size(), acceleration_factor, result_.get());
+        check(cudaGetLastError(), "evaluate PD fluid traction");
+        download(result, result_, "PD fluid traction results");
     }
 
   private:
-    std::size_t max_blocks_=0;
+    static constexpr unsigned threads_ = 128;
+    std::size_t max_blocks_ = 0, solid_sites_ = 0, fluid_sites_ = 0;
+    bool configured_ = false;
     DeviceBuffer<FluidTractionSolid> solid_;
     DeviceBuffer<FluidTractionFluid> fluid_;
     DeviceBuffer<std::size_t> offsets_;

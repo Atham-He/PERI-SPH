@@ -179,8 +179,9 @@ int main(int ac, char *av[]) try
     /** velocity divergence on the fluid side (after the 2nd half step).
      * Note: must be constructed before the acoustic damper,
      * which retrieves the registered VelocityDivergence variable. */
+    peridynamics::FluidNeighborConfiguration fluid_configuration;
     fluid_dynamics::PDFluidAcousticWorkspace acoustic(water_block_inner, water_plate_contact,
-                                                       execution.makeFluidAcoustic(), 1.0);
+                                                       execution.makeFluidAcoustic(), 1.0, &fluid_configuration);
     fluid_dynamics::PDFluidVelocityDivergence velocity_divergence(acoustic);
     fluid_dynamics::PDFluidAcousticDamping acoustic_damper(acoustic);
     acoustic_damper.setCoeffAcousticDamper(rho0_f, c_f, water_block.getSPHAdaptation().getKernel()->CutOffRadius());
@@ -188,7 +189,7 @@ int main(int ac, char *av[]) try
     //	Algorithms of FSI.
     //----------------------------------------------------------------------
     SimpleDynamics<NormalDirectionFromBodyShape> plate_normal_direction(plate);
-    solid_dynamics::PDFluidPressureCoupling<> fluid_pressure_force_on_plate(plate_water_contact,execution);
+    solid_dynamics::PDFluidPressureCoupling<> fluid_pressure_force_on_plate(plate_water_contact, execution, &fluid_configuration);
     std::cout<<"PD fluid pressure backend "<<(fluid_pressure_force_on_plate.onDevice()?"cuda_fp64":"cpu_fp64")<<std::endl;
     fluid_pressure_force_on_plate.setCoeffAcousticDamper(rho0_f, c_f, water_block.getSPHAdaptation().getKernel()->CutOffRadius());
     solid_dynamics::AverageVelocityAndAcceleration average_velocity_and_acceleration(plate);
@@ -260,7 +261,7 @@ int main(int ac, char *av[]) try
             plate_update_normal.exec();
 
             Real relaxation_time = 0.0;
-            for (const auto configuration = acoustic.reuseConfiguration(); relaxation_time < Dt;)
+            for (const auto configuration = fluid_configuration.reuse(); relaxation_time < Dt;)
             {
                 /** fluid relaxation and force computation. */
                 pressure_relaxation.exec(dt);

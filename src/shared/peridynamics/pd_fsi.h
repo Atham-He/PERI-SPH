@@ -82,6 +82,55 @@ class ContactRelationSelectKernel : public ContactRelationCrossResolution
 
 namespace peridynamics
 {
+class FluidNeighborConfiguration
+{
+  public:
+    // Keep this scope within one fixed neighbor geometry and particle order.
+    class Scope
+    {
+      public:
+        ~Scope();
+        Scope(const Scope &) = delete;
+        Scope &operator=(const Scope &) = delete;
+
+      private:
+        friend class FluidNeighborConfiguration;
+        explicit Scope(FluidNeighborConfiguration &configuration);
+        FluidNeighborConfiguration &configuration_;
+    };
+
+    [[nodiscard]] Scope reuse() { return Scope(*this); }
+    std::size_t generation() const { return depth_ ? generation_ : 0; }
+
+  private:
+    std::size_t depth_ = 0, generation_ = 0;
+};
+
+class FluidNeighborCache
+{
+  public:
+    explicit FluidNeighborCache(const FluidNeighborConfiguration *configuration) : configuration_(configuration) {}
+
+    bool needsConfiguration(std::size_t rows) const
+    {
+        const auto generation = activeGeneration();
+        return generation == 0 || generation != generation_ || rows_ != rows;
+    }
+
+    void invalidate() { generation_ = 0; }
+    void configured(std::size_t rows)
+    {
+        rows_ = rows;
+        generation_ = activeGeneration();
+    }
+
+  private:
+    std::size_t activeGeneration() const { return configuration_ ? configuration_->generation() : 0; }
+
+    const FluidNeighborConfiguration *configuration_;
+    std::size_t rows_ = 0, generation_ = 0;
+};
+
 class SPHViscosityWorkspace
 {
   public:
@@ -194,24 +243,10 @@ class PDFluidAcousticWorkspace
 {
   public:
     PDFluidAcousticWorkspace(BaseInnerRelation &inner, BaseContactRelation &wall,
-                             std::unique_ptr<peridynamics::FluidAcousticBatch> backend, Real acceleration_factor);
+                             std::unique_ptr<peridynamics::FluidAcousticBatch> backend, Real acceleration_factor,
+                             const peridynamics::FluidNeighborConfiguration *configuration = nullptr);
     bool onDevice() const { return static_cast<bool>(backend_); }
 
-    // Keep this scope within one fixed neighbor configuration. Begin a new
-    // scope after rebuilding or restoring the relations, or sorting particles.
-    class FixedConfiguration
-    {
-      public:
-        ~FixedConfiguration();
-        FixedConfiguration(const FixedConfiguration &) = delete;
-        FixedConfiguration &operator=(const FixedConfiguration &) = delete;
-
-      private:
-        friend class PDFluidAcousticWorkspace;
-        explicit FixedConfiguration(PDFluidAcousticWorkspace &workspace);
-        PDFluidAcousticWorkspace &workspace_;
-    };
-    [[nodiscard]] FixedConfiguration reuseConfiguration() { return FixedConfiguration(*this); }
 
   private:
     friend class PDFluidPressureHalf;
@@ -233,8 +268,7 @@ class PDFluidAcousticWorkspace
     std::vector<std::size_t> ghost_indices_, ghost_sources_;
     std::vector<std::vector<std::size_t>> wall_indices_;
     std::vector<std::pair<std::size_t, std::size_t>> wall_sources_;
-    std::size_t scope_depth_ = 0, configured_count_ = 0;
-    bool configuration_ready_ = false;
+    peridynamics::FluidNeighborCache neighbor_cache_;
     peridynamics::FluidAcousticStencil inner_stencil_, wall_stencil_;
     std::vector<peridynamics::FluidAcousticResult> results_;
 };
@@ -425,7 +459,8 @@ template <class RiemannSolverType = NoRiemannSolver>
 class PressureForceFromFluidforPD : public LocalDynamics, public DataDelegateContact
 {
   public:
-    explicit PressureForceFromFluidforPD(BaseContactRelation &contact_relation);
+    explicit PressureForceFromFluidforPD(
+        BaseContactRelation &contact_relation, const peridynamics::FluidNeighborConfiguration *configuration = nullptr);
     virtual ~PressureForceFromFluidforPD() {};
 
     void setCoeffAcousticDamper(Real rho0, Real c0, Real h)
@@ -457,6 +492,10 @@ class PressureForceFromFluidforPD : public LocalDynamics, public DataDelegateCon
     StdVec<RiemannSolverType> riemann_solvers_;
 
   private:
+    void configureDevice(peridynamics::FluidTractionBatch &backend, std::size_t count);
+    peridynamics::FluidNeighborCache neighbor_cache_;
+    peridynamics::FluidTractionBatch *configured_backend_ = nullptr;
+    StdVec<std::pair<std::size_t, std::size_t>> fluid_sources_;
     StdVec<peridynamics::FluidTractionSolid> solid_rows_;
     StdVec<peridynamics::FluidTractionFluid> fluid_sites_;
     StdVec<peridynamics::FluidTractionNeighbor> traction_neighbors_;
@@ -471,8 +510,9 @@ class PDFluidPressureCoupling : public InteractionDynamics<PressureForceFromFlui
 {
   public:
     using Base=InteractionDynamics<PressureForceFromFluidforPD<RiemannSolverType>>;
-    PDFluidPressureCoupling(BaseContactRelation &relation, const peridynamics::PeriExecution &execution)
-        : Base(relation), backend_(execution.makeFluidTraction()) {}
+    PDFluidPressureCoupling(BaseContactRelation &relation, const peridynamics::PeriExecution &execution,
+                            const peridynamics::FluidNeighborConfiguration *configuration = nullptr)
+        : Base(relation, configuration), backend_(execution.makeFluidTraction()) {}
 
     bool onDevice() const noexcept { return backend_!=nullptr; }
 

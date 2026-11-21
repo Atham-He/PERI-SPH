@@ -88,6 +88,25 @@ class PDLayeredFractureReference : public PDLayeredQuadraticReference
     const StdVec<CrackFacet>&crackFacets()const{return facets_;}
     bool visibleReference(const Vecd&a,const Vecd&b)const
     {for(const auto&f:facets_)if(intersects(f,a,b,false))return false;return true;}
+    // A trace exactly on a crack intersection has more than one material
+    // limit. Resolve incident faces from the interior of the owning patch;
+    // the specified inward normal distinguishes the two limits on its plane.
+    StdVec<Vecd> traceSector(const Vecd &point, const Vecd &patch_interior, const Vecd &inward) const
+    {
+        StdVec<Vecd> sides;
+        for (const auto &facet : facets_)
+        {
+            const Real tol=tolerance(facet,point,patch_interior);
+            if (std::abs(facet.normal.dot(point-facet.origin))>tol || !contains(facet,point,tol))
+                continue;
+            Real side=facet.normal.dot(patch_interior-facet.origin);
+            if (std::abs(side)<=tol)
+                side=facet.normal.dot(inward);
+            if (side!=0)
+                sides.push_back(side>0 ? facet.normal : Vecd(-facet.normal));
+        }
+        return sides;
+    }
     bool visible(size_t anchor,size_t node)const
     {
         requireInitialized();

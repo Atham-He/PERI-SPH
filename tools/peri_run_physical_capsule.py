@@ -121,6 +121,10 @@ def run(a):
             raise RuntimeError('Affine inner interface requires a matched affine contact preflight')
         identity['inner_shell_interpolation']='affine'
         identity['checkpoint_schema']=10
+    legacy_checkpoint_schema = identity['checkpoint_schema']
+    if a.fracture_contact_only:
+        identity['checkpoint_schema'] = 11
+        identity['legacy_contact_checkpoint_schema'] = legacy_checkpoint_schema
     # A PASSED file from an earlier executable/input cannot authorize a new run.
     for name,path in [('binary_sha256',binary),('config_sha256',cfg),('DPC_table_sha256',material),('core_cache_sha256',cache),('crack_bank_sha256',bank)]:
         if preflight_manifest.get(name)!=sha(path):raise RuntimeError('Coupled preflight identity mismatch: '+name)
@@ -148,7 +152,8 @@ def run(a):
             if latest['fingerprint']!=previous['fingerprint'] or Path(latest['file']).resolve()!=checkpoint:raise RuntimeError('Continuation checkpoint differs from its original manifest')
         allowed_versions={identity['checkpoint_schema']}
         if a.resume_accepted_step and not a.fracture_contact_only:allowed_versions.add(4)
-        if a.fracture_contact_only:allowed_versions.add(identity['checkpoint_schema']-2)
+        if a.fracture_contact_only:
+            allowed_versions.update({legacy_checkpoint_schema, legacy_checkpoint_schema - 2})
         if latest['version']!=previous['identity']['checkpoint_schema'] or latest['version'] not in allowed_versions:
             raise RuntimeError('Continuation checkpoint schema differs from its permitted source')
         for name in ['config_sha256','DPC_table_sha256','core_cache_sha256','crack_bank_sha256']:

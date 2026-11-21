@@ -23,7 +23,7 @@ foreach(PD_HEADER pd_quadratic_correspondence.h pd_principal_stress_onset.h
         pd_layered_geometry.h pd_layered_correspondence.h pd_layered_surface.h pd_coulomb_friction.h
         pd_layered_fracture_reference.h pd_broken_bond_energy.h pd_fracture_visible_surface.h
         pd_cohesive_crack_law.h pd_cohesive_interface_imex.h pd_cohesive_surface_evolution.h
-        pd_extrinsic_crack_growth.h pd_consistent_reconstruction.h pd_isoparametric_crack_surface.h pd_crack_face_contact.h pd_fracture_topology_checkpoint.h)
+        pd_extrinsic_crack_growth.h pd_fracture_patch_partition.h pd_consistent_reconstruction.h pd_isoparametric_crack_surface.h pd_crack_face_contact.h pd_fracture_topology_checkpoint.h)
     set(PD_HEADER_PATH ${PERI_SHARED}/peridynamics/${PD_HEADER})
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${PD_HEADER_PATH})
     file(SHA256 ${PD_HEADER_PATH} PD_HEADER_HASH)

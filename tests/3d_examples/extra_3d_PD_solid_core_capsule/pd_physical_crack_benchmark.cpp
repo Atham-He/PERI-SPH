@@ -189,7 +189,51 @@ std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesy
         maximum_cohesive_force=std::max(maximum_cohesive_force,force.norm());
     set(-2e-9,0,Matd::Identity());energy();
     Real closed_force=growth.contact_network->normal_force_sum,expected_closed_force=K*area*2e-9;
-    bool pass=live_crossing==0&&ref.physical_broken_bonds==broken&&std::abs(open_gap-20e-6)<1e-9*dp&&
+    const size_t original_broken=ref.physical_broken_bonds;
+    const Real closed_energy=growth.contact_energy;
+    const auto before_split=ref.crackFacets().size();
+    for (auto &patch : growth.patches)
+    {
+        patch.minus->captureTransferValues();
+        patch.plus->captureTransferValues();
+    }
+    ref.setTransferState(StdVec<Vecd>(s.x,s.x+count),StdVec<Matd>(bulk.F,bulk.F+count),StdVec<Vecd>(s.v,s.v+count));
+    const auto split_bonds=ref.cutPlane(Vecd::Zero(),Vecd::UnitY(),std::numeric_limits<Real>::infinity(),false);
+    ref.updateAfterFailure();
+    bulk.rebuild();
+    growth.splitExistingContactPatches(StdVec<Growth::Reference::CrackFacet>(
+        ref.crackFacets().begin()+before_split,ref.crackFacets().end()));
+    growth.rebuildTraces();
+    energy();
+    const Real split_force_error=std::abs(growth.contact_network->normal_force_sum/closed_force-1);
+    const Real split_energy_error=std::abs(growth.contact_energy/closed_energy-1);
+    const Real split_moment_balance=growth.contact_network->torque_residual;
+    size_t crossing_support=0;
+    StdVec<FractureIntegrationPatch> split_layout;
+    StdVec<size_t> order;
+    StdVec<StdVec<Vecd>> minus_values,plus_values;
+    for (const auto &patch : growth.patches)
+    {
+        if (!patch.integration)
+            throw std::runtime_error("Perpendicular crack missed an intersected integration patch");
+        const Real sign=Growth::patchInterior(patch.integration->vertices)[1]>0 ? 1 : -1;
+        for (const auto *side : {patch.minus.get(),patch.plus.get()})
+            for (size_t q=0;q<4;++q)
+                for (size_t node : side->rows[q].index)
+                    if (sign*s.x0[node][1]<0)
+                        ++crossing_support;
+        split_layout.push_back(*patch.integration);
+        order.push_back(patch.candidate);
+        minus_values.push_back(patch.minus->transferValues());
+        plus_values.push_back(patch.plus->transferValues());
+    }
+    growth.restorePatches(order,std::vector<Growth::History>(growth.integrationPointCount()),
+                          minus_values,plus_values,{},{},split_layout);
+    energy();
+    const Real restored_energy_error=std::abs(growth.contact_energy/closed_energy-1);
+    const bool split_pass=split_bonds>0&&growth.patches.size()==2&&crossing_support==0&&
+        split_force_error<1e-8&&split_energy_error<1e-8&&restored_energy_error<1e-8&&split_moment_balance<1e-8;
+    bool pass=split_pass&&live_crossing==0&&original_broken==broken&&std::abs(open_gap-20e-6)<1e-9*dp&&
         open_contact==0&&maximum_cohesive_force==0&&growth.stored==0&&growth.dissipated==0&&
         std::abs(closed_force/expected_closed_force-1)<1e-8&&std::isfinite(growth.contact_dt);
     const auto &network = *growth.contact_network;
@@ -199,7 +243,14 @@ std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesy
            (!device_trace || network.device_trace_pullback);
     std::ofstream report(out/"acceptance.json");
     report<<std::setprecision(17)<<"{\"overall_status\":\""<<(pass?"PASSED":"FAILED")
-        <<"\",\"surface_law\":\"contact_only\",\"execution_backend\":" << std::quoted(execution.backendName()) << ",\"broken_bond_pairs\":"<<ref.physical_broken_bonds
+        <<"\",\"surface_law\":\"contact_only\",\"execution_backend\":"<<std::quoted(execution.backendName())
+        <<",\"broken_bond_pairs\":"<<original_broken
+        <<",\"split_integration_patches\":"<<growth.patches.size()
+        <<",\"split_crossing_support\":"<<crossing_support
+        <<",\"split_force_relative_error\":"<<split_force_error
+        <<",\"split_contact_energy_relative_error\":"<<split_energy_error
+        <<",\"split_restored_energy_relative_error\":"<<restored_energy_error
+        <<",\"split_moment_balance\":"<<split_moment_balance
         <<",\"live_crossing_bonds\":"<<live_crossing<<",\"maximum_normal_opening_m\":"<<open_gap
         <<",\"open_contact_energy_J\":"<<open_contact<<",\"maximum_cohesive_force_N\":"<<maximum_cohesive_force
         <<",\"closure_normal_force_N\":"<<closed_force<<",\"expected_closure_normal_force_N\":"<<expected_closed_force

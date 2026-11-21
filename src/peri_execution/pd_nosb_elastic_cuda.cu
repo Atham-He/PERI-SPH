@@ -1,6 +1,6 @@
 #include "pd_nosb_elastic_batch.h"
-#include "pd_nosb_j2_batch.h"
-#include "pd_plastic_multiplier.h"
+#include "pd_nosb_plastic_batch.h"
+#include "pd_drucker_prager_return.h"
 #include "pd_hughes_winget.h"
 #include "pd_cuda_buffer.cuh"
 
@@ -101,7 +101,7 @@ __global__ void updateNosbPDElasticity(const NosbPDElasticSite *sites, std::size
     results[i] = result;
 }
 
-__device__ double j2Hardening(NosbPDJ2Parameters parameters, double alpha)
+__device__ double j2Hardening(NosbPDPlasticParameters parameters, double alpha)
 {
     const double argument = -parameters.hardening_rate * alpha;
     const double saturation = parameters.legacy_hardening ? 1.0 - exp(argument) : -expm1(argument);
@@ -110,7 +110,7 @@ __device__ double j2Hardening(NosbPDJ2Parameters parameters, double alpha)
 
 struct J2Residual
 {
-    NosbPDJ2Parameters parameters;
+    NosbPDPlasticParameters parameters;
     double norm, resistance, alpha, root_two_thirds;
 
     __device__ double operator()(double gamma) const
@@ -121,24 +121,24 @@ struct J2Residual
 };
 
 template <int dimensions>
-__global__ void updateNosbPDJ2(const NosbPDJ2Site *sites, std::size_t count, NosbPDJ2Parameters parameters,
-                               double dt, NosbPDJ2Result *results)
+__global__ void updateNosbPDPlastic(const NosbPDPlasticSite *sites, std::size_t count, NosbPDPlasticParameters parameters,
+                               double dt, NosbPDPlasticResult *results)
 {
     const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count)
         return;
 
     const auto &site = sites[i];
-    NosbPDJ2Result result{};
+    NosbPDPlasticResult result{};
     if (!site.active)
     {
-        result.status = NosbPDJ2Status::Inactive;
+        result.status = NosbPDPlasticStatus::Inactive;
         results[i] = result;
         return;
     }
-    if (!isfinite(site.alpha) || site.alpha < 0)
+    if (!parameters.drucker_prager && (!isfinite(site.alpha) || site.alpha < 0))
     {
-        result.status = NosbPDJ2Status::InvalidHistory;
+        result.status = NosbPDPlasticStatus::InvalidHistory;
         results[i] = result;
         return;
     }
@@ -154,45 +154,64 @@ __global__ void updateNosbPDJ2(const NosbPDJ2Site *sites, std::size_t count, Nos
     Matrix stress = rotation * load<dimensions>(site.stress) * rotation.transpose() + stress_increment;
     const Matrix rotated_plastic = rotation * load<dimensions>(site.plastic_strain) * rotation.transpose();
     Matrix plastic = rotated_plastic;
-    Matrix kinematic = rotation * load<dimensions>(site.kinematic) * rotation.transpose();
-    const Matrix backstress = parameters.kinematic * kinematic;
-    const Matrix relative = stress - backstress;
-    const Matrix deviator = relative - relative.trace() * (1.0 / dimensions) * Matrix::Identity();
-    const double norm = deviator.norm();
-    const double root_two_thirds = sqrt(2.0 / 3.0);
-    const double yield_value = norm - root_two_thirds * (j2Hardening(parameters, site.alpha) + parameters.yield);
-
+    Matrix kinematic = load<dimensions>(site.kinematic);
     double alpha = site.alpha;
-    if (yield_value > parameters.yield_tolerance)
+    if (parameters.drucker_prager)
     {
-        if (parameters.viscosity > 0 && (!isfinite(dt) || dt <= 0))
-        {
-            result.status = NosbPDJ2Status::InvalidViscousStep;
-            results[i] = result;
-            return;
-        }
-        const double viscosity_resistance = parameters.viscosity > 0 ? parameters.viscosity / (3.0 * dt) : 0.0;
-        const double flow_resistance = parameters.shear + parameters.hardening_linear / 3.0 + parameters.kinematic / 2.0;
-        const double resistance = 2.0 * (flow_resistance + viscosity_resistance) - 2.0 * parameters.hardening_linear / 3.0;
-        const J2Residual residual{parameters, norm, resistance, alpha, root_two_thirds};
-        double gamma = 0;
-        const double scale = norm > parameters.yield ? norm : parameters.yield;
-        const auto status = bracketPlasticMultiplier(residual, 0.0, yield_value / resistance, scale, gamma);
+        const DruckerPragerHardening<double> hardening{
+            parameters.hardening_linear, parameters.hardening_saturation, parameters.hardening_rate};
+        const auto status = returnDruckerPrager(stress, plastic, alpha, parameters.shear, parameters.bulk,
+                                               parameters.pressure_sensitivity, parameters.yield,
+                                               hardening, parameters.yield_tolerance);
         if (status != PlasticMultiplierStatus::Accepted)
         {
-            result.status = NosbPDJ2Status::ReturnFailed;
+            result.status = NosbPDPlasticStatus::ReturnFailed;
             result.return_status = status;
             results[i] = result;
             return;
         }
-        const Matrix direction = deviator / norm;
-        stress -= 2.0 * parameters.shear * gamma * direction;
-        plastic += gamma * direction;
-        alpha += root_two_thirds * gamma;
-        kinematic += gamma * direction;
+    }
+    else
+    {
+        kinematic = rotation * kinematic * rotation.transpose();
+        const Matrix backstress = parameters.kinematic * kinematic;
+        const Matrix relative = stress - backstress;
+        const Matrix deviator = relative - relative.trace() * (1.0 / dimensions) * Matrix::Identity();
+        const double norm = deviator.norm();
+        const double root_two_thirds = sqrt(2.0 / 3.0);
+        const double yield_value = norm - root_two_thirds * (j2Hardening(parameters, site.alpha) + parameters.yield);
+
+        if (yield_value > parameters.yield_tolerance)
+        {
+            if (parameters.viscosity > 0 && (!isfinite(dt) || dt <= 0))
+            {
+                result.status = NosbPDPlasticStatus::InvalidViscousStep;
+                results[i] = result;
+                return;
+            }
+            const double viscosity_resistance = parameters.viscosity > 0 ? parameters.viscosity / (3.0 * dt) : 0.0;
+            const double flow_resistance = parameters.shear + parameters.hardening_linear / 3.0 + parameters.kinematic / 2.0;
+            const double resistance = 2.0 * (flow_resistance + viscosity_resistance) - 2.0 * parameters.hardening_linear / 3.0;
+            const J2Residual residual{parameters, norm, resistance, alpha, root_two_thirds};
+            double gamma = 0;
+            const double scale = norm > parameters.yield ? norm : parameters.yield;
+            const auto status = bracketPlasticMultiplier(residual, 0.0, yield_value / resistance, scale, gamma);
+            if (status != PlasticMultiplierStatus::Accepted)
+            {
+                result.status = NosbPDPlasticStatus::ReturnFailed;
+                result.return_status = status;
+                results[i] = result;
+                return;
+            }
+            const Matrix direction = deviator / norm;
+            stress -= 2.0 * parameters.shear * gamma * direction;
+            plastic += gamma * direction;
+            alpha += root_two_thirds * gamma;
+            kinematic += gamma * direction;
+        }
     }
 
-    result.status = NosbPDJ2Status::Accepted;
+    result.status = NosbPDPlasticStatus::Accepted;
     result.stress = pack(stress);
     result.plastic_strain = pack(plastic);
     result.rotated_plastic_strain = pack(rotated_plastic);
@@ -201,10 +220,10 @@ __global__ void updateNosbPDJ2(const NosbPDJ2Site *sites, std::size_t count, Nos
     results[i] = result;
 }
 
-class CudaNosbPDJ2 final : public NosbPDJ2Batch
+class CudaNosbPDPlastic final : public NosbPDPlasticBatch
 {
   public:
-    CudaNosbPDJ2()
+    CudaNosbPDPlastic()
     {
         int device = 0, limit = 0;
         check(cudaGetDevice(&device), "select NOSB-PD J2 device");
@@ -212,11 +231,11 @@ class CudaNosbPDJ2 final : public NosbPDJ2Batch
         max_blocks_ = static_cast<std::size_t>(limit);
     }
 
-    void update(const std::vector<NosbPDJ2Site> &sites, NosbPDJ2Parameters parameters,
-                double dt, int dimensions, std::vector<NosbPDJ2Result> &results) override
+    void update(const std::vector<NosbPDPlasticSite> &sites, NosbPDPlasticParameters parameters,
+                double dt, int dimensions, std::vector<NosbPDPlasticResult> &results) override
     {
         if (dimensions != 2 && dimensions != 3)
-            throw std::invalid_argument("NOSB-PD J2 requires two or three dimensions");
+            throw std::invalid_argument("NOSB-PD plastic requires two or three dimensions");
         const auto count = sites.size();
         results.resize(count);
         if (count == 0)
@@ -224,22 +243,22 @@ class CudaNosbPDJ2 final : public NosbPDJ2Batch
         constexpr unsigned threads = 128;
         const auto blocks = (count - 1) / threads + 1;
         if (blocks > max_blocks_)
-            throw std::length_error("NOSB-PD J2 update exceeds the device grid");
+            throw std::length_error("NOSB-PD plastic update exceeds the device grid");
 
-        upload(sites_, sites, "NOSB-PD J2 sites");
+        upload(sites_, sites, "NOSB-PD plastic sites");
         results_.reserve(count);
         if (dimensions == 2)
-            updateNosbPDJ2<2><<<static_cast<unsigned>(blocks), threads>>>(sites_.get(), count, parameters, dt, results_.get());
+            updateNosbPDPlastic<2><<<static_cast<unsigned>(blocks), threads>>>(sites_.get(), count, parameters, dt, results_.get());
         else
-            updateNosbPDJ2<3><<<static_cast<unsigned>(blocks), threads>>>(sites_.get(), count, parameters, dt, results_.get());
+            updateNosbPDPlastic<3><<<static_cast<unsigned>(blocks), threads>>>(sites_.get(), count, parameters, dt, results_.get());
         check(cudaGetLastError(), "update NOSB-PD J2");
-        download(results, results_, "NOSB-PD J2 results");
+        download(results, results_, "NOSB-PD plastic results");
     }
 
   private:
     std::size_t max_blocks_ = 0;
-    DeviceBuffer<NosbPDJ2Site> sites_;
-    DeviceBuffer<NosbPDJ2Result> results_;
+    DeviceBuffer<NosbPDPlasticSite> sites_;
+    DeviceBuffer<NosbPDPlasticResult> results_;
 };
 
 class CudaNosbPDElastic final : public NosbPDElasticBatch
@@ -288,9 +307,9 @@ std::unique_ptr<NosbPDElasticBatch> makeCudaNosbPDElastic()
 {
     return std::make_unique<CudaNosbPDElastic>();
 }
-std::unique_ptr<NosbPDJ2Batch> makeCudaNosbPDJ2()
+std::unique_ptr<NosbPDPlasticBatch> makeCudaNosbPDPlastic()
 {
-    return std::make_unique<CudaNosbPDJ2>();
+    return std::make_unique<CudaNosbPDPlastic>();
 }
 
 }

@@ -16,6 +16,7 @@
 #include "base_particles.hpp"
 #include "pd_numerics.h"
 #include "pd_plastic_multiplier.h"
+#include "pd_drucker_prager_return.h"
 
 namespace SPH
 {
@@ -320,50 +321,12 @@ Matd DruckerPragerPlasticityforPD::PlasticConstitutiveRelation(const Matd &G, co
     Matd trial_epsilon_p = Q * epsilon_p * Q.transpose();
     /** predict the internal state variables, hardening in the "k" level */
     Real trial_isoHardening_ISV1 = iso_hardening_ISV1_[index_i];
-    Real trial_isoHardening_q = IsoHardeningFunc(trial_isoHardening_ISV1);
-    /** intermediate variables */
-    Real norm1 = trial_sigma.trace();
-    Matd dev_sigma = trial_sigma - norm1 * OneOverDimensions * Matd::Identity();
-    Real dev_sigma_norm = dev_sigma.norm();
-
-    /** yield function */
-    Real trial_function = alpha_phi_ * norm1 + dev_sigma_norm / sqrt2_ -
-                          (trial_isoHardening_q + k_phi_);
-
-    if (trial_function > TinyReal)
-    {
-        Real q_trial = dev_sigma_norm / sqrt2_;
-        Real gamma_apex = q_trial / G0_;
-        auto smooth_residual = [&](Real gamma)
-        {
-            return alpha_phi_ * norm1 + q_trial - (9.0 * K0_ * alpha_phi_ * alpha_phi_ + G0_) * gamma -
-                   k_phi_ - IsoHardeningFunc(trial_isoHardening_ISV1 + gamma);
-        };
-        Real relax_increment;
-        if (smooth_residual(gamma_apex) <= 0.0)
-        {
-            relax_increment = solvePlasticMultiplier(smooth_residual, 0.0, gamma_apex,
-                                                      std::max(std::abs(alpha_phi_ * norm1) + q_trial, k_phi_));
-            Matd eta = dev_sigma / dev_sigma_norm;
-            trial_sigma -= relax_increment * (3.0 * K0_ * alpha_phi_ * Matd::Identity() + sqrt2_ * G0_ * eta);
-            trial_epsilon_p += relax_increment * (alpha_phi_ * Matd::Identity() + eta / sqrt2_);
-        }
-        else
-        {
-            // Cone apex: deviatoric stress is exhausted. Continue on the hydrostatic branch.
-            auto apex_residual = [&](Real gamma)
-            {
-                return alpha_phi_ * norm1 - 9.0 * K0_ * alpha_phi_ * alpha_phi_ * gamma -
-                       k_phi_ - IsoHardeningFunc(trial_isoHardening_ISV1 + gamma);
-            };
-            Real upper = gamma_apex + trial_function / (9.0 * K0_ * alpha_phi_ * alpha_phi_);
-            relax_increment = solvePlasticMultiplier(apex_residual, gamma_apex, upper,
-                                                      std::max(std::abs(alpha_phi_ * norm1), k_phi_));
-            trial_sigma = (norm1 * OneOverDimensions - 3.0 * K0_ * alpha_phi_ * relax_increment) * Matd::Identity();
-            trial_epsilon_p += dev_sigma / (2.0 * G0_) + alpha_phi_ * relax_increment * Matd::Identity();
-        }
-        trial_isoHardening_ISV1 += relax_increment;
-    }
+    const peridynamics::DruckerPragerHardening<Real> hardening{
+        isotropic_hardening_modulus_, sigmaY_infinite_ - sigmaY_0_, index_kesi_};
+    const auto status = peridynamics::returnDruckerPrager(trial_sigma, trial_epsilon_p, trial_isoHardening_ISV1,
+                                                        G0_, K0_, alpha_phi_, k_phi_, hardening, TinyReal);
+    if (status != peridynamics::PlasticMultiplierStatus::Accepted)
+        peridynamics::throwPlasticMultiplierFailure(status);
 
     epsilon_p = trial_epsilon_p;
     iso_hardening_ISV1_[index_i] = trial_isoHardening_ISV1;

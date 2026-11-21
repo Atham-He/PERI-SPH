@@ -165,6 +165,10 @@ class DruckerPragerPlasticityforPD : public PlasticSolidforPD
     virtual ~DruckerPragerPlasticityforPD() {};
 
     virtual Real YieldFunc(const Matd &stress, const Real &iso_q = 0.0, const Matd &kin_q = Matd::Zero()) override;
+    Real PressureSensitivity() const { return alpha_phi_; }
+    Real HardeningSaturation() const { return sigmaY_infinite_ - sigmaY_0_; }
+    Real HardeningRate() const { return index_kesi_; }
+
     inline Real IsoHardeningFunc(const Real &ISV1)
     {
         Real exponent = exp(-index_kesi_ * ISV1);

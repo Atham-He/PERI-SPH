@@ -9,7 +9,7 @@
 #include "pd_fluid_viscosity_batch.h"
 #include "pd_nosb_bond_batch.h"
 #include "pd_nosb_elastic_batch.h"
-#include "pd_nosb_j2_batch.h"
+#include "pd_nosb_plastic_batch.h"
 #include "pd_solid_time_step.h"
 #include "pd_solid_cfl_batch.h"
 #include "pd_spatial_derivatives.h"
@@ -53,7 +53,7 @@ class PeriExecution
     std::unique_ptr<PositionVerletBatch> makePositionVerlet() const;
     std::unique_ptr<NosbPDBondBatch> makeNosbPDBonds() const;
     std::unique_ptr<NosbPDElasticBatch> makeNosbPDElastic() const;
-    std::unique_ptr<NosbPDJ2Batch> makeNosbPDJ2() const;
+    std::unique_ptr<NosbPDPlasticBatch> makeNosbPDPlastic() const;
     std::unique_ptr<FluidTractionBatch> makeFluidTraction() const;
     std::unique_ptr<FluidAcousticBatch> makeFluidAcoustic() const;
     std::unique_ptr<FluidViscosityBatch> makeFluidViscosity() const;

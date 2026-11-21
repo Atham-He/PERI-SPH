@@ -31,7 +31,7 @@
 
 #include "pd_nosb_bond_batch.h"
 #include "pd_nosb_elastic_batch.h"
-#include "pd_nosb_j2_batch.h"
+#include "pd_nosb_plastic_batch.h"
 #include "pd_solid_time_step.h"
 #include "dynamics_algorithms.h"
 
@@ -231,21 +231,21 @@ class NosbPDElasticWithExecution : public NosbPDDeformationWithExecution<NosbPDS
     std::vector<peridynamics::NosbPDElasticResult> results_;
 };
 
-class NosbPDJ2WithExecution : public NosbPDDeformationWithExecution<NosbPDSecondStepPlastic>
+class NosbPDPlasticWithExecution : public NosbPDDeformationWithExecution<NosbPDSecondStepPlastic>
 {
   public:
-    NosbPDJ2WithExecution(BaseInnerRelation &relation, NosbPDBondWorkspace *workspace,
-                          std::unique_ptr<peridynamics::NosbPDJ2Batch> backend);
+    NosbPDPlasticWithExecution(BaseInnerRelation &relation, NosbPDBondWorkspace *workspace,
+                          std::unique_ptr<peridynamics::NosbPDPlasticBatch> backend);
     void exec(Real dt = 0.0) override;
 
   private:
-    std::unique_ptr<peridynamics::NosbPDJ2Batch> backend_;
-    peridynamics::NosbPDJ2Parameters parameters_{};
+    std::unique_ptr<peridynamics::NosbPDPlasticBatch> backend_;
+    peridynamics::NosbPDPlasticParameters parameters_{};
     Real *alpha_ = nullptr;
     Matd *kinematic_ = nullptr;
     std::vector<Real> determinants_;
-    std::vector<peridynamics::NosbPDJ2Site> sites_;
-    std::vector<peridynamics::NosbPDJ2Result> results_;
+    std::vector<peridynamics::NosbPDPlasticSite> sites_;
+    std::vector<peridynamics::NosbPDPlasticResult> results_;
 };
 
 /**

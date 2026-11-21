@@ -638,30 +638,49 @@ void NosbPDSecondStepPlastic::update(size_t index_i, Real dt)
     publishPlasticState(index_i, detF, rotated_plastic);
 }
 
-NosbPDJ2WithExecution::NosbPDJ2WithExecution(
-    BaseInnerRelation &relation, NosbPDBondWorkspace *workspace, std::unique_ptr<peridynamics::NosbPDJ2Batch> backend)
+NosbPDPlasticWithExecution::NosbPDPlasticWithExecution(
+    BaseInnerRelation &relation, NosbPDBondWorkspace *workspace, std::unique_ptr<peridynamics::NosbPDPlasticBatch> backend)
     : NosbPDDeformationWithExecution<NosbPDSecondStepPlastic>(relation, workspace), backend_(std::move(backend))
 {
     const auto &actual = typeid(plastic_solid_);
     const bool viscous = actual == typeid(ViscoPlasticSolidforPD);
-    if (!backend_ || (!viscous && actual != typeid(J2PlasticityforPD)))
+    const bool drucker_prager = actual == typeid(DruckerPragerPlasticityforPD);
+    if (!backend_ || (!viscous && !drucker_prager && actual != typeid(J2PlasticityforPD)))
     {
         backend_.reset();
         return;
     }
 
-    auto &material = static_cast<J2PlasticityforPD &>(plastic_solid_);
-    const auto &hardening = material.HardeningParameters();
-    parameters_ = {material.FirstLameParameter(), material.ShearModulus(), material.YieldStress(),
-                   hardening.linearModulus(), hardening.saturationIncrement(), hardening.saturationRate(),
-                   material.KinematicHardeningModulus(),
-                   viscous ? static_cast<ViscoPlasticSolidforPD &>(material).Viscosity() : Real(0),
-                   TinyReal, hardening.law() == PDIsotropicHardening::Law::Legacy};
+    parameters_.lambda = plastic_solid_.FirstLameParameter();
+    parameters_.shear = plastic_solid_.ShearModulus();
+    parameters_.yield = plastic_solid_.YieldStress();
+    parameters_.yield_tolerance = TinyReal;
+    if (drucker_prager)
+    {
+        auto &material = static_cast<DruckerPragerPlasticityforPD &>(plastic_solid_);
+        parameters_.hardening_linear = material.IsotropicHardeningModulus();
+        parameters_.hardening_saturation = material.HardeningSaturation();
+        parameters_.hardening_rate = material.HardeningRate();
+        parameters_.drucker_prager = true;
+        parameters_.pressure_sensitivity = material.PressureSensitivity();
+        parameters_.bulk = material.BulkModulus();
+    }
+    else
+    {
+        auto &material = static_cast<J2PlasticityforPD &>(plastic_solid_);
+        const auto &hardening = material.HardeningParameters();
+        parameters_.hardening_linear = hardening.linearModulus();
+        parameters_.hardening_saturation = hardening.saturationIncrement();
+        parameters_.hardening_rate = hardening.saturationRate();
+        parameters_.kinematic = material.KinematicHardeningModulus();
+        parameters_.viscosity = viscous ? static_cast<ViscoPlasticSolidforPD &>(material).Viscosity() : Real(0);
+        parameters_.legacy_hardening = hardening.law() == PDIsotropicHardening::Law::Legacy;
+    }
     alpha_ = particles_->getVariableDataByName<Real>("IsotropicHardeningParam");
     kinematic_ = particles_->getVariableDataByName<Matd>("KinematicHardeningParam");
 }
 
-void NosbPDJ2WithExecution::exec(Real dt)
+void NosbPDPlasticWithExecution::exec(Real dt)
 {
     using namespace peridynamics;
     if (!backend_)
@@ -692,16 +711,16 @@ void NosbPDJ2WithExecution::exec(Real dt)
     for (std::size_t i = 0; i < count; ++i)
     {
         const auto &result = results_[i];
-        if (result.status == NosbPDJ2Status::Inactive)
+        if (result.status == NosbPDPlasticStatus::Inactive)
         {
             stress_[i].setZero();
             continue;
         }
-        if (result.status == NosbPDJ2Status::InvalidHistory)
+        if (result.status == NosbPDPlasticStatus::InvalidHistory)
             throw std::invalid_argument("PD hardening: nonnegative finite equivalent plastic strain required");
-        if (result.status == NosbPDJ2Status::InvalidViscousStep)
+        if (result.status == NosbPDPlasticStatus::InvalidViscousStep)
             throw std::invalid_argument("ViscoPlasticSolidforPD requires a positive time increment");
-        if (result.status == NosbPDJ2Status::ReturnFailed)
+        if (result.status == NosbPDPlasticStatus::ReturnFailed)
             throwPlasticMultiplierFailure(result.return_status);
         stress_[i] = unpackNosbPDTensor(result.stress);
         plastic_strain_[i] = unpackNosbPDTensor(result.plastic_strain);

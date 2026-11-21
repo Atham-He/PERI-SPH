@@ -121,11 +121,11 @@ std::unique_ptr<NosbPDElasticBatch> PeriExecution::makeNosbPDElastic() const
     return nullptr;
 }
 
-std::unique_ptr<NosbPDJ2Batch> PeriExecution::makeNosbPDJ2() const
+std::unique_ptr<NosbPDPlasticBatch> PeriExecution::makeNosbPDPlastic() const
 {
 #if defined(PERI_SPH_HAS_CUDA)
     if (mode_ == PeriExecutionMode::GPU)
-        return makeCudaNosbPDJ2();
+        return makeCudaNosbPDPlastic();
 #endif
     return nullptr;
 }

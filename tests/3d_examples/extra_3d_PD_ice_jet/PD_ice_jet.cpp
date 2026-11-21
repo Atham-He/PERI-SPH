@@ -206,8 +206,10 @@ int main(int ac, char *av[]) try
     std::cout << "NOSB-PD position Verlet backend " << (pd_time_integration ? "cuda_fp64" : "cpu_fp64") << std::endl;
     InteractionDynamics<solid_dynamics::BondBreakBySigma1andSigma3> check_bond_live(plate_inner_relation, max_tension_stress, max_shear_stress);
     solid_dynamics::NosbPDBondWorkspace pd_bonds(plate_inner_relation, execution.makeNosbPDBonds());
-    solid_dynamics::NosbPDDeformationWithExecution<solid_dynamics::NosbPDSecondStepPlastic>
-        nosbpd_second_step_plastic(plate_inner_relation, &pd_bonds);
+    auto pd_plastic = execution.makeNosbPDPlastic();
+    std::cout << "NOSB-PD drucker_prager stress backend " << (pd_plastic ? "cuda_fp64" : "cpu_fp64") << std::endl;
+    solid_dynamics::NosbPDPlasticWithExecution nosbpd_second_step_plastic(
+        plate_inner_relation, &pd_bonds, std::move(pd_plastic));
     std::cout << "NOSB-PD internal force backend " << (pd_bonds.onDevice() ? "cuda_fp64" : "cpu_fp64") << std::endl;
     solid_dynamics::NosbPDStabilizationWithExecution hourglass_control(pd_bonds);
     solid_dynamics::NosbPDDampingWithExecution numerical_damping(pd_bonds);

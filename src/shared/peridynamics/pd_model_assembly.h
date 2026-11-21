@@ -39,7 +39,7 @@ struct PDConstitutiveDynamics
 inline PDConstitutiveDynamics makePDConstitutiveDynamics(
     BaseInnerRelation &relation, solid_dynamics::NosbPDBondWorkspace *bond_workspace = nullptr,
     std::unique_ptr<NosbPDElasticBatch> elastic_backend = nullptr,
-    std::unique_ptr<NosbPDJ2Batch> j2_backend = nullptr)
+    std::unique_ptr<NosbPDPlasticBatch> plastic_backend = nullptr)
 {
     auto &material = relation.getSPHBody().getMatterMaterial();
     PDConstitutiveDynamics dynamics;
@@ -50,8 +50,8 @@ inline PDConstitutiveDynamics makePDConstitutiveDynamics(
         dynamics.commit = makeUnique<InteractionDynamics<Update>>(relation, Update::Stage::AcceptedHistory);
     }
     else if (dynamic_cast<PlasticSolidforPD *>(&material))
-        dynamics.force = makeUnique<solid_dynamics::NosbPDJ2WithExecution>(
-            relation, bond_workspace, std::move(j2_backend));
+        dynamics.force = makeUnique<solid_dynamics::NosbPDPlasticWithExecution>(
+            relation, bond_workspace, std::move(plastic_backend));
     else
     {
         if (!dynamic_cast<HughesWingetSolid *>(&material))

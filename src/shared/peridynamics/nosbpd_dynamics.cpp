@@ -76,6 +76,34 @@ void NosbPDShapeMatrix::update(size_t index_i, Real dt)
     shape_K_1_[index_i] = shape_K_[index_i].inverse();
 }
 //=================================================================================================//
+namespace
+{
+peridynamics::ParticleVector3 packPositionVerlet(const Vecd &value)
+{
+    peridynamics::ParticleVector3 packed{};
+    for (int axis = 0; axis < Dimensions; ++axis)
+        packed.component[axis] = value[axis];
+    return packed;
+}
+
+Vecd unpackPositionVerlet(const peridynamics::ParticleVector3 &value)
+{
+    Vecd result;
+    for (int axis = 0; axis < Dimensions; ++axis)
+        result[axis] = value.component[axis];
+    return result;
+}
+
+void checkPositionVerletVelocity(SPHBody &body, BaseParticles &particles, std::size_t i, const Vecd &velocity)
+{
+    if (!velocity.allFinite())
+    {
+        particles.getVariableDataByName<int>("NumericalFailureReason")[i] = 1;
+        peridynamics::numericalFailure(body.Name(), i, "non-finite Velocity");
+    }
+}
+}
+
 NosbPDFirstStep::NosbPDFirstStep(SPHBody &sph_body)
     : LocalDynamics(sph_body),
       hw_solid_(DynamicCast<HughesWingetSolid>(this, sph_body.getMatterMaterial())),
@@ -91,20 +119,32 @@ NosbPDFirstStep::NosbPDFirstStep(SPHBody &sph_body)
     rho0_ = hw_solid_.ReferenceDensity();
 }
 //=================================================================================================//
+void NosbPDFirstStep::prepare(std::size_t i)
+{
+    acc_old_[i] = acc_[i];
+    acc_[i] = acc_prior_[i];
+    rho_[i] = rho0_ / F_[i].determinant();
+    checkPositionVerletVelocity(*sph_body_, *particles_, i, vel_[i]);
+}
+
 void NosbPDFirstStep::update(size_t index_i, Real dt)
 {
-    acc_old_[index_i] = acc_[index_i];
-    acc_[index_i] = acc_prior_[index_i];
-    rho_[index_i] = rho0_ / F_[index_i].determinant();
-    /** NaN fuse: a particle with non-finite velocity is disabled and frozen
-     * before its position is poisoned and the contamination spreads through
-     * the bond network (and into the fluid via AverageVelocity). */
-    if (!vel_[index_i].allFinite())
-    {
-        particles_->getVariableDataByName<int>("NumericalFailureReason")[index_i] = 1;
-        peridynamics::numericalFailure(sph_body_->Name(), index_i, "non-finite Velocity");
-    }
+    prepare(index_i);
     pos_[index_i] += vel_[index_i] * dt * 0.5;
+}
+
+void NosbPDFirstStep::evaluateDevice(peridynamics::PositionVerletBatch &backend, Real dt)
+{
+    const auto count = particles_->TotalRealParticles();
+    device_input_.resize(count);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        prepare(i);
+        device_input_[i] = {packPositionVerlet(pos_[i]), packPositionVerlet(vel_[i])};
+    }
+    backend.start(device_input_, dt, device_output_);
+    for (std::size_t i = 0; i < count; ++i)
+        pos_[i] = unpackPositionVerlet(device_output_[i]);
 }
 //=================================================================================================//
 NosbPDSecondStep::
@@ -539,15 +579,36 @@ void NosbPDFourthStep::update(size_t index_i, Real dt)
     boundary_work_[index_i] += dt * boundary_power_[index_i];
     friction_loss_[index_i] += dt * friction_boundary_power_[index_i] - friction_[index_i].dot(displacement);
     vel_[index_i] += acc_[index_i] * dt;
-    /** NaN fuse (second fence): velocity is checked immediately after the
-     * integration so a poisoned value can never reach the position or the
-     * AverageVelocity read by the fluid side. */
-    if (!vel_[index_i].allFinite())
-    {
-        particles_->getVariableDataByName<int>("NumericalFailureReason")[index_i] = 1;
-        peridynamics::numericalFailure(sph_body_->Name(), index_i, "non-finite Velocity");
-    }
+    checkPositionVerletVelocity(*sph_body_, *particles_, index_i, vel_[index_i]);
     pos_[index_i] += vel_[index_i] * dt * 0.5;
+}
+
+void NosbPDFourthStep::evaluateDevice(peridynamics::PositionVerletBatch &backend, Real dt)
+{
+    const auto count = particles_->TotalRealParticles();
+    device_input_.resize(count);
+    for (std::size_t i = 0; i < count; ++i)
+        device_input_[i] = {packPositionVerlet(pos_[i]), packPositionVerlet(vel_[i]), packPositionVerlet(acc_[i]),
+                            packPositionVerlet(internal_[i]), packPositionVerlet(hg_[i]), packPositionVerlet(damping_[i]),
+                            packPositionVerlet(viscous_[i]), packPositionVerlet(friction_[i]), packPositionVerlet(acoustic_[i]),
+                            mass_[i], boundary_power_[i], friction_boundary_power_[i]};
+
+    backend.finish(device_input_, dt, device_output_);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        const auto &result = device_output_[i];
+        internal_work_[i] += result.internal_work;
+        external_work_[i] += result.external_work;
+        hg_work_[i] += result.hourglass_work;
+        damping_work_[i] += result.damping_work;
+        viscous_work_[i] += result.viscous_work;
+        acoustic_work_[i] += result.acoustic_work;
+        boundary_work_[i] += result.boundary_work;
+        friction_loss_[i] += result.friction_loss;
+        vel_[i] = unpackPositionVerlet(result.velocity);
+        checkPositionVerletVelocity(*sph_body_, *particles_, i, vel_[i]);
+        pos_[i] = unpackPositionVerlet(result.position);
+    }
 }
 //=================================================================================================//
 ProjectedPairStabilization::

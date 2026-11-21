@@ -46,6 +46,7 @@ class PeriExecution
     std::unique_ptr<SpatialDerivativeBatch> makeSpatialDerivatives() const;
     std::unique_ptr<dpc::PointBatch> makeDpcPoints(const dpc::Model &model) const;
     std::unique_ptr<SolidTimeStepBatch> makeSolidTimeStep(const std::vector<double> &mass) const;
+    std::unique_ptr<PositionVerletBatch> makePositionVerlet() const;
     std::unique_ptr<FluidTractionBatch> makeFluidTraction() const;
     std::unique_ptr<FluidAcousticBatch> makeFluidAcoustic() const;
     std::unique_ptr<FluidViscosityBatch> makeFluidViscosity() const;

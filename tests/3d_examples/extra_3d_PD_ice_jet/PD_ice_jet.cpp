@@ -201,13 +201,15 @@ int main(int ac, char *av[]) try
     //	Algorithms of NOSB-PD dynamics.
     //----------------------------------------------------------------------
     InteractionWithUpdate<solid_dynamics::NosbPDShapeMatrix> plate_shape_matrix(plate_inner_relation);
-    SimpleDynamics<solid_dynamics::NosbPDFirstStep> nosbpd_first_step(plate);
+    auto pd_time_integration = execution.makePositionVerlet();
+    solid_dynamics::NosbPDStepWithExecution<solid_dynamics::NosbPDFirstStep> nosbpd_first_step(plate, pd_time_integration.get());
+    std::cout << "NOSB-PD position Verlet backend " << (pd_time_integration ? "cuda_fp64" : "cpu_fp64") << std::endl;
     InteractionDynamics<solid_dynamics::BondBreakBySigma1andSigma3> check_bond_live(plate_inner_relation, max_tension_stress, max_shear_stress);
     InteractionWithUpdate<solid_dynamics::NosbPDSecondStepPlastic> nosbpd_second_step_plastic(plate_inner_relation);
     InteractionDynamics<solid_dynamics::LittleWoodHourGlassControl> hourglass_control(plate_inner_relation);
     InteractionDynamics<solid_dynamics::PairNumericalDampingforPD> numerical_damping(plate_inner_relation);
     InteractionDynamics<solid_dynamics::NosbPDThirdStep> nosbpd_third_step(plate_inner_relation);
-    SimpleDynamics<solid_dynamics::NosbPDFourthStep> nosbpd_fourth_step(plate);
+    solid_dynamics::NosbPDStepWithExecution<solid_dynamics::NosbPDFourthStep> nosbpd_fourth_step(plate, pd_time_integration.get());
     /** normal direction updated from the PD deformation gradient;
      * must be constructed after the NOSB-PD dynamics which register
      * the DeformationGradient variable. */

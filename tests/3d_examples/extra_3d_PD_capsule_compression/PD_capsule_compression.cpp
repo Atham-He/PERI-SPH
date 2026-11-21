@@ -238,13 +238,15 @@ int main(int argc, char **argv)
     box_contact.addBox("LowerPlate", Vecd(0, 0.5 * plate_thickness, 0), plate_half_size);
     box_contact.addBox("UpperPlate", Vecd(0, upper_plate_bottom + 0.5 * plate_thickness, 0), plate_half_size);
     InteractionWithUpdate<solid_dynamics::NosbPDShapeMatrix> shape_matrix(shell_inner);
-    SimpleDynamics<solid_dynamics::NosbPDFirstStep> first(shell);
+    auto pd_time_integration = execution->makePositionVerlet();
+    solid_dynamics::NosbPDStepWithExecution<solid_dynamics::NosbPDFirstStep> first(shell, pd_time_integration.get());
+    std::cout << "NOSB-PD position Verlet backend " << (pd_time_integration ? "cuda_fp64" : "cpu_fp64") << std::endl;
     auto constitutive = peridynamics::makePDConstitutiveDynamics(shell_inner);
     auto fracture = peridynamics::makePDFracture(shell_inner, material_options, fracture_options);
     InteractionDynamics<solid_dynamics::LittleWoodHourGlassControl> hourglass(shell_inner, hourglass_coefficient, hourglass_damage_cutoff);
     InteractionDynamics<solid_dynamics::PairNumericalDampingforPD> pd_damping(shell_inner);
     InteractionDynamics<solid_dynamics::NosbPDThirdStep> third(shell_inner);
-    SimpleDynamics<solid_dynamics::NosbPDFourthStep> fourth(shell);
+    solid_dynamics::NosbPDStepWithExecution<solid_dynamics::NosbPDFourthStep> fourth(shell, pd_time_integration.get());
     ReduceDynamics<solid_dynamics::PDTimeStep> shell_step(shell, pd_cfl);
     SimpleDynamics<solid_dynamics::UpdateElasticNormalDirection> update_normals(shell);
     solid_dynamics::AverageVelocityAndAcceleration averages(shell);

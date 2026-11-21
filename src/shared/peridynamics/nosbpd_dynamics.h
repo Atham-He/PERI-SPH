@@ -29,6 +29,9 @@
 
 #include <Eigen/Eigenvalues>
 
+#include "pd_solid_time_step.h"
+#include "dynamics_algorithms.h"
+
 namespace SPH
 {
 namespace solid_dynamics
@@ -80,6 +83,7 @@ class NosbPDFirstStep : public LocalDynamics
     virtual ~NosbPDFirstStep() {};
 
     void update(size_t index_i, Real dt = 0.0);
+    void evaluateDevice(peridynamics::PositionVerletBatch &backend, Real dt);
 
   protected:
     HughesWingetSolid &hw_solid_;
@@ -88,6 +92,11 @@ class NosbPDFirstStep : public LocalDynamics
     int *particleLive_;
     Vecd *pos_, *vel_, *acc_old_, *acc_, *acc_prior_;
     Matd *F_;
+
+  private:
+    void prepare(std::size_t i);
+    std::vector<peridynamics::PositionVerletStart> device_input_;
+    std::vector<peridynamics::ParticleVector3> device_output_;
 };
 
 /**
@@ -265,6 +274,7 @@ class NosbPDFourthStep : public LocalDynamics
     virtual ~NosbPDFourthStep() {};
 
     void update(size_t index_i, Real dt = 0.0);
+    void evaluateDevice(peridynamics::PositionVerletBatch &backend, Real dt);
 
   protected:
     int *particleLive_;
@@ -273,6 +283,35 @@ class NosbPDFourthStep : public LocalDynamics
     Vecd *prior_, *internal_, *hg_, *damping_, *viscous_, *friction_, *acoustic_;
     Real *internal_work_, *external_work_, *hg_work_, *damping_work_, *viscous_work_, *acoustic_work_;
     Real *boundary_power_, *friction_boundary_power_, *boundary_work_, *friction_loss_;
+
+  private:
+    std::vector<peridynamics::PositionVerletFinish> device_input_;
+    std::vector<peridynamics::PositionVerletResult> device_output_;
+};
+
+template <class Stage>
+class NosbPDStepWithExecution : public SimpleDynamics<Stage>
+{
+    using Base = SimpleDynamics<Stage>;
+
+  public:
+    NosbPDStepWithExecution(SPHBody &body, peridynamics::PositionVerletBatch *backend)
+        : Base(body), backend_(backend) {}
+
+    void exec(Real dt = 0.0) override
+    {
+        if (!backend_)
+        {
+            Base::exec(dt);
+            return;
+        }
+        this->setUpdated(this->getSPHBody());
+        this->setupDynamics(dt);
+        this->evaluateDevice(*backend_, dt);
+    }
+
+  private:
+    peridynamics::PositionVerletBatch *backend_;
 };
 
 /**

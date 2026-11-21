@@ -46,5 +46,37 @@ class SolidTimeStepBatch
                         SolidKickInput drive, std::vector<SolidFinishResult> &output) = 0;
 };
 
+// NOSB-PD uses a drift-kick-drift update with work evaluated at the
+// midpoint velocity; the solid SPH integrator above uses kick-drift-kick.
+struct PositionVerletStart
+{
+    ParticleVector3 position, velocity;
+};
+
+struct PositionVerletFinish
+{
+    ParticleVector3 position, velocity, acceleration;
+    ParticleVector3 internal, hourglass, damping, viscous, friction, acoustic;
+    double mass, boundary_power, friction_boundary_power;
+};
+
+struct PositionVerletResult
+{
+    ParticleVector3 position, velocity;
+    double internal_work, external_work, hourglass_work, damping_work;
+    double viscous_work, acoustic_work, boundary_work, friction_loss;
+};
+
+class PositionVerletBatch
+{
+  public:
+    virtual ~PositionVerletBatch() = default;
+    virtual void start(const std::vector<PositionVerletStart> &state, double dt,
+                       std::vector<ParticleVector3> &position) = 0;
+    virtual void finish(const std::vector<PositionVerletFinish> &state, double dt,
+                        std::vector<PositionVerletResult> &result) = 0;
+};
+
+std::unique_ptr<PositionVerletBatch> makeCudaPositionVerlet();
 std::unique_ptr<SolidTimeStepBatch> makeCudaSolidTimeStep(const std::vector<double> &mass);
 }

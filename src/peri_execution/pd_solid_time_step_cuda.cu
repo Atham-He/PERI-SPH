@@ -65,6 +65,112 @@ __global__ void finishSolidStep(const double *mass, const SolidFinishInput *inpu
     next.undamped_kinetic = .5 * mass[i] * normSquared(undamped_velocity);
 }
 
+__device__ double dot(const ParticleVector3 &a, const ParticleVector3 &b)
+{
+    return a.component[0] * b.component[0] +
+        (a.component[1] * b.component[1] + a.component[2] * b.component[2]);
+}
+
+__global__ void startPositionVerlet(const PositionVerletStart *state, std::size_t count, double dt,
+                                    ParticleVector3 *position)
+{
+    const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count)
+        return;
+
+    for (int axis = 0; axis < 3; ++axis)
+        position[i].component[axis] = state[i].position.component[axis] +
+            state[i].velocity.component[axis] * dt * 0.5;
+}
+
+__global__ void finishPositionVerlet(const PositionVerletFinish *state, std::size_t count, double dt,
+                                     PositionVerletResult *result)
+{
+    const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count)
+        return;
+
+    const auto &old = state[i];
+    auto &next = result[i];
+    ParticleVector3 displacement, external;
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        const double acceleration = old.acceleration.component[axis];
+        const double velocity = old.velocity.component[axis];
+        displacement.component[axis] = dt * (velocity + 0.5 * dt * acceleration);
+        external.component[axis] = old.mass * acceleration - old.internal.component[axis] -
+            old.hourglass.component[axis] - old.damping.component[axis];
+        next.velocity.component[axis] = velocity + acceleration * dt;
+        next.position.component[axis] = old.position.component[axis] + next.velocity.component[axis] * dt * 0.5;
+    }
+    next.internal_work = dot(old.internal, displacement);
+    next.external_work = dot(external, displacement);
+    next.hourglass_work = dot(old.hourglass, displacement);
+    next.damping_work = dot(old.damping, displacement);
+    next.viscous_work = dot(old.viscous, displacement);
+    next.acoustic_work = dot(old.acoustic, displacement);
+    next.boundary_work = dt * old.boundary_power;
+    next.friction_loss = dt * old.friction_boundary_power - dot(old.friction, displacement);
+}
+
+class CudaPositionVerlet final : public PositionVerletBatch
+{
+  public:
+    CudaPositionVerlet()
+    {
+        int device = 0, limit = 0;
+        check(cudaGetDevice(&device), "select position Verlet device");
+        check(cudaDeviceGetAttribute(&limit, cudaDevAttrMaxGridDimX, device), "read position Verlet grid limit");
+        max_blocks_ = static_cast<std::size_t>(limit);
+    }
+
+    void start(const std::vector<PositionVerletStart> &state, double dt,
+               std::vector<ParticleVector3> &position) override
+    {
+        const auto blocks = grid(state.size(), dt);
+        position.resize(state.size());
+        if (!blocks)
+            return;
+        upload(start_, state, "position Verlet start state");
+        position_.reserve(state.size());
+        startPositionVerlet<<<blocks, threads_>>>(start_.get(), state.size(), dt, position_.get());
+        check(cudaGetLastError(), "start position Verlet");
+        download(position, position_, "position Verlet starting positions");
+    }
+
+    void finish(const std::vector<PositionVerletFinish> &state, double dt,
+                std::vector<PositionVerletResult> &result) override
+    {
+        const auto blocks = grid(state.size(), dt);
+        result.resize(state.size());
+        if (!blocks)
+            return;
+        upload(finish_, state, "position Verlet finish state");
+        result_.reserve(state.size());
+        finishPositionVerlet<<<blocks, threads_>>>(finish_.get(), state.size(), dt, result_.get());
+        check(cudaGetLastError(), "finish position Verlet");
+        download(result, result_, "position Verlet finished positions and work");
+    }
+
+  private:
+    unsigned grid(std::size_t count, double dt) const
+    {
+        if (!std::isfinite(dt) || dt < 0)
+            throw std::invalid_argument("Invalid position Verlet time step");
+        const auto blocks = count ? (count - 1) / threads_ + 1 : 0;
+        if (blocks > max_blocks_)
+            throw std::length_error("Position Verlet batch exceeds the device grid");
+        return static_cast<unsigned>(blocks);
+    }
+
+    static constexpr unsigned threads_ = 128;
+    std::size_t max_blocks_ = 0;
+    DeviceBuffer<PositionVerletStart> start_;
+    DeviceBuffer<PositionVerletFinish> finish_;
+    DeviceBuffer<ParticleVector3> position_;
+    DeviceBuffer<PositionVerletResult> result_;
+};
+
 class CudaSolidTimeStep final : public SolidTimeStepBatch
 {
   public:
@@ -130,6 +236,11 @@ class CudaSolidTimeStep final : public SolidTimeStepBatch
     DeviceBuffer<SolidFinishInput> finish_input_;
     DeviceBuffer<SolidFinishResult> finish_output_;
 };
+}
+
+std::unique_ptr<PositionVerletBatch> makeCudaPositionVerlet()
+{
+    return std::make_unique<CudaPositionVerlet>();
 }
 
 std::unique_ptr<SolidTimeStepBatch> makeCudaSolidTimeStep(const std::vector<double> &mass)

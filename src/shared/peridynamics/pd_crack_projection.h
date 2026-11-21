@@ -17,6 +17,7 @@ struct CrackProjectionInput
 
 struct CrackProjectionResult
 {
+    enum Status { Accepted, Outside, InvalidGeometry };
     double s, t;
     int status;
 };

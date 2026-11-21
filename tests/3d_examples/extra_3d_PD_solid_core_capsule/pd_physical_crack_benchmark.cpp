@@ -3,6 +3,7 @@
 #include "pd_column_face_surface.h"
 #include "pd_fracture_visible_surface.h"
 #include "pd_crack_face_contact.h"
+#include "pd_bilinear_contact_projection.h"
 #include "pd_execution.h"
 #include "pd_cohesive_crack_law.h"
 #include "pd_fracture_topology_checkpoint.h"
@@ -22,6 +23,30 @@ void writeCloud(const std::filesystem::path&p,const StdVec<Vecd>&x,const StdVec<
 }
 void writeFace(const std::filesystem::path&p,const StdVec<Vecd>&x){std::ofstream f(p);f<<std::setprecision(17)<<"<VTKFile type=\"PolyData\" version=\"0.1\" byte_order=\"LittleEndian\"><PolyData><Piece NumberOfPoints=\"4\" NumberOfPolys=\"2\"><Points><DataArray type=\"Float64\" NumberOfComponents=\"3\" format=\"ascii\">";for(const auto&a:x)f<<a.transpose()<<' ';f<<"</DataArray></Points><Polys><DataArray type=\"Int64\" Name=\"connectivity\" format=\"ascii\">0 1 2 0 2 3</DataArray><DataArray type=\"Int64\" Name=\"offsets\" format=\"ascii\">3 6</DataArray></Polys></Piece></PolyData></VTKFile>\n";}
 #include "pd_automatic_growth_benchmark.h"
+static void verifyFiniteCrackProjection(CrackProjectionBatch *backend)
+{
+    // Recorded warped face whose extrapolated Newton projection did not converge.
+    const std::vector<CrackProjectionInput> points{
+        {{{0,0,0}, {-4.1401785295784881e-06,8.269540908265754e-08,2.7488666310837714e-06},
+          {-1.1793556276693397e-05,8.5026307437271362e-06,-1.0984019756959647e-05},
+          {-7.4297540423547733e-06,7.819441603255761e-06,-1.3401550975850653e-05},
+          {4.3390626231422298e-05,5.6049425184217104e-05,3.5649716562550924e-05}}},
+        // Newton starts at the saddle. The two minimizing feet have s=t=.25 or .75.
+        {{{0,0,1}, {1,0,-1}, {1,1,1}, {0,1,-1}, {.5,.5,.5}}}
+    };
+    std::vector<CrackProjectionResult> result;
+    if (backend)
+        backend->project(points, result);
+    else
+        for (const auto &point : points)
+            result.push_back(projectCrackContact(point));
+
+    if (result.size() != points.size() || result[0].status != CrackProjectionResult::Outside ||
+        result[1].status != CrackProjectionResult::Accepted ||
+        std::abs(result[1].s-result[1].t) > 1e-12 ||
+        std::abs(std::abs(result[1].s-.5)-.25) > 1e-12)
+        throw std::runtime_error("Finite crack projection failed its bounded warped-face check");
+}
 int main(int argc,char**argv){bool published=false,contact_only=false;try{
  if(argc<2)throw std::invalid_argument("Output directory required");
  PeriExecutionMode execution_mode=PeriExecutionMode::Default;
@@ -33,6 +58,7 @@ int main(int argc,char**argv){bool published=false,contact_only=false;try{
  }
  const PeriExecution execution(execution_mode);
  auto projection=execution.makeCrackProjection();
+ if(contact_only)verifyFiniteCrackProjection(projection.get());
 std::filesystem::path out(argv[1]);if(std::filesystem::exists(out)&&!std::filesystem::is_empty(out))throw std::runtime_error("Benchmark output must be new or empty");std::filesystem::create_directories(out/"frames");
  {std::ofstream pending(out/"acceptance.json");pending<<"{\"geometry_status\":\"RUNNING\",\"capsule_restart_allowed\":false}\n";if(!pending)throw std::runtime_error("Cannot publish precrack acceptance start");published=true;}
  const Real E=2.151e9,nu=.3,ft=46.4e6,Gc=100,dp=25e-6,t=5e-6,K=2.8491556e15;const int nx=16,ny=16;

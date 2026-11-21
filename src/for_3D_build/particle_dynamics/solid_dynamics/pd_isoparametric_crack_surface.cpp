@@ -1,4 +1,5 @@
 #include "pd_isoparametric_crack_surface.h"
+#include "pd_bilinear_contact_projection.h"
 
 #include <algorithm>
 #include <iomanip>
@@ -109,6 +110,14 @@ void CrackSurfaceContactNetwork::apply(){
         for(size_t a=0;a<4;++a){s.kinematics(a,masters[m].x[a],masters[m].v[a]);lo=lo.cwiseMin(masters[m].x[a]);hi=hi.cwiseMax(masters[m].x[a]);}Real margin=std::max(2*spacing,(hi-lo).norm());Cell a=cell(lo-Vecd::Constant(margin)),b=cell(hi+Vecd::Constant(margin));
         for(long long i=a[0];i<=b[0];++i)for(long long j=a[1];j<=b[1];++j)for(long long k=a[2];k<=b[2];++k)grid[{i,j,k}].push_back(m);
     }
+    const auto projectionInput = [&](size_t master, const Vecd &point)
+    {
+        CrackProjectionInput input;
+        for (size_t a = 0; a < 4; ++a)
+            std::copy_n(masters[master].x[a].data(), 3, input.coordinates[a]);
+        std::copy_n(point.data(), 3, input.coordinates[4]);
+        return input;
+    };
     // Use the grid and the existing master order on both execution paths.
     // Projection is independent of contact force assembly and trace scattering.
     size_t next_projection=0;
@@ -123,12 +132,7 @@ void CrackSurfaceContactNetwork::apply(){
                 if(it==grid.end())continue;
                 for(size_t m:it->second){
                     if(m==si)continue;
-                    CrackProjectionInput input;
-                    for(size_t d=0;d<3;++d){
-                        for(size_t a=0;a<4;++a)input.coordinates[a][d]=masters[m].x[a][d];
-                        input.coordinates[4][d]=x[d];
-                    }
-                    projection_inputs_.push_back(input);
+                    projection_inputs_.push_back(projectionInput(m, x));
                 }
             }
         }
@@ -136,14 +140,13 @@ void CrackSurfaceContactNetwork::apply(){
         if(projection_results_.size()!=projection_inputs_.size())
             throw std::logic_error("Crack projection backend returned an incomplete batch");
     }
-    auto closest=[&](size_t master,const Vecd&point){
-        if(projection_batch_){
-            const auto&p=projection_results_.at(next_projection++);
-            if(p.status==0&&std::isfinite(p.s)&&std::isfinite(p.t))
-                return BilinearCrackGeometry::Param(p.s,p.t);
-            // The scalar solver handles exceptional geometry and preserves its diagnostics.
-        }
-        return BilinearCrackGeometry::closest(masters[master].x,point);
+    const auto project = [&](size_t master, const Vecd &point)
+    {
+        const auto result = projection_batch_ ? projection_results_.at(next_projection++) :
+                                                projectCrackContact(projectionInput(master, point));
+        if (result.status != CrackProjectionResult::Accepted && result.status != CrackProjectionResult::Outside)
+            throw std::runtime_error("Crack contact surface has invalid geometry");
+        return result;
     };
     using TraceRows = std::array<const ReferenceSolidSurface::Row *, 5>;
     using TraceWeights = std::array<Real, 5>;
@@ -314,13 +317,13 @@ void CrackSurfaceContactNetwork::apply(){
             {
                 if (master == si)
                     continue;
-                auto p = closest(master, x);
-                if (p.minCoeff() < -1e-9 || p.maxCoeff() > 1 + 1e-9)
+                const auto p = project(master, x);
+                if (p.status == CrackProjectionResult::Outside)
                 {
                     ++outside_projections;
                     continue;
                 }
-                const auto a = BilinearCrackGeometry::evaluate(masters[master].x, p);
+                const auto a = BilinearCrackGeometry::evaluate(masters[master].x, BilinearCrackGeometry::Param(p.s,p.t));
                 const Vecd n = sides[master].outward_sign * a.u.cross(a.v).normalized();
                 if (!n.allFinite())
                     throw std::runtime_error("Master crack normal is unresolved");

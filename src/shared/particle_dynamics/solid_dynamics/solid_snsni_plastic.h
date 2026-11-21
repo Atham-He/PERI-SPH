@@ -28,12 +28,15 @@ class SnsniPlasticSolid
     bool pending_commit=false;
     Real linear_frequency_bound_squared=0,acoustic_dt=0;
     SnsniPlasticSolid(SnsniReference &r, const dpc::Model &m, const peridynamics::PeriExecution &execution)
-        : SnsniPlasticSolid(r, m, execution.makeSpatialDerivatives(), execution.makeDpcPoints(m)) {}
+        : SnsniPlasticSolid(r, m, execution.makeSpatialDerivatives(), execution.makeDpcPoints(m),
+                            execution.makeSpatialDerivatives()) {}
 
     SnsniPlasticSolid(SnsniReference&r,const dpc::Model&m,
                       std::unique_ptr<peridynamics::SpatialDerivativeBatch> derivatives = nullptr,
-                      std::unique_ptr<dpc::PointBatch> material_points = nullptr)
-      : reference(r), model(m), derivatives_(std::move(derivatives)), material_points_(std::move(material_points))
+                      std::unique_ptr<dpc::PointBatch> material_points = nullptr,
+                      std::unique_ptr<peridynamics::SpatialDerivativeBatch> sampling_derivatives = nullptr)
+      : reference(r), model(m), derivatives_(std::move(derivatives)), material_points_(std::move(material_points)),
+        sampling_derivatives_(std::move(sampling_derivatives))
     {
         const size_t n=r.cells.size();history.resize(n);pending.resize(n);F.resize(n);inverseF.resize(n);correction.resize(n);force_gradient.resize(n);displacement_hessian.resize(n);force_hessian.resize(n);accumulated_plastic_work.assign(n,0);sampling_gradient.resize(n);
         StdVec<Vecd> sites;StdVec<Real> volumes;
@@ -53,7 +56,10 @@ class SnsniPlasticSolid
         if(!(linear_frequency_bound_squared>0))throw std::runtime_error("Invalid S-NSNI frequency bound");
         if (derivatives_)
             configureDerivatives();
+        if (sampling_derivatives_)
+            configureSamplingDerivatives();
     }
+    bool hasDeviceSamplingGradients() const noexcept { return sampling_derivatives_ != nullptr; }
     bool hasDeviceDerivatives() const noexcept { return derivatives_ != nullptr; }
     bool hasDeviceMaterial() const noexcept { return material_points_ != nullptr; }
     void evaluate(const Field&d,Real rho0,Real cfl)
@@ -64,6 +70,12 @@ class SnsniPlasticSolid
             evaluateDeviceDerivatives(d);
         if (material_points_)
             point_input_.resize(n);
+        if (sampling_derivatives_)
+            evaluateSamplingField(n, history_channels, [&](size_t l, double *values)
+            {
+                packSamplingTensor(history[l].inverse_Cp, values);
+                values[tensor_channels]=history[l].kappa;
+            });
         tbb::parallel_for(size_t(0),n,[&](size_t l){auto&h=displacement_hessian[l];
             if (derivatives_)
             {
@@ -83,11 +95,27 @@ class SnsniPlasticSolid
                 for(const auto&e:reference.cells[l].rows){F[l]+=d[e.j]*e.gradient.transpose();for(int a=0;a<3;++a)h[a]+=d[e.j][a]*e.hessian;}
             }
             if(!F[l].allFinite()||F[l].determinant()<=0)throw std::runtime_error("Invalid S-NSNI cell Jacobian, no deletion or clamping");inverseF[l]=F[l].inverse();
-            Triple derivativeF,derivativeCp;for(auto&a:derivativeCp)a.setZero();Vecd derivativeKappa=Vecd::Zero();
-            // Difference form enforces the derivative of a constant exactly;
-            // algebraically it is the partition-of-unity RK derivative.
-            for(const auto&e:sampling_gradient[l]){Matd delta=history[e.j].inverse_Cp-history[l].inverse_Cp;Real dk=history[e.j].kappa-history[l].kappa;
-                for(int k=0;k<3;++k)derivativeCp[k]+=e.gradient[k]*delta;derivativeKappa+=dk*e.gradient;}
+            Triple derivativeF,derivativeCp;
+            Vecd derivativeKappa;
+            if (sampling_derivatives_)
+            {
+                derivativeCp=sampledTensorGradient(l, history_channels);
+                const auto &kappa=sampled_gradients_[l*history_channels+tensor_channels].component;
+                derivativeKappa=Vecd(kappa[0],kappa[1],kappa[2]);
+            }
+            else
+            {
+                for(auto &a:derivativeCp) a.setZero();
+                derivativeKappa.setZero();
+                // Difference form enforces the derivative of a constant exactly.
+                for(const auto &e:sampling_gradient[l])
+                {
+                    const Matd delta=history[e.j].inverse_Cp-history[l].inverse_Cp;
+                    const Real dk=history[e.j].kappa-history[l].kappa;
+                    for(int k=0;k<3;++k) derivativeCp[k]+=e.gradient[k]*delta;
+                    derivativeKappa+=dk*e.gradient;
+                }
+            }
             Triple cp_spatial;Vecd kappa_spatial=inverseF[l].transpose()*derivativeKappa;
             for(int k=0;k<3;++k){derivativeF[k].setZero();cp_spatial[k].setZero();
                 for(int j=0;j<3;++j){cp_spatial[k]+=inverseF[l](j,k)*derivativeCp[j];for(int a=0;a<3;++a)derivativeF[k].row(a)+=inverseF[l](j,k)*h[a].col(j).transpose();}}
@@ -101,9 +129,24 @@ class SnsniPlasticSolid
         });
         if (material_points_)
             evaluateDeviceMaterial(n,rho0,cfl*reference.dp);
+        if (sampling_derivatives_)
+            evaluateSamplingField(n, tensor_channels, [&](size_t l, double *values)
+            {
+                packSamplingTensor(correction[l], values);
+            });
         tbb::parallel_for(size_t(0),n,[&](size_t l){const auto&cell=reference.cells[l];const auto&inv=inverseF[l];
-            Triple derivative;for(auto&a:derivative)a.setZero();
-            for(const auto&e:sampling_gradient[l]){Matd delta=correction[e.j]-correction[l];for(int k=0;k<3;++k)derivative[k]+=e.gradient[k]*delta;}
+            Triple derivative;
+            if (sampling_derivatives_)
+                derivative=sampledTensorGradient(l,tensor_channels);
+            else
+            {
+                for(auto &a:derivative) a.setZero();
+                for(const auto &e:sampling_gradient[l])
+                {
+                    const Matd delta=correction[e.j]-correction[l];
+                    for(int k=0;k<3;++k) derivative[k]+=e.gradient[k]*delta;
+                }
+            }
             Triple sigma_gradient;
             for(int k=0;k<3;++k){sigma_gradient[k]=pending[l].trial.gradient[k];for(int j=0;j<3;++j)sigma_gradient[k]-=inverseF[l](j,k)*derivative[j];}
             const Real J=F[l].determinant();Matd moment=J*F[l]*cell.moment*F[l].transpose(),geometric=Matd::Zero();
@@ -153,6 +196,62 @@ class SnsniPlasticSolid
     std::unique_ptr<dpc::PointBatch> material_points_;
     std::vector<dpc::SnsniPointInput> point_input_;
     std::vector<dpc::SnsniPointOutput> point_output_;
+    std::unique_ptr<peridynamics::SpatialDerivativeBatch> sampling_derivatives_;
+    std::vector<double> sampling_values_;
+    std::vector<peridynamics::ParticleVector3> sampled_gradients_;
+    static constexpr size_t tensor_channels=9, history_channels=tensor_channels+1;
+
+    void configureSamplingDerivatives()
+    {
+        peridynamics::SpatialDerivativeMap map{};
+        map.particle_count=sampling_gradient.size();
+        map.build_adjoint=false;
+        map.offsets.push_back(0);
+        for (size_t l=0;l<sampling_gradient.size();++l)
+        {
+            map.origins.push_back(l);
+            for (const auto &entry:sampling_gradient[l])
+            {
+                map.neighbors.push_back(entry.j);
+                map.gradients.push_back({{entry.gradient[0],entry.gradient[1],entry.gradient[2]}});
+            }
+            map.offsets.push_back(map.neighbors.size());
+        }
+        sampling_derivatives_->configure(map);
+    }
+
+    template<class Fill>
+    void evaluateSamplingField(size_t cells, size_t channels, const Fill &fill)
+    {
+        sampling_values_.resize(cells*channels);
+        tbb::parallel_for(size_t(0),cells,[&](size_t l)
+        {
+            fill(l,sampling_values_.data()+l*channels);
+        });
+        sampling_derivatives_->evaluateChannelGradients(sampling_values_,channels,sampled_gradients_);
+        if (sampled_gradients_.size()!=cells*channels)
+            throw std::logic_error("Spatial backend returned an incomplete S-NSNI sampling field");
+    }
+
+    static void packSamplingTensor(const Matd &matrix, double *values)
+    {
+        for (int row=0;row<3;++row)
+            for (int col=0;col<3;++col)
+                values[3*row+col]=matrix(row,col);
+    }
+
+    Triple sampledTensorGradient(size_t cell, size_t channels) const
+    {
+        Triple gradient;
+        for (int row=0;row<3;++row)
+            for (int col=0;col<3;++col)
+            {
+                const auto &value=sampled_gradients_[cell*channels+3*row+col].component;
+                for (int direction=0;direction<3;++direction)
+                    gradient[direction](row,col)=value[direction];
+            }
+        return gradient;
+    }
 
     void packMaterialInput(size_t cell,const Triple &grad_F,const Triple &grad_Cp,const Vecd &grad_kappa)
     {

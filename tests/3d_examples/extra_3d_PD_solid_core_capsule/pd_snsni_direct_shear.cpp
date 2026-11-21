@@ -178,7 +178,7 @@ int runDirectShear(const HybridOptions&o,const std::string&cells,const std::stri
       <<",\"execution_backend\":"<<std::quoted(execution.backendName())
       <<",\"core_derivatives_backend\":"<<std::quoted(cb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")
       <<",\"core_internal_force_backend\":"<<std::quoted(cb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")
-      <<",\"core_material_backend\":"<<std::quoted(cb.hasDeviceMaterial()?"cuda_fp64":"cpu_fp64")<<",\"trial_stress_gradient_backend\":"<<std::quoted(cb.hasDeviceMaterial()?"cuda_fp64":"cpu_fp64")
+      <<",\"core_material_backend\":"<<std::quoted(cb.hasDeviceMaterial()?"cuda_fp64":"cpu_fp64")<<",\"trial_stress_gradient_backend\":"<<std::quoted(cb.hasDeviceMaterial()?"cuda_fp64":"cpu_fp64")<<",\"core_sampling_gradients_backend\":"<<std::quoted(cb.hasDeviceSamplingGradients()?"cuda_fp64":"cpu_fp64")
       <<",\"bonded_interface_backend\":"<<std::quoted(execution.bondedInterfaceOnDevice()?"cuda_fp64":"cpu_fp64")
       <<",\"capsule_count\":1,\"capsule_mass_kg\":"<<capsule_mass<<",\"sand_mass_kg\":"<<grain_mass<<",\"capsule_mass_fraction\":"<<capsule_mass/(grain_mass+capsule_mass)<<",\"capsule_sand_mu\":0,\"initial_height_m\":"<<box.initial_height_m
       <<",\"initial_area_m2\":"<<box.length_x_m*box.length_y_m<<",\"normal_pressure_Pa\":"<<box.normal_pressure_Pa<<",\"normal_load_control\":\"massless_exact_piston_constant_nominal_force\",\"load_steps\":"<<box.normal_increments+box.shear_increments

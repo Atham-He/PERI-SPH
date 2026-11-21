@@ -2,6 +2,7 @@
 #include "pd_cuda_buffer.cuh"
 
 #include <algorithm>
+#include <limits>
 
 namespace SPH::peridynamics
 {
@@ -45,6 +46,27 @@ __global__ void evaluateSpatialDerivatives(const std::size_t *offsets, const std
         for (int k = 0; k < 3; ++k)
             result[row].hessian[axis][j][k] = hessian[j][k];
     }
+}
+
+__global__ void evaluateChannelGradientsKernel(const std::size_t *offsets, const std::size_t *neighbors,
+                                               const std::size_t *origins, const ParticleVector3 *weights,
+                                               const double *particles, std::size_t channels, std::size_t entries,
+                                               ParticleVector3 *result)
+{
+    const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= entries)
+        return;
+    const auto row = index / channels;
+    const auto channel = index % channels;
+    const double origin = origins ? particles[origins[row] * channels + channel] : 0.0;
+    ParticleVector3 gradient{};
+    for (auto i = offsets[row]; i < offsets[row + 1]; ++i)
+    {
+        const double value = particles[neighbors[i] * channels + channel] - origin;
+        for (int axis = 0; axis < 3; ++axis)
+            gradient.component[axis] += value * weights[i].component[axis];
+    }
+    result[index] = gradient;
 }
 
 struct AdjointContribution
@@ -162,8 +184,8 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
             throw std::invalid_argument("Invalid spatial derivative stencil");
         const auto rows = map.offsets.size() - 1;
         if (!map.weighted_differences.empty() &&
-            (map.weighted_differences.size() != entries || map.origins.empty()))
-            throw std::invalid_argument("Weighted differences require one fit per stencil entry and a row origin");
+            (map.weighted_differences.size() != entries || map.origins.empty() || !map.build_adjoint))
+            throw std::invalid_argument("Weighted differences require entry fits, row origins and the adjoint stencil");
         if (!map.origins.empty() && map.origins.size() != rows)
             throw std::invalid_argument("Invalid spatial derivative origins");
         for (auto node : map.neighbors)
@@ -180,7 +202,9 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
         upload(gradients_, map.gradients, "reference gradients");
         upload(hessians_, map.hessians, "reference Hessians");
         upload(weighted_differences_, map.weighted_differences, "reference weighted differences");
-        configureAdjoint(map);
+        if (map.build_adjoint)
+            configureAdjoint(map);
+        has_adjoint_ = map.build_adjoint;
         particle_count_ = map.particle_count;
         rows_ = rows;
         use_origins_ = !map.origins.empty();
@@ -220,11 +244,34 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
         download(result, result_, "spatial derivative results");
     }
 
+    void evaluateChannelGradients(const std::vector<double> &particles, std::size_t channels,
+                                  std::vector<ParticleVector3> &result) override
+    {
+        constexpr auto maximum = std::numeric_limits<std::size_t>::max();
+        if (!configured_ || channels == 0 || particle_count_ > maximum / channels ||
+            particles.size() != particle_count_ * channels)
+            throw std::invalid_argument("Channel field does not match the spatial derivative stencil");
+        if (rows_ > maximum / channels)
+            throw std::length_error("Spatial derivative channel result exceeds its index range");
+        const auto entries = rows_ * channels;
+        const auto blocks = grid(entries, 1);
+        result.resize(entries);
+        if (entries == 0)
+            return;
+        upload(channel_field_, particles, "spatial derivative channels");
+        channel_gradients_.reserve(entries);
+        const auto *origins = use_origins_ ? origins_.get() : nullptr;
+        evaluateChannelGradientsKernel<<<blocks, threads>>>(offsets_.get(), neighbors_.get(), origins,
+            gradients_.get(), channel_field_.get(), channels, entries, channel_gradients_.get());
+        check(cudaGetLastError(), "spatial derivative channel evaluation");
+        download(result, channel_gradients_, "spatial derivative channel results");
+    }
+
     void assembleAdjoint(const std::vector<SpatialDerivatives3> &coefficients,
                          std::vector<ParticleVector3> &result) override
     {
-        if (!configured_ || coefficients.size() != rows_)
-            throw std::invalid_argument("Coefficient field does not match the spatial derivative stencil");
+        if (!configured_ || !has_adjoint_ || coefficients.size() != rows_)
+            throw std::invalid_argument("Coefficient field does not match an adjoint stencil");
         result.resize(particle_count_);
         if (particle_count_ == 0)
             return;
@@ -245,9 +292,13 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
   private:
     static constexpr unsigned int threads = 128;
 
-    unsigned int grid(std::size_t sites) const
+    unsigned int grid(std::size_t sites, std::size_t components = 3) const
     {
-        const std::size_t blocks = (sites * 3 + threads - 1) / threads;
+        if (sites == 0)
+            return 0;
+        if (sites > std::numeric_limits<std::size_t>::max() / components)
+            throw std::length_error("Spatial derivative batch exceeds its index range");
+        const std::size_t blocks = (sites * components - 1) / threads + 1;
         if (blocks > max_blocks_)
             throw std::length_error("Spatial derivative batch exceeds the device grid");
         return static_cast<unsigned int>(blocks);
@@ -309,8 +360,10 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
 
     std::size_t particle_count_ = 0, rows_ = 0, max_blocks_ = 0;
     bool use_origins_ = false, use_hessians_ = false, add_identity_ = false, configured_ = false;
+    bool has_adjoint_ = false;
     DeviceBuffer<std::size_t> offsets_, neighbors_, origins_;
-    DeviceBuffer<ParticleVector3> gradients_, particles_;
+    DeviceBuffer<ParticleVector3> gradients_, particles_, channel_gradients_;
+    DeviceBuffer<double> channel_field_;
     DeviceBuffer<ShapeHessian3> hessians_;
     DeviceBuffer<SpatialDerivatives3> result_, adjoint_coefficients_;
     DeviceBuffer<std::size_t> adjoint_offsets_;

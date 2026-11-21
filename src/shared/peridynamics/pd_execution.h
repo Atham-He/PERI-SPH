@@ -4,6 +4,7 @@
 #include "pd_bonded_interface_batch.h"
 #include "pd_crack_projection.h"
 #include "pd_fluid_acoustic_batch.h"
+#include "pd_fluid_cfl_batch.h"
 #include "pd_fluid_traction_batch.h"
 #include "pd_fluid_viscosity_batch.h"
 #include "pd_solid_time_step.h"
@@ -47,6 +48,7 @@ class PeriExecution
     std::unique_ptr<FluidTractionBatch> makeFluidTraction() const;
     std::unique_ptr<FluidAcousticBatch> makeFluidAcoustic() const;
     std::unique_ptr<FluidViscosityBatch> makeFluidViscosity() const;
+    std::unique_ptr<FluidCflBatch> makeFluidCfl() const;
 
   private:
     PeriExecutionMode mode_;

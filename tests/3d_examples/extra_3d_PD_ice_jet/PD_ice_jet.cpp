@@ -11,6 +11,7 @@
  * while the reference case relaxes and reloads them.
  */
 #include "sphinxsys.h"
+#include "pd_fluid_time_step.h"
 using namespace SPH;
 
 // general parameters for geometry
@@ -170,8 +171,11 @@ int main(int ac, char *av[]) try
     Dynamics1Level<fluid_dynamics::Integration1stHalfWithWallRiemann> pressure_relaxation(water_block_inner, water_plate_contact);
     Dynamics1Level<fluid_dynamics::Integration2ndHalfWithWallRiemann> density_relaxation(water_block_inner, water_plate_contact);
     InteractionWithUpdate<fluid_dynamics::DensitySummationComplexFreeSurface> update_density_by_summation(water_block_inner, water_plate_contact);
-    ReduceDynamics<fluid_dynamics::AdvectionTimeStep> get_fluid_advection_time_step_size(water_block, U_f);
-    ReduceDynamics<fluid_dynamics::AcousticTimeStep> get_fluid_time_step_size(water_block, 0.06);
+    auto fluid_cfl = execution.makeFluidCfl();
+    fluid_dynamics::FluidAdvectionTimeStepExecution<fluid_dynamics::AdvectionTimeStep>
+        get_fluid_advection_time_step_size(water_block, fluid_cfl.get(), U_f);
+    fluid_dynamics::FluidAcousticTimeStepExecution get_fluid_time_step_size(water_block, fluid_cfl.get(), 0.06);
+    std::cout << "Fluid CFL backend " << (fluid_cfl ? "cuda_fp64" : "cpu_fp64") << std::endl;
     /** velocity divergence on the fluid side (after the 2nd half step).
      * Note: must be constructed before the acoustic damper,
      * which retrieves the registered VelocityDivergence variable. */

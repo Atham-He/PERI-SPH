@@ -122,4 +122,13 @@ std::unique_ptr<FluidViscosityBatch> PeriExecution::makeFluidViscosity() const
 #endif
     return nullptr;
 }
+
+std::unique_ptr<FluidCflBatch> PeriExecution::makeFluidCfl() const
+{
+#if defined(PERI_SPH_HAS_CUDA)
+    if (mode_ == PeriExecutionMode::GPU)
+        return makeCudaFluidCfl();
+#endif
+    return nullptr;
+}
 }

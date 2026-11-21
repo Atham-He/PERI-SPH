@@ -4,6 +4,7 @@
  */
 #include <optional>
 #include "sphinxsys.h"
+#include "pd_fluid_time_step.h"
 #include "pd_case_config.h"
 #include "pd_checkpoint.h"
 #include <regex>
@@ -196,8 +197,11 @@ int main(int argc, char **argv)
     std::cout << "Fluid viscosity backend " << (viscosity_backend ? "cuda_fp64" : "cpu_fp64") << std::endl;
     SimpleDynamics<fluid_dynamics::ContinuumVolumeUpdate> update_fluid_volume(liquid);
     SimpleDynamics<peridynamics::FluidKineticWork> fluid_work(liquid);
-    ReduceDynamics<fluid_dynamics::AdvectionViscousTimeStep> advection_step(liquid, U_ref);
-    ReduceDynamics<fluid_dynamics::AcousticTimeStep> acoustic_step(liquid, acoustic_cfl);
+    auto fluid_cfl = execution->makeFluidCfl();
+    fluid_dynamics::FluidAdvectionTimeStepExecution<fluid_dynamics::AdvectionViscousTimeStep>
+        advection_step(liquid, fluid_cfl.get(), U_ref);
+    fluid_dynamics::FluidAcousticTimeStepExecution acoustic_step(liquid, fluid_cfl.get(), acoustic_cfl);
+    std::cout << "Fluid CFL backend " << (fluid_cfl ? "cuda_fp64" : "cpu_fp64") << std::endl;
     SimpleDynamics<GravityForce<Gravity>> fluid_gravity(liquid, Gravity(Vecd(0, -gravity_g, 0)));
     SimpleDynamics<solid_dynamics::PDTimeStepInitialization> initialize_shell(shell, makeShared<Gravity>(Vecd(0, -gravity_g, 0)));
     InteractionDynamics<fluid_dynamics::VelocityDivergenceInner> divergence(fluid_inner);

@@ -241,13 +241,13 @@ int main(int argc, char **argv)
     auto pd_time_integration = execution->makePositionVerlet();
     solid_dynamics::NosbPDStepWithExecution<solid_dynamics::NosbPDFirstStep> first(shell, pd_time_integration.get());
     std::cout << "NOSB-PD position Verlet backend " << (pd_time_integration ? "cuda_fp64" : "cpu_fp64") << std::endl;
-    auto pd_deformation = material_options.isViscoelastic() ? nullptr : execution->makeNosbPDDeformation();
-    std::cout << "NOSB-PD deformation backend " << (pd_deformation ? "cuda_fp64" : "cpu_fp64") << std::endl;
-    auto constitutive = peridynamics::makePDConstitutiveDynamics(shell_inner, std::move(pd_deformation));
+    solid_dynamics::NosbPDBondWorkspace pd_bonds(shell_inner, execution->makeNosbPDBonds());
+    std::cout << "NOSB-PD internal force backend " << (pd_bonds.onDevice() ? "cuda_fp64" : "cpu_fp64") << std::endl;
+    auto constitutive = peridynamics::makePDConstitutiveDynamics(shell_inner, &pd_bonds);
     auto fracture = peridynamics::makePDFracture(shell_inner, material_options, fracture_options);
     InteractionDynamics<solid_dynamics::LittleWoodHourGlassControl> hourglass(shell_inner, hourglass_coefficient, hourglass_damage_cutoff);
     InteractionDynamics<solid_dynamics::PairNumericalDampingforPD> pd_damping(shell_inner);
-    InteractionDynamics<solid_dynamics::NosbPDThirdStep> third(shell_inner);
+    solid_dynamics::NosbPDInternalForceWithExecution third(pd_bonds);
     solid_dynamics::NosbPDStepWithExecution<solid_dynamics::NosbPDFourthStep> fourth(shell, pd_time_integration.get());
     ReduceDynamics<solid_dynamics::PDTimeStep> shell_step(shell, pd_cfl);
     SimpleDynamics<solid_dynamics::UpdateElasticNormalDirection> update_normals(shell);

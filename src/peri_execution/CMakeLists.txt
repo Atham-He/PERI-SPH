@@ -15,7 +15,7 @@ if(PERI_SPH_ENABLE_CUDA)
         "${PERI_EXECUTION_HEADERS}/pd_spatial_derivatives_cuda.cu"
         dpc_point_cuda.cu
         pd_solid_time_step_cuda.cu
-        pd_nosb_deformation_cuda.cu
+        pd_nosb_bond_cuda.cu
         pd_fluid_traction_cuda.cu
         pd_fluid_acoustic_cuda.cu
         pd_fluid_viscosity_cuda.cu

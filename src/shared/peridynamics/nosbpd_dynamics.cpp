@@ -94,6 +94,15 @@ Vecd unpackPDVector(const peridynamics::ParticleVector3 &value)
     return result;
 }
 
+peridynamics::ShapeHessian3 packNosbPDTensor(const Matd &value)
+{
+    peridynamics::ShapeHessian3 tensor{};
+    for (int i = 0; i < Dimensions; ++i)
+        for (int j = 0; j < Dimensions; ++j)
+            tensor.derivative[i][j] = value(i, j);
+    return tensor;
+}
+
 Matd unpackNosbPDTensor(const peridynamics::ShapeHessian3 &tensor)
 {
     Matd result;
@@ -156,7 +165,7 @@ void NosbPDFirstStep::evaluateDevice(peridynamics::PositionVerletBatch &backend,
         pos_[i] = unpackPDVector(device_output_[i]);
 }
 //=================================================================================================//
-void NosbPDDeformationWorkspace::configure(std::size_t count, std::size_t bound)
+void NosbPDBondWorkspace::configure(std::size_t count, std::size_t bound)
 {
     using namespace peridynamics;
     const auto missing = std::numeric_limits<std::size_t>::max();
@@ -194,14 +203,26 @@ void NosbPDDeformationWorkspace::configure(std::size_t count, std::size_t bound)
     bound_ = bound;
 }
 
-void NosbPDDeformationWorkspace::evaluate(Real dt, Matd *full, Matd *increment, Matd *midpoint)
+void NosbPDBondWorkspace::refreshLiveBonds(std::size_t count, std::size_t bound)
 {
-    auto &particles = relation_.getSPHBody().getBaseParticles();
-    const auto count = particles.TotalRealParticles();
-    const auto bound = particles.ParticlesBound();
     // Pack the frozen geometry on first use, after checkpoint restore.
     if (offsets_.size() != count + 1 || bound_ != bound)
         configure(count, bound);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        const auto &row = relation_.inner_configuration_[i];
+        if (row.current_size_ != offsets_[i + 1] - offsets_[i])
+            throw std::logic_error("NOSB-PD reference row changed after bond workspace initialization");
+        for (std::size_t n = 0; n < row.current_size_; ++n)
+            bond_live_[offsets_[i] + n] = row.bondLive_[n];
+    }
+}
+
+void NosbPDBondWorkspace::evaluateDeformation(Real dt, Matd *full, Matd *increment, Matd *midpoint)
+{
+    auto &particles = relation_.getSPHBody().getBaseParticles();
+    const auto count = particles.TotalRealParticles();
+    refreshLiveBonds(count, particles.ParticlesBound());
     const auto *position = particles.getVariableDataByName<Vecd>("Position");
     const auto *velocity = particles.getVariableDataByName<Vecd>("Velocity");
     const auto *volume = particles.getVariableDataByName<Real>("VolumetricMeasure");
@@ -209,21 +230,14 @@ void NosbPDDeformationWorkspace::evaluate(Real dt, Matd *full, Matd *increment, 
 
     sites_.resize(count + ghost_sources_.size());
     for (std::size_t i = 0; i < count; ++i)
-    {
         sites_[i] = {packPDVector(position[i]), packPDVector(velocity[i]), volume[i], active[i] == 1};
-        const auto &row = relation_.inner_configuration_[i];
-        if (row.current_size_ != offsets_[i + 1] - offsets_[i])
-            throw std::logic_error("NOSB-PD reference row changed after deformation workspace initialization");
-        for (std::size_t n = 0; n < row.current_size_; ++n)
-            bond_live_[offsets_[i] + n] = row.bondLive_[n];
-    }
     for (std::size_t n = 0; n < ghost_sources_.size(); ++n)
     {
         const auto j = ghost_sources_[n];
         sites_[count + n] = {packPDVector(position[j]), packPDVector(velocity[j]), volume[j], false};
     }
 
-    backend_->evaluate(sites_, bond_live_, dt, tensors_);
+    backend_->evaluateDeformation(sites_, bond_live_, dt, tensors_);
     for (std::size_t i = 0; i < count; ++i)
     {
         if (active[i] != 1)
@@ -231,6 +245,36 @@ void NosbPDDeformationWorkspace::evaluate(Real dt, Matd *full, Matd *increment, 
         full[i] = unpackNosbPDTensor(tensors_[i].full);
         increment[i] = unpackNosbPDTensor(tensors_[i].increment);
         midpoint[i] = unpackNosbPDTensor(tensors_[i].midpoint);
+    }
+}
+
+void NosbPDBondWorkspace::evaluateInternalForce(Real reference_density, Vecd *acceleration, Vecd *force)
+{
+    auto &particles = relation_.getSPHBody().getBaseParticles();
+    const auto count = particles.TotalRealParticles();
+    refreshLiveBonds(count, particles.ParticlesBound());
+    const auto *volume = particles.getVariableDataByName<Real>("VolumetricMeasure");
+    const auto *active = particles.getVariableDataByName<int>("ParticleLive");
+    const auto *force_state = particles.getVariableDataByName<Matd>("PDForceStateT0");
+
+    force_sites_.resize(count + ghost_sources_.size());
+    for (std::size_t i = 0; i < count; ++i)
+        force_sites_[i] = {packNosbPDTensor(force_state[i]), volume[i], active[i] == 1};
+    for (std::size_t n = 0; n < ghost_sources_.size(); ++n)
+    {
+        const auto j = ghost_sources_[n];
+        force_sites_[count + n] = {packNosbPDTensor(force_state[j]), volume[j], false};
+    }
+
+    backend_->assembleInternalForce(force_sites_, bond_live_, force_density_);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        force[i].setZero();
+        if (active[i] != 1)
+            continue;
+        const auto density = unpackPDVector(force_density_[i]);
+        acceleration[i] += density / reference_density;
+        force[i] = density * volume[i];
     }
 }
 

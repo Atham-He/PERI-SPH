@@ -29,7 +29,7 @@
 
 #include <Eigen/Eigenvalues>
 
-#include "pd_nosb_deformation_batch.h"
+#include "pd_nosb_bond_batch.h"
 #include "pd_solid_time_step.h"
 #include "dynamics_algorithms.h"
 
@@ -153,24 +153,29 @@ class NosbPDSecondStepPlastic : public LocalDynamics, public DataDelegateInner
     Real *plastic_work_;
 };
 
-class NosbPDDeformationWorkspace
+class NosbPDBondWorkspace
 {
   public:
-    NosbPDDeformationWorkspace(BaseInnerRelation &relation, std::unique_ptr<peridynamics::NosbPDDeformationBatch> backend)
+    NosbPDBondWorkspace(BaseInnerRelation &relation, std::unique_ptr<peridynamics::NosbPDBondBatch> backend)
         : relation_(relation), backend_(std::move(backend)) {}
 
     bool onDevice() const { return static_cast<bool>(backend_); }
-    void evaluate(Real dt, Matd *full, Matd *increment, Matd *midpoint);
+    BaseInnerRelation &relation() const { return relation_; }
+    void evaluateDeformation(Real dt, Matd *full, Matd *increment, Matd *midpoint);
+    void evaluateInternalForce(Real reference_density, Vecd *acceleration, Vecd *force);
 
   private:
     void configure(std::size_t count, std::size_t bound);
+    void refreshLiveBonds(std::size_t count, std::size_t bound);
 
     BaseInnerRelation &relation_;
-    std::unique_ptr<peridynamics::NosbPDDeformationBatch> backend_;
+    std::unique_ptr<peridynamics::NosbPDBondBatch> backend_;
     std::vector<std::size_t> offsets_, ghost_sources_;
     std::vector<peridynamics::NosbPDKinematicSite> sites_;
+    std::vector<peridynamics::NosbPDForceSite> force_sites_;
     std::vector<std::uint8_t> bond_live_;
     std::vector<peridynamics::NosbPDDeformationTensors> tensors_;
+    std::vector<peridynamics::ParticleVector3> force_density_;
     std::size_t bound_ = 0;
 };
 
@@ -180,22 +185,25 @@ class NosbPDDeformationWithExecution : public InteractionWithUpdate<Stage>
     using Base = InteractionWithUpdate<Stage>;
 
   public:
-    NosbPDDeformationWithExecution(BaseInnerRelation &relation,
-                                   std::unique_ptr<peridynamics::NosbPDDeformationBatch> backend)
-        : Base(relation), workspace_(relation, std::move(backend)) {}
+    NosbPDDeformationWithExecution(BaseInnerRelation &relation, NosbPDBondWorkspace *workspace)
+        : Base(relation), workspace_(workspace)
+    {
+        if (workspace && &workspace->relation() != &relation)
+            throw std::invalid_argument("NOSB-PD deformation workspace must use the same reference relation");
+    }
 
-    bool onDevice() const { return workspace_.onDevice(); }
+    bool onDevice() const { return workspace_ && workspace_->onDevice(); }
 
     void runMainStep(Real dt) override
     {
-        if (workspace_.onDevice())
-            workspace_.evaluate(dt, this->N_, this->N_deltaU_, this->N_half_);
+        if (onDevice())
+            workspace_->evaluateDeformation(dt, this->N_, this->N_deltaU_, this->N_half_);
         else
             Base::runMainStep(dt);
     }
 
   private:
-    NosbPDDeformationWorkspace workspace_;
+    NosbPDBondWorkspace *workspace_;
 };
 
 /**
@@ -307,6 +315,26 @@ class NosbPDThirdStep : public LocalDynamics, public DataDelegateInner
     Real *Vol_;
     Vecd *acc_, *internal_force_;
     Matd *T0_;
+};
+
+class NosbPDInternalForceWithExecution : public InteractionDynamics<NosbPDThirdStep>
+{
+    using Base = InteractionDynamics<NosbPDThirdStep>;
+
+  public:
+    explicit NosbPDInternalForceWithExecution(NosbPDBondWorkspace &workspace)
+        : Base(workspace.relation()), workspace_(workspace) {}
+
+    void runMainStep(Real dt) override
+    {
+        if (workspace_.onDevice())
+            workspace_.evaluateInternalForce(rho0_, acc_, internal_force_);
+        else
+            Base::runMainStep(dt);
+    }
+
+  private:
+    NosbPDBondWorkspace &workspace_;
 };
 
 /**

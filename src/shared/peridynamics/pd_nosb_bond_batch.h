@@ -20,23 +20,33 @@ struct NosbPDKinematicSite
     bool active;
 };
 
+struct NosbPDForceSite
+{
+    ShapeHessian3 force_state;
+    double volume;
+    bool active;
+};
+
 struct NosbPDDeformationTensors
 {
     ShapeHessian3 full, increment, midpoint;
 };
 
-class NosbPDDeformationBatch
+class NosbPDBondBatch
 {
   public:
-    virtual ~NosbPDDeformationBatch() = default;
+    virtual ~NosbPDBondBatch() = default;
     // Each offset row is a real particle, followed by optional referenced
     // ghosts in the separate site field. Bonds retain the CPU neighbor order.
     virtual void configure(std::size_t sites, const std::vector<std::size_t> &offsets,
                            const std::vector<NosbPDBondGeometry> &bonds) = 0;
-    virtual void evaluate(const std::vector<NosbPDKinematicSite> &sites,
+    virtual void evaluateDeformation(const std::vector<NosbPDKinematicSite> &sites,
                           const std::vector<std::uint8_t> &bond_live, double dt,
-                          std::vector<NosbPDDeformationTensors> &tensors) = 0;
+                                     std::vector<NosbPDDeformationTensors> &tensors) = 0;
+    virtual void assembleInternalForce(const std::vector<NosbPDForceSite> &sites,
+                                       const std::vector<std::uint8_t> &bond_live,
+                                       std::vector<ParticleVector3> &force_density) = 0;
 };
 
-std::unique_ptr<NosbPDDeformationBatch> makeCudaNosbPDDeformation();
+std::unique_ptr<NosbPDBondBatch> makeCudaNosbPDBonds();
 }

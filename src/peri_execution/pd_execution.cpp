@@ -103,11 +103,11 @@ std::unique_ptr<SolidTimeStepBatch> PeriExecution::makeSolidTimeStep(const std::
     return nullptr;
 }
 
-std::unique_ptr<NosbPDDeformationBatch> PeriExecution::makeNosbPDDeformation() const
+std::unique_ptr<NosbPDBondBatch> PeriExecution::makeNosbPDBonds() const
 {
 #if defined(PERI_SPH_HAS_CUDA)
     if (mode_ == PeriExecutionMode::GPU)
-        return makeCudaNosbPDDeformation();
+        return makeCudaNosbPDBonds();
 #endif
     return nullptr;
 }

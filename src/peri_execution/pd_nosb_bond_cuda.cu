@@ -1,4 +1,4 @@
-#include "pd_nosb_deformation_batch.h"
+#include "pd_nosb_bond_batch.h"
 #include "pd_cuda_buffer.cuh"
 
 #include <algorithm>
@@ -56,10 +56,46 @@ __global__ void evaluateBondTensors(const std::size_t *offsets, const NosbPDBond
     }
 }
 
-class CudaNosbPDDeformation final : public NosbPDDeformationBatch
+__device__ double projectBond(const ShapeHessian3 &state, std::size_t axis, double weight,
+                              const ParticleVector3 &reference, double sign)
+{
+    const auto &row = state.derivative[axis];
+    return (weight * row[0]) * (sign * reference.component[0]) +
+        ((weight * row[1]) * (sign * reference.component[1]) +
+         (weight * row[2]) * (sign * reference.component[2]));
+}
+
+__global__ void assembleInternalBondForce(const std::size_t *offsets, const NosbPDBondGeometry *bonds,
+                                          const NosbPDForceSite *sites, const std::uint8_t *live,
+                                          std::size_t rows, ParticleVector3 *force_density)
+{
+    const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const auto i = index / 3;
+    const auto axis = index % 3;
+    if (i >= rows)
+        return;
+
+    const auto &source = sites[i];
+    double force = 0.0;
+    const auto end = source.active ? offsets[i + 1] : offsets[i];
+    for (auto entry = offsets[i]; entry < end; ++entry)
+    {
+        if (!live[entry])
+            continue;
+
+        const auto &bond = bonds[entry];
+        const auto &target = sites[bond.particle];
+        const double from = projectBond(source.force_state, axis, bond.kernel_weight, bond.reference, 1.0);
+        const double to = projectBond(target.force_state, axis, bond.kernel_weight, bond.reference, -1.0);
+        force += (from - to) * target.volume;
+    }
+    force_density[i].component[axis] = force;
+}
+
+class CudaNosbPDBonds final : public NosbPDBondBatch
 {
   public:
-    CudaNosbPDDeformation()
+    CudaNosbPDBonds()
     {
         int device = 0, limit = 0;
         check(cudaGetDevice(&device), "select NOSB-PD deformation device");
@@ -86,11 +122,10 @@ class CudaNosbPDDeformation final : public NosbPDDeformationBatch
         configured_ = true;
     }
 
-    void evaluate(const std::vector<NosbPDKinematicSite> &sites, const std::vector<std::uint8_t> &bond_live,
+    void evaluateDeformation(const std::vector<NosbPDKinematicSite> &sites, const std::vector<std::uint8_t> &bond_live,
                   double dt, std::vector<NosbPDDeformationTensors> &tensors) override
     {
-        if (!configured_ || sites.size() != site_count_ || bond_live.size() != bond_count_)
-            throw std::invalid_argument("NOSB-PD deformation inputs do not match the reference stencil");
+        validate(sites.size(), bond_live.size());
         tensors.resize(rows_);
         if (rows_ == 0)
             return;
@@ -105,20 +140,47 @@ class CudaNosbPDDeformation final : public NosbPDDeformationBatch
         download(tensors, tensors_, "NOSB-PD deformation tensors");
     }
 
+    void assembleInternalForce(const std::vector<NosbPDForceSite> &sites,
+                               const std::vector<std::uint8_t> &bond_live,
+                               std::vector<ParticleVector3> &force_density) override
+    {
+        validate(sites.size(), bond_live.size());
+        force_density.resize(rows_);
+        if (rows_ == 0)
+            return;
+
+        const auto blocks = static_cast<unsigned>((3 * rows_ - 1) / threads_ + 1);
+        upload(force_sites_, sites, "NOSB-PD force sites");
+        upload(live_, bond_live, "NOSB-PD live bond flags before internal force");
+        force_density_.reserve(rows_);
+        assembleInternalBondForce<<<blocks, threads_>>>(offsets_.get(), bonds_.get(), force_sites_.get(),
+            live_.get(), rows_, force_density_.get());
+        check(cudaGetLastError(), "assemble NOSB-PD internal bond force");
+        download(force_density, force_density_, "NOSB-PD internal force density");
+    }
+
   private:
+    void validate(std::size_t sites, std::size_t bonds) const
+    {
+        if (!configured_ || sites != site_count_ || bonds != bond_count_)
+            throw std::invalid_argument("NOSB-PD inputs do not match the reference stencil");
+    }
+
     static constexpr unsigned threads_ = 128;
     std::size_t max_blocks_ = 0, rows_ = 0, site_count_ = 0, bond_count_ = 0;
     bool configured_ = false;
     DeviceBuffer<std::size_t> offsets_;
     DeviceBuffer<NosbPDBondGeometry> bonds_;
     DeviceBuffer<NosbPDKinematicSite> sites_;
+    DeviceBuffer<NosbPDForceSite> force_sites_;
+    DeviceBuffer<ParticleVector3> force_density_;
     DeviceBuffer<std::uint8_t> live_;
     DeviceBuffer<NosbPDDeformationTensors> tensors_;
 };
 }
 
-std::unique_ptr<NosbPDDeformationBatch> makeCudaNosbPDDeformation()
+std::unique_ptr<NosbPDBondBatch> makeCudaNosbPDBonds()
 {
-    return std::make_unique<CudaNosbPDDeformation>();
+    return std::make_unique<CudaNosbPDBonds>();
 }
 }

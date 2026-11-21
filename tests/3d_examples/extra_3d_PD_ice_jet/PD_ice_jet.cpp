@@ -205,12 +205,13 @@ int main(int ac, char *av[]) try
     solid_dynamics::NosbPDStepWithExecution<solid_dynamics::NosbPDFirstStep> nosbpd_first_step(plate, pd_time_integration.get());
     std::cout << "NOSB-PD position Verlet backend " << (pd_time_integration ? "cuda_fp64" : "cpu_fp64") << std::endl;
     InteractionDynamics<solid_dynamics::BondBreakBySigma1andSigma3> check_bond_live(plate_inner_relation, max_tension_stress, max_shear_stress);
+    solid_dynamics::NosbPDBondWorkspace pd_bonds(plate_inner_relation, execution.makeNosbPDBonds());
     solid_dynamics::NosbPDDeformationWithExecution<solid_dynamics::NosbPDSecondStepPlastic>
-        nosbpd_second_step_plastic(plate_inner_relation, execution.makeNosbPDDeformation());
-    std::cout << "NOSB-PD deformation backend " << (nosbpd_second_step_plastic.onDevice() ? "cuda_fp64" : "cpu_fp64") << std::endl;
+        nosbpd_second_step_plastic(plate_inner_relation, &pd_bonds);
+    std::cout << "NOSB-PD internal force backend " << (pd_bonds.onDevice() ? "cuda_fp64" : "cpu_fp64") << std::endl;
     InteractionDynamics<solid_dynamics::LittleWoodHourGlassControl> hourglass_control(plate_inner_relation);
     InteractionDynamics<solid_dynamics::PairNumericalDampingforPD> numerical_damping(plate_inner_relation);
-    InteractionDynamics<solid_dynamics::NosbPDThirdStep> nosbpd_third_step(plate_inner_relation);
+    solid_dynamics::NosbPDInternalForceWithExecution nosbpd_third_step(pd_bonds);
     solid_dynamics::NosbPDStepWithExecution<solid_dynamics::NosbPDFourthStep> nosbpd_fourth_step(plate, pd_time_integration.get());
     /** normal direction updated from the PD deformation gradient;
      * must be constructed after the NOSB-PD dynamics which register

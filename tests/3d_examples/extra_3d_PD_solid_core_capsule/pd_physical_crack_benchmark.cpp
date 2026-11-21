@@ -36,7 +36,19 @@ static void verifyFiniteCrackProjection(CrackProjectionBatch *backend)
     };
     std::vector<CrackProjectionResult> result;
     if (backend)
-        backend->project(points, result);
+    {
+        std::vector<CrackProjectionMaster> masters(points.size());
+        std::vector<CrackProjectionPoint> queries(points.size());
+        std::vector<CrackProjectionPair> pairs;
+        for (size_t i = 0; i < points.size(); ++i)
+        {
+            for (size_t a = 0; a < 4; ++a)
+                std::copy_n(points[i].coordinates[a], 3, masters[i].corners[a]);
+            std::copy_n(points[i].coordinates[4], 3, queries[i].position);
+            pairs.push_back({i, i});
+        }
+        backend->projectIndexed(masters, queries, pairs, result);
+    }
     else
         for (const auto &point : points)
             result.push_back(projectCrackContact(point));

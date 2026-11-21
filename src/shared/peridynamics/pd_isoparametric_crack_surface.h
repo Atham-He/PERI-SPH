@@ -56,7 +56,11 @@ class BilinearCrackSurface:public ReferenceSolidSurface {
  */
 class CrackSurfaceContactNetwork {
     CrackProjectionBatch *projection_batch_;
-    std::vector<CrackProjectionInput> projection_inputs_;
+    std::vector<CrackProjectionMaster> projection_masters_;
+    std::vector<CrackProjectionPoint> projection_points_;
+    std::vector<Vecd> projection_velocities_;
+    std::vector<size_t> projection_point_offsets_;
+    std::vector<CrackProjectionPair> projection_pairs_;
     std::vector<CrackProjectionResult> projection_results_;
 
     struct ContactPoint

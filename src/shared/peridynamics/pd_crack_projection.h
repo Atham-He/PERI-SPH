@@ -2,6 +2,7 @@
 
 #include "pd_particle_trace_map.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
@@ -13,6 +14,22 @@ struct CrackProjectionInput
 {
     // Four master corners, followed by the slave point.
     double coordinates[5][3];
+};
+
+// Current geometry is shared by every candidate referring to that face or point.
+struct CrackProjectionMaster
+{
+    double corners[4][3];
+};
+
+struct CrackProjectionPoint
+{
+    double position[3];
+};
+
+struct CrackProjectionPair
+{
+    std::size_t master, point;
 };
 
 struct CrackProjectionResult
@@ -58,6 +75,23 @@ class CrackProjectionBatch
     virtual ~CrackProjectionBatch() = default;
     virtual void project(const std::vector<CrackProjectionInput> &input,
                          std::vector<CrackProjectionResult> &output) = 0;
+    virtual void projectIndexed(const std::vector<CrackProjectionMaster> &masters,
+                                const std::vector<CrackProjectionPoint> &points,
+                                const std::vector<CrackProjectionPair> &pairs,
+                                std::vector<CrackProjectionResult> &output)
+    {
+        // Keep projection-only implementations compatible with indexed callers.
+        std::vector<CrackProjectionInput> input(pairs.size());
+        for (std::size_t i = 0; i < pairs.size(); ++i)
+        {
+            const auto &master = masters.at(pairs[i].master);
+            const auto &point = points.at(pairs[i].point);
+            for (std::size_t corner = 0; corner < 4; ++corner)
+                std::copy_n(master.corners[corner], 3, input[i].coordinates[corner]);
+            std::copy_n(point.position, 3, input[i].coordinates[4]);
+        }
+        project(input, output);
+    }
     virtual bool assemblesLocalContact() const noexcept { return false; }
     virtual void assembleLocalContact(const std::vector<CrackLocalContactInput> &,
                                       std::vector<CrackLocalContactResult> &)

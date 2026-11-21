@@ -16,9 +16,17 @@ using cuda_detail::upload;
 
 using crack_projection_detail::Vector3;
 
-__global__ void projectBatch(const CrackProjectionInput *in, CrackProjectionResult *out,std::size_t n) {
-    const std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = projectCrackContact(in[i]);
+__global__ void projectBatch(const CrackProjectionInput *packed,
+                             const CrackProjectionMaster *masters, const CrackProjectionPoint *points,
+                             const CrackProjectionPair *pairs, CrackProjectionResult *out, std::size_t count)
+{
+    const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count)
+        return;
+
+    const auto *corners = pairs ? masters[pairs[i].master].corners : packed[i].coordinates;
+    const auto &point = pairs ? points[pairs[i].point].position : packed[i].coordinates[4];
+    out[i] = projectCrackContact(corners, point);
 }
 
 __device__ Vector3 loadVector(const double (&x)[3])
@@ -186,10 +194,33 @@ class CudaCrackProjection final : public CrackProjectionBatch
         output_.reserve(count);
         check(cudaMemcpy(input_.get(), input.data(), count * sizeof(input[0]),
                          cudaMemcpyHostToDevice), "input transfer");
-        projectBatch<<<blocks, threads>>>(input_.get(), output_.get(), count);
+        projectBatch<<<blocks, threads>>>(input_.get(), nullptr, nullptr, nullptr, output_.get(), count);
         check(cudaGetLastError(), "kernel launch");
         check(cudaMemcpy(output.data(), output_.get(), count * sizeof(output[0]),
                          cudaMemcpyDeviceToHost), "output transfer");
+    }
+
+    void projectIndexed(const std::vector<CrackProjectionMaster> &masters,
+                        const std::vector<CrackProjectionPoint> &points,
+                        const std::vector<CrackProjectionPair> &pairs,
+                        std::vector<CrackProjectionResult> &output) override
+    {
+        for (const auto &pair : pairs)
+            if (pair.master >= masters.size() || pair.point >= points.size())
+                throw std::out_of_range("Crack projection pair refers to missing geometry");
+        output.resize(pairs.size());
+        if (pairs.empty())
+            return;
+
+        const auto blocks = grid(pairs.size());
+        upload(masters_, masters, "crack projection master faces");
+        upload(points_, points, "crack projection integration points");
+        upload(pairs_, pairs, "crack projection candidate pairs");
+        output_.reserve(pairs.size());
+        projectBatch<<<blocks, threads>>>(nullptr, masters_.get(), points_.get(), pairs_.get(),
+                                         output_.get(), pairs.size());
+        check(cudaGetLastError(), "project indexed crack faces");
+        download(output, output_, "indexed crack projection results");
     }
 
     bool assemblesLocalContact() const noexcept override { return assemble_local_contact_; }
@@ -304,6 +335,9 @@ class CudaCrackProjection final : public CrackProjectionBatch
     bool assemble_local_contact_;
     cudaDeviceProp properties_{};
     DeviceBuffer<CrackProjectionInput> input_;
+    DeviceBuffer<CrackProjectionMaster> masters_;
+    DeviceBuffer<CrackProjectionPoint> points_;
+    DeviceBuffer<CrackProjectionPair> pairs_;
     DeviceBuffer<CrackProjectionResult> output_;
     DeviceBuffer<CrackLocalContactInput> contact_input_;
     DeviceBuffer<CrackLocalContactResult> contact_output_;

@@ -289,19 +289,24 @@ SPH_CRACK_HOST_DEVICE inline CrackProjectionResult findRulingStationaryFeet(cons
  * A boundary minimum caused by clamping an out-of-face point is not a
  * face contact in this law. Reference quadrature uses its own inversion.
  */
-SPH_CRACK_HOST_DEVICE inline CrackProjectionResult projectCrackContact(const CrackProjectionInput &input)
+SPH_CRACK_HOST_DEVICE inline CrackProjectionResult projectCrackContact(const double (*corners)[3],
+                                                                      const double (&point)[3])
 {
     using namespace crack_projection_detail;
-    for (int i = 0; i < 5; ++i)
-        for (int d = 0; d < 3; ++d)
-            if (!std::isfinite(input.coordinates[i][d]))
+    for (int d = 0; d < 3; ++d)
+    {
+        if (!std::isfinite(point[d]))
+            return {0, 0, CrackProjectionResult::InvalidGeometry};
+        for (int i = 0; i < 4; ++i)
+            if (!std::isfinite(corners[i][d]))
                 return {0, 0, CrackProjectionResult::InvalidGeometry};
-    const auto &x = input.coordinates;
+    }
+    const auto &x = corners;
     const Vector3 origin{x[0][0], x[0][1], x[0][2]};
     const Vector3 u = Vector3{x[1][0], x[1][1], x[1][2]}-origin;
     const Vector3 diagonal = Vector3{x[2][0], x[2][1], x[2][2]}-origin;
     const Vector3 v = Vector3{x[3][0], x[3][1], x[3][2]}-origin;
-    const Face face{u, v, (diagonal-v)-u, Vector3{x[4][0], x[4][1], x[4][2]}-origin};
+    const Face face{u, v, (diagonal-v)-u, Vector3{point[0], point[1], point[2]}-origin};
     const double scale = std::fmax(u.norm(), std::fmax(v.norm(), face.warp.norm()));
     if (!(scale > 0) || !std::isfinite(scale) || !std::isfinite(face.query.norm()))
         return {0, 0, CrackProjectionResult::InvalidGeometry};
@@ -318,6 +323,11 @@ SPH_CRACK_HOST_DEVICE inline CrackProjectionResult projectCrackContact(const Cra
     const double inv = 1/scale;
     return findRulingStationaryFeet({u*inv, v*inv, face.warp*inv, face.query*inv});
 }
+SPH_CRACK_HOST_DEVICE inline CrackProjectionResult projectCrackContact(const CrackProjectionInput &input)
+{
+    return projectCrackContact(input.coordinates, input.coordinates[4]);
+}
+
 }
 
 #undef SPH_CRACK_HOST_DEVICE

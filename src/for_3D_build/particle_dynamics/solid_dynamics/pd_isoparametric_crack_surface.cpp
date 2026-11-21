@@ -110,44 +110,40 @@ void CrackSurfaceContactNetwork::apply(){
         for(size_t a=0;a<4;++a){s.kinematics(a,masters[m].x[a],masters[m].v[a]);lo=lo.cwiseMin(masters[m].x[a]);hi=hi.cwiseMax(masters[m].x[a]);}Real margin=std::max(2*spacing,(hi-lo).norm());Cell a=cell(lo-Vecd::Constant(margin)),b=cell(hi+Vecd::Constant(margin));
         for(long long i=a[0];i<=b[0];++i)for(long long j=a[1];j<=b[1];++j)for(long long k=a[2];k<=b[2];++k)grid[{i,j,k}].push_back(m);
     }
-    const auto projectionInput = [&](size_t master, const Vecd &point)
+    if (projection_batch_)
     {
-        CrackProjectionInput input;
-        for (size_t a = 0; a < 4; ++a)
-            std::copy_n(masters[master].x[a].data(), 3, input.coordinates[a]);
-        std::copy_n(point.data(), 3, input.coordinates[4]);
-        return input;
-    };
-    // Use the grid and the existing master order on both execution paths.
-    // Projection is independent of contact force assembly and trace scattering.
-    size_t next_projection=0;
-    if(projection_batch_){
-        projection_inputs_.clear();
-        for(size_t si=0;si<sides.size();++si){
-            const auto&slave=*sides[si].surface;
-            for(size_t q=0;q<slave.natural.size();++q){
-                Vecd x,v;
-                slave.kinematics(4+q,x,v);
-                const auto it=grid.find(cell(x));
-                if(it==grid.end())continue;
-                for(size_t m:it->second){
-                    if(m==si)continue;
-                    projection_inputs_.push_back(projectionInput(m, x));
-                }
+        projection_masters_.resize(masters.size());
+        for (size_t m = 0; m < masters.size(); ++m)
+            for (size_t a = 0; a < 4; ++a)
+                std::copy_n(masters[m].x[a].data(), 3, projection_masters_[m].corners[a]);
+
+        projection_points_.clear();
+        projection_velocities_.clear();
+        projection_point_offsets_.assign(1, 0);
+        projection_pairs_.clear();
+        for (size_t si = 0; si < sides.size(); ++si)
+        {
+            const auto &slave = *sides[si].surface;
+            for (size_t q = 0; q < slave.natural.size(); ++q)
+            {
+                Vecd x, v;
+                slave.kinematics(4 + q, x, v);
+                const auto sample = projection_points_.size();
+                projection_points_.push_back({{x[0], x[1], x[2]}});
+                projection_velocities_.push_back(v);
+
+                const auto candidates = grid.find(cell(x));
+                if (candidates != grid.end())
+                    for (size_t master : candidates->second)
+                        if (master != si)
+                            projection_pairs_.push_back({master, sample});
+                projection_point_offsets_.push_back(projection_pairs_.size());
             }
         }
-        projection_batch_->project(projection_inputs_,projection_results_);
-        if(projection_results_.size()!=projection_inputs_.size())
+        projection_batch_->projectIndexed(projection_masters_, projection_points_, projection_pairs_, projection_results_);
+        if (projection_results_.size() != projection_pairs_.size())
             throw std::logic_error("Crack projection backend returned an incomplete batch");
     }
-    const auto project = [&](size_t master, const Vecd &point)
-    {
-        const auto result = projection_batch_ ? projection_results_.at(next_projection++) :
-                                                projectCrackContact(projectionInput(master, point));
-        if (result.status != CrackProjectionResult::Accepted && result.status != CrackProjectionResult::Outside)
-            throw std::runtime_error("Crack contact surface has invalid geometry");
-        return result;
-    };
     using TraceRows = std::array<const ReferenceSolidSurface::Row *, 5>;
     using TraceWeights = std::array<Real, 5>;
     auto traceRows = [&](const ContactPoint &point) -> TraceRows
@@ -293,42 +289,46 @@ void CrackSurfaceContactNetwork::apply(){
     contact_inputs_.clear();
     device_contact_evaluations = host_contact_fallbacks = 0;
     device_trace_pullback = false;
+    size_t sample = 0;
     for (size_t si = 0; si < sides.size(); ++si)
     {
         auto &slave = *sides[si].surface;
-        for (size_t q = 0; q < slave.natural.size(); ++q)
+        for (size_t q = 0; q < slave.natural.size(); ++q, ++sample)
         {
             Vecd x, v;
-            slave.kinematics(4 + q, x, v);
+            if (projection_batch_)
+            {
+                const auto &p = projection_points_[sample].position;
+                x = Vecd(p[0], p[1], p[2]);
+                v = projection_velocities_[sample];
+            }
+            else
+                slave.kinematics(4 + q, x, v);
             const Vecd tangent_u = slave.position(slave.normalU(q)) - x;
             const Vecd tangent_v = slave.position(slave.normalV(q)) - x;
             const Vecd outward = sides[si].outward_sign * tangent_u.cross(tangent_v).normalized();
             if (!outward.allFinite())
                 throw std::runtime_error("Slave crack normal is unresolved");
-            const auto candidates = grid.find(cell(x));
-            if (candidates == grid.end())
-                continue;
 
             size_t chosen = sides.size();
             Real distance = std::numeric_limits<Real>::infinity(), gap = 0;
             BilinearCrackGeometry::Value selected;
             Vecd normal;
-            for (size_t master : candidates->second)
+            const auto consider = [&](size_t master, const CrackProjectionResult &p)
             {
-                if (master == si)
-                    continue;
-                const auto p = project(master, x);
                 if (p.status == CrackProjectionResult::Outside)
                 {
                     ++outside_projections;
-                    continue;
+                    return;
                 }
+                if (p.status != CrackProjectionResult::Accepted)
+                    throw std::runtime_error("Crack contact surface has invalid geometry");
                 const auto a = BilinearCrackGeometry::evaluate(masters[master].x, BilinearCrackGeometry::Param(p.s,p.t));
                 const Vecd n = sides[master].outward_sign * a.u.cross(a.v).normalized();
                 if (!n.allFinite())
                     throw std::runtime_error("Master crack normal is unresolved");
                 if (n.dot(outward) >= -1e-8)
-                    continue;
+                    return;
                 const Real g = n.dot(x - a.x);
                 if (std::abs(g) < distance)
                 {
@@ -337,6 +337,27 @@ void CrackSurfaceContactNetwork::apply(){
                     gap = g;
                     selected = a;
                     normal = n;
+                }
+            };
+            if (projection_batch_)
+            {
+                for (size_t i = projection_point_offsets_[sample]; i < projection_point_offsets_[sample + 1]; ++i)
+                    consider(projection_pairs_[i].master, projection_results_[i]);
+            }
+            else
+            {
+                const auto candidates = grid.find(cell(x));
+                if (candidates == grid.end())
+                    continue;
+                for (size_t master : candidates->second)
+                {
+                    if (master == si)
+                        continue;
+                    CrackProjectionInput input;
+                    for (size_t a = 0; a < 4; ++a)
+                        std::copy_n(masters[master].x[a].data(), 3, input.coordinates[a]);
+                    std::copy_n(x.data(), 3, input.coordinates[4]);
+                    consider(master, projectCrackContact(input));
                 }
             }
             if (chosen == sides.size())

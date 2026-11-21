@@ -63,7 +63,8 @@ inline PDConstitutiveDynamics makePDConstitutiveDynamics(
 }
 
 inline UniquePtr<BaseDynamics<void>> makePDFracture(BaseInnerRelation &relation,
-    const PDMaterialOptions &material, const PDFractureOptions &failure)
+    const PDMaterialOptions &material, const PDFractureOptions &failure,
+    solid_dynamics::NosbPDBondWorkspace *bond_workspace = nullptr)
 {
     failure.validate(material);
     auto &actual = relation.getSPHBody().getMatterMaterial();
@@ -77,17 +78,25 @@ inline UniquePtr<BaseDynamics<void>> makePDFracture(BaseInnerRelation &relation,
     if (dynamic_cast<GelViscoelasticSolid *>(&actual))
         throw std::invalid_argument("fracture assembly requires intact-bond compatible material dynamics");
     using namespace solid_dynamics;
+    using Law = NosbPDBondFailureLaw;
     if (failure.model == "principal_plastic_strain")
     {
         if (!dynamic_cast<PlasticSolidforPD *>(&actual))
             throw std::invalid_argument("plastic-strain fracture requires actual plastic material history");
-        return makeUnique<InteractionDynamics<BondBreakByPlasticStrain>>(relation, failure.plastic_strain_limit);
+        return makeUnique<NosbPDBondFractureWithExecution<BondBreakByPlasticStrain>>(relation, bond_workspace,
+            NosbPDBondFailureParameters{Law::PrincipalPlasticStrain, failure.plastic_strain_limit, 0, Dimensions},
+            failure.plastic_strain_limit);
     }
     if (failure.model == "principal_stress")
-        return makeUnique<InteractionDynamics<BondBreakByPrinStress>>(relation, failure.stress_limit);
+        return makeUnique<NosbPDBondFractureWithExecution<BondBreakByPrinStress>>(relation, bond_workspace,
+            NosbPDBondFailureParameters{Law::PrincipalStress, failure.stress_limit, 0, Dimensions}, failure.stress_limit);
     if (failure.model == "stress_shear")
-        return makeUnique<InteractionDynamics<BondBreakBySigma1andSigma3>>(relation, failure.stress_limit, failure.shear_limit);
-    return makeUnique<InteractionDynamics<BondBreakBySigma1andNorm1>>(relation, failure.stress_limit, failure.pressure_limit);
+        return makeUnique<NosbPDBondFractureWithExecution<BondBreakBySigma1andSigma3>>(relation, bond_workspace,
+            NosbPDBondFailureParameters{Law::StressShear, failure.stress_limit, failure.shear_limit, Dimensions},
+            failure.stress_limit, failure.shear_limit);
+    return makeUnique<NosbPDBondFractureWithExecution<BondBreakBySigma1andNorm1>>(relation, bond_workspace,
+        NosbPDBondFailureParameters{Law::StressPressure, failure.stress_limit, failure.pressure_limit, Dimensions},
+        failure.stress_limit, failure.pressure_limit);
 }
 } // namespace SPH::peridynamics
 #endif

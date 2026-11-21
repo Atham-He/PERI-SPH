@@ -2,6 +2,7 @@
 #include "pd_cuda_buffer.cuh"
 
 #include <algorithm>
+#include <cmath>
 
 namespace SPH::peridynamics
 {
@@ -199,6 +200,122 @@ __global__ void assembleCorrectionForce(const std::size_t *offsets, const NosbPD
     force[i] = row;
 }
 
+// Extreme eigenvalues of a finite symmetric tensor, scaled before forming
+// the characteristic invariants. The host resolves decisions near a limit.
+__device__ void principalExtremes(double (&matrix)[3][3], int dim, double scale,
+                                 double &minimum, double &maximum)
+{
+    if (scale == 0)
+    {
+        minimum = maximum = 0;
+        return;
+    }
+    for (int a = 0; a < dim; ++a)
+        for (int b = 0; b < dim; ++b)
+            matrix[a][b] /= scale;
+
+    if (dim == 2)
+    {
+        const double center = (matrix[0][0] + matrix[1][1]) * .5;
+        const double radius = hypot((matrix[0][0] - matrix[1][1]) * .5, matrix[0][1]);
+        minimum = scale * (center - radius);
+        maximum = scale * (center + radius);
+        return;
+    }
+
+    const double center = (matrix[0][0] + matrix[1][1] + matrix[2][2]) / 3;
+    double squared = 0;
+    for (int a = 0; a < 3; ++a)
+    {
+        matrix[a][a] -= center;
+        for (int b = 0; b < 3; ++b)
+            squared += matrix[a][b] * matrix[a][b];
+    }
+    const double radius = sqrt(squared / 6);
+    if (radius == 0)
+    {
+        minimum = maximum = center * scale;
+        return;
+    }
+    for (int a = 0; a < 3; ++a)
+        for (int b = 0; b < 3; ++b)
+            matrix[a][b] /= radius;
+    const auto &a = matrix;
+    const double determinant = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) -
+                               a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) +
+                               a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+    const double angle = acos(fmax(-1.0, fmin(1.0, 0.5 * determinant))) / 3;
+    maximum = scale * (center + 2 * radius * cos(angle));
+    minimum = scale * (center + 2 * radius * cos(angle + 2.0943951023931954923));
+}
+
+__device__ NosbPDBondDecision screenFailure(const NosbPDBondFailureSite &source, const NosbPDBondFailureSite &target,
+                                            double reference_distance, NosbPDBondFailureParameters parameters)
+{
+    using Decision = NosbPDBondDecision;
+    using Law = NosbPDBondFailureLaw;
+    constexpr double epsilon = 2.2204460492503131e-16;
+    const bool plastic = parameters.law == Law::PrincipalPlasticStrain;
+    const auto delta = difference(target.position, source.position);
+    const double stretch = (sqrt(dot(delta, delta)) - reference_distance) / reference_distance;
+    if (!isfinite(stretch))
+        return Decision::EvaluateOnHost;
+    const double stretch_limit = plastic ? 1.0 : 0.5;
+    if (fabs(stretch - stretch_limit) <= 32 * epsilon * fmax(1.0, fabs(stretch)))
+        return Decision::EvaluateOnHost;
+    if (plastic && stretch > stretch_limit)
+        return Decision::Broken;
+
+    const auto dim = parameters.dimensions;
+    double tensor[3][3]{};
+    double scale = 0, trace = 0;
+    for (int a = 0; a < dim; ++a)
+        for (int b = 0; b < dim; ++b)
+        {
+            const double ab = .5 * (source.tensor.derivative[a][b] + target.tensor.derivative[a][b]);
+            const double ba = .5 * (source.tensor.derivative[b][a] + target.tensor.derivative[b][a]);
+            tensor[a][b] = .5 * (ab + ba);
+            if (!isfinite(tensor[a][b]))
+                return Decision::EvaluateOnHost;
+            scale = fmax(scale, fabs(tensor[a][b]));
+            if (a == b)
+                trace += ab;
+        }
+
+    double minimum, maximum;
+    principalExtremes(tensor, dim, scale, minimum, maximum);
+    const bool shear = parameters.law == Law::StressShear;
+    const bool pressure = parameters.law == Law::StressPressure;
+    const double secondary = shear ? (maximum - minimum) * .5 : -trace / dim;
+    // Near repeated eigenvalues the inverse cosine can lose order sqrt(eps).
+    // Delegate these threshold decisions to the original host eigensolver.
+    const double margin = 64 * sqrt(epsilon) * scale;
+    if (!isfinite(maximum) || !isfinite(minimum) ||
+        fabs(maximum - parameters.limit) <= margin ||
+        ((shear || pressure) && (!isfinite(secondary) || fabs(secondary - parameters.secondary_limit) <= margin)))
+        return Decision::EvaluateOnHost;
+    const bool fails = maximum > parameters.limit || stretch > stretch_limit ||
+                       ((shear || pressure) && secondary > parameters.secondary_limit);
+    return fails ? Decision::Broken : Decision::Live;
+}
+
+__global__ void screenBondFailures(const std::size_t *offsets, const NosbPDBondGeometry *bonds,
+                                   const NosbPDBondFailureSite *sites, const std::uint8_t *live,
+                                   NosbPDBondFailureParameters parameters, NosbPDBondDecision *decisions)
+{
+    const std::size_t i = blockIdx.x;
+    for (auto entry = offsets[i] + threadIdx.x; entry < offsets[i + 1]; entry += blockDim.x)
+    {
+        auto decision = live[entry] ? NosbPDBondDecision::Live : NosbPDBondDecision::Broken;
+        if (sites[i].active && live[entry])
+        {
+            const auto &bond = bonds[entry];
+            decision = screenFailure(sites[i], sites[bond.particle], bond.reference_distance, parameters);
+        }
+        decisions[entry] = decision;
+    }
+}
+
 class CudaNosbPDBonds final : public NosbPDBondBatch
 {
   public:
@@ -245,6 +362,29 @@ class CudaNosbPDBonds final : public NosbPDBondBatch
             rows_, dt, tensors_.get());
         check(cudaGetLastError(), "evaluate NOSB-PD bond tensors");
         download(tensors, tensors_, "NOSB-PD deformation tensors");
+    }
+
+    bool screensBondFailure() const noexcept override { return true; }
+
+    void screenBondFailure(const std::vector<NosbPDBondFailureSite> &sites,
+                           const std::vector<std::uint8_t> &bond_live, NosbPDBondFailureParameters parameters,
+                           std::vector<NosbPDBondDecision> &decisions) override
+    {
+        validate(sites.size(), bond_live.size());
+        if (parameters.dimensions != 2 && parameters.dimensions != 3)
+            throw std::invalid_argument("NOSB-PD failure screening requires two or three dimensions");
+        decisions.resize(bond_count_);
+        if (bond_count_ == 0)
+            return;
+        if (rows_ > max_blocks_)
+            throw std::length_error("NOSB-PD failure stencil exceeds the device grid");
+        upload(failure_sites_, sites, "NOSB-PD failure sites");
+        upload(live_, bond_live, "NOSB-PD live flags before failure screening");
+        failure_decisions_.reserve(bond_count_);
+        screenBondFailures<<<static_cast<unsigned>(rows_), threads_>>>(
+            offsets_.get(), bonds_.get(), failure_sites_.get(), live_.get(), parameters, failure_decisions_.get());
+        check(cudaGetLastError(), "screen NOSB-PD bond failures");
+        download(decisions, failure_decisions_, "NOSB-PD bond decisions");
     }
 
     void assembleInternalForce(const std::vector<NosbPDForceSite> &sites,
@@ -316,6 +456,8 @@ class CudaNosbPDBonds final : public NosbPDBondBatch
     DeviceBuffer<NosbPDBondGeometry> bonds_;
     DeviceBuffer<NosbPDKinematicSite> sites_;
     DeviceBuffer<NosbPDForceSite> force_sites_;
+    DeviceBuffer<NosbPDBondFailureSite> failure_sites_;
+    DeviceBuffer<NosbPDBondDecision> failure_decisions_;
     DeviceBuffer<ParticleVector3> force_density_;
     DeviceBuffer<NosbPDCorrectionSite> correction_sites_;
     DeviceBuffer<NosbPDCorrectionForce> correction_force_;

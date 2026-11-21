@@ -254,7 +254,9 @@ int main(int argc, char **argv)
                   << (pd_plastic ? "cuda_fp64" : "cpu_fp64") << std::endl;
     auto constitutive = peridynamics::makePDConstitutiveDynamics(
         shell_inner, &pd_bonds, std::move(pd_elastic), std::move(pd_plastic));
-    auto fracture = peridynamics::makePDFracture(shell_inner, material_options, fracture_options);
+    auto fracture = peridynamics::makePDFracture(shell_inner, material_options, fracture_options, &pd_bonds);
+    if (fracture)
+        std::cout << "NOSB-PD bond failure backend " << (pd_bonds.screensBondFailure() ? "cuda_fp64" : "cpu_fp64") << std::endl;
     solid_dynamics::NosbPDStabilizationWithExecution hourglass(pd_bonds, hourglass_coefficient, hourglass_damage_cutoff);
     solid_dynamics::NosbPDDampingWithExecution pd_damping(pd_bonds);
     std::cout << "NOSB-PD stabilization backend " << (pd_bonds.onDevice() ? "cuda_fp64" : "cpu_fp64")

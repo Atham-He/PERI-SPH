@@ -113,6 +113,17 @@ Matd unpackNosbPDTensor(const peridynamics::ShapeHessian3 &tensor)
     return result;
 }
 
+void publishBondFailure(size_t i, size_t total, size_t live, int *particle_live, int *bond, Real *damage)
+{
+    bond[i] = int(live);
+    damage[i] = 1.0 - Real(live) / Real(total);
+    if (live == 0)
+    {
+        particle_live[i] = 0;
+        std::cout << "Particle_index_i = " << i << " becomes a FREE Particle !" << "\n";
+    }
+}
+
 void checkPositionVerletVelocity(SPHBody &body, BaseParticles &particles, std::size_t i, const Vecd &velocity)
 {
     if (!velocity.allFinite())
@@ -245,6 +256,66 @@ void NosbPDBondWorkspace::evaluateDeformation(Real dt, Matd *full, Matd *increme
         full[i] = unpackNosbPDTensor(tensors_[i].full);
         increment[i] = unpackNosbPDTensor(tensors_[i].increment);
         midpoint[i] = unpackNosbPDTensor(tensors_[i].midpoint);
+    }
+}
+
+void NosbPDBondWorkspace::evaluateBondFailure(const Matd *tensor, peridynamics::NosbPDBondFailureParameters parameters,
+                                              const std::function<bool(Matd &, Real &)> &host_test)
+{
+    using namespace peridynamics;
+    auto &particles = relation_.getSPHBody().getBaseParticles();
+    const auto count = particles.TotalRealParticles();
+    refreshLiveBonds(count, particles.ParticlesBound());
+    const auto *position = particles.getVariableDataByName<Vecd>("Position");
+    auto *active = particles.getVariableDataByName<int>("ParticleLive");
+    auto *bond = particles.getVariableDataByName<int>("BondNumber");
+    auto *damage = particles.getVariableDataByName<Real>("Damage");
+
+    failure_sites_.resize(count + ghost_sources_.size());
+    for (size_t i = 0; i < count; ++i)
+        failure_sites_[i] = {packPDVector(position[i]), packNosbPDTensor(tensor[i]), active[i] == 1};
+    for (size_t g = 0; g < ghost_sources_.size(); ++g)
+    {
+        const auto j = ghost_sources_[g];
+        failure_sites_[count + g] = {packPDVector(position[j]), packNosbPDTensor(tensor[j]), false};
+    }
+    backend_->screenBondFailure(failure_sites_, bond_live_, parameters, failure_decisions_);
+    if (failure_decisions_.size() != bond_live_.size())
+        throw std::logic_error("NOSB-PD backend returned an incomplete failure batch");
+
+    // Resolve exceptional or threshold-adjacent decisions before touching
+    // any live-bond or damage state, using the original CPU criterion.
+    for (size_t i = 0; i < count; ++i)
+    {
+        if (active[i] != 1)
+            continue;
+        const auto &row = relation_.inner_configuration_[i];
+        for (size_t n = 0; n < row.current_size_; ++n)
+        {
+            auto &decision = failure_decisions_[offsets_[i] + n];
+            if (decision != NosbPDBondDecision::EvaluateOnHost)
+                continue;
+            const auto j = row.j_[n];
+            const Vecd eta = position[j] - position[i];
+            Real stretch = (eta.norm() - row.r_ij_[n]) / row.r_ij_[n];
+            Matd average = (tensor[i] + tensor[j]) * .5;
+            decision = host_test(average, stretch) ? NosbPDBondDecision::Live : NosbPDBondDecision::Broken;
+        }
+    }
+
+    for (size_t i = 0; i < count; ++i)
+    {
+        if (active[i] != 1)
+            continue;
+        auto &row = relation_.inner_configuration_[i];
+        size_t live = 0;
+        for (size_t n = 0; n < row.current_size_; ++n)
+        {
+            const bool alive = failure_decisions_[offsets_[i] + n] == NosbPDBondDecision::Live;
+            row.bondLive_[n] = alive;
+            live += alive;
+        }
+        publishBondFailure(i, row.current_size_, live, active, bond, damage);
     }
 }
 
@@ -775,13 +846,7 @@ void BondBreakByPrinStress::interaction(size_t index_i, Real dt)
                 if (inner_neighborhood.bondLive_[n]) bondcount++;
             }
         }
-        bond_[index_i] = int(bondcount);
-        damage_[index_i] = 1.0 - Real(bondcount) / Real(inner_neighborhood.current_size_);
-        if (bondcount < 1)
-        {
-            particleLive_[index_i] = 0;
-            std::cout << "Particle_index_i = " << index_i << " becomes a FREE Particle !" << "\n";
-        }
+        publishBondFailure(index_i, inner_neighborhood.current_size_, bondcount, particleLive_, bond_, damage_);
     }
 }
 //=================================================================================================//
@@ -852,13 +917,7 @@ void BondBreakByPlasticStrain::interaction(size_t index_i, Real dt)
                 if (inner_neighborhood.bondLive_[n]) bondcount++;
             }
         }
-        bond_[index_i] = int(bondcount);
-        damage_[index_i] = 1.0 - Real(bondcount) / Real(inner_neighborhood.current_size_);
-        if (bondcount < 1)
-        {
-            particleLive_[index_i] = 0;
-            std::cout << "Particle_index_i = " << index_i << " becomes a FREE Particle !" << "\n";
-        }
+        publishBondFailure(index_i, inner_neighborhood.current_size_, bondcount, particleLive_, bond_, damage_);
     }
 }
 //=================================================================================================//

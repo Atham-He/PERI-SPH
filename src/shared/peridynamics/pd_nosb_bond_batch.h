@@ -3,6 +3,7 @@
 #include "pd_spatial_derivatives.h"
 
 #include <cstdint>
+#include <stdexcept>
 
 namespace SPH::peridynamics
 {
@@ -57,6 +58,23 @@ struct NosbPDCorrectionForce
     bool collapsed;
 };
 
+enum class NosbPDBondFailureLaw { PrincipalStress, StressShear, StressPressure, PrincipalPlasticStrain };
+enum class NosbPDBondDecision : std::uint8_t { Broken, Live, EvaluateOnHost };
+
+struct NosbPDBondFailureParameters
+{
+    NosbPDBondFailureLaw law;
+    double limit, secondary_limit;
+    int dimensions;
+};
+
+struct NosbPDBondFailureSite
+{
+    ParticleVector3 position;
+    ShapeHessian3 tensor;
+    bool active;
+};
+
 class NosbPDBondBatch
 {
   public:
@@ -68,6 +86,13 @@ class NosbPDBondBatch
     virtual void evaluateDeformation(const std::vector<NosbPDKinematicSite> &sites,
                           const std::vector<std::uint8_t> &bond_live, double dt,
                                      std::vector<NosbPDDeformationTensors> &tensors) = 0;
+    virtual bool screensBondFailure() const noexcept { return false; }
+    virtual void screenBondFailure(const std::vector<NosbPDBondFailureSite> &,
+                                   const std::vector<std::uint8_t> &, NosbPDBondFailureParameters,
+                                   std::vector<NosbPDBondDecision> &)
+    {
+        throw std::logic_error("This NOSB-PD backend does not screen bond failure");
+    }
     virtual void assembleInternalForce(const std::vector<NosbPDForceSite> &sites,
                                        const std::vector<std::uint8_t> &bond_live,
                                        std::vector<ParticleVector3> &force_density) = 0;

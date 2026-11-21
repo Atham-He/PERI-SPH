@@ -29,6 +29,7 @@
 
 #include <Eigen/Eigenvalues>
 
+#include <functional>
 #include "pd_nosb_bond_batch.h"
 #include "pd_nosb_elastic_batch.h"
 #include "pd_nosb_plastic_batch.h"
@@ -165,6 +166,9 @@ class NosbPDBondWorkspace
 
     bool onDevice() const { return static_cast<bool>(backend_); }
     BaseInnerRelation &relation() const { return relation_; }
+    bool screensBondFailure() const noexcept { return backend_ && backend_->screensBondFailure(); }
+    void evaluateBondFailure(const Matd *tensor, peridynamics::NosbPDBondFailureParameters parameters,
+                             const std::function<bool(Matd &, Real &)> &host_test);
     void evaluateDeformation(Real dt, Matd *full, Matd *increment, Matd *midpoint);
     void evaluateInternalForce(Real reference_density, Vecd *acceleration, Vecd *force);
     void evaluateStabilization(peridynamics::NosbPDStabilizationParameters parameters, Real reference_density,
@@ -182,6 +186,8 @@ class NosbPDBondWorkspace
     std::unique_ptr<peridynamics::NosbPDBondBatch> backend_;
     std::vector<std::size_t> offsets_, ghost_sources_;
     std::vector<peridynamics::NosbPDKinematicSite> sites_;
+    std::vector<peridynamics::NosbPDBondFailureSite> failure_sites_;
+    std::vector<peridynamics::NosbPDBondDecision> failure_decisions_;
     std::vector<peridynamics::NosbPDForceSite> force_sites_;
     std::vector<std::uint8_t> bond_live_;
     std::vector<peridynamics::NosbPDDeformationTensors> tensors_;
@@ -278,6 +284,7 @@ class BondBreakByPrinStress : public NosbPDCheckBondLive
     void interaction(size_t index_i, Real dt = 0.0);
 
   protected:
+    const Matd *failureTensor() const { return stress_; }
     int *bond_;
     Real *damage_;
     Matd *stress_;
@@ -331,11 +338,41 @@ class BondBreakByPlasticStrain : public LocalDynamics, public DataDelegateInner
     void interaction(size_t index_i, Real dt = 0.0);
 
   protected:
+    const Matd *failureTensor() const { return plastic_strain_; }
     Real critical_value_;
     int *particleLive_, *bond_;
     Real *damage_;
     Matd *plastic_strain_;
     Vecd *pos_, *vel_, *acc_;
+};
+
+template <class Criterion>
+class NosbPDBondFractureWithExecution : public InteractionDynamics<Criterion>
+{
+    using Base = InteractionDynamics<Criterion>;
+
+  public:
+    template <class... Arguments>
+    NosbPDBondFractureWithExecution(BaseInnerRelation &relation, NosbPDBondWorkspace *workspace,
+                                  peridynamics::NosbPDBondFailureParameters parameters, Arguments &&...args)
+        : Base(relation, std::forward<Arguments>(args)...), workspace_(workspace), parameters_(parameters)
+    {
+        if (workspace_ && &workspace_->relation() != &relation)
+            throw std::invalid_argument("NOSB-PD failure workspace must use the same reference relation");
+    }
+
+    void runMainStep(Real dt) override
+    {
+        if (workspace_ && workspace_->screensBondFailure())
+            workspace_->evaluateBondFailure(this->failureTensor(), parameters_,
+                [this](Matd &tensor, Real &stretch) { return this->checkBondLive(tensor, stretch); });
+        else
+            Base::runMainStep(dt);
+    }
+
+  private:
+    NosbPDBondWorkspace *workspace_;
+    peridynamics::NosbPDBondFailureParameters parameters_;
 };
 
 /**

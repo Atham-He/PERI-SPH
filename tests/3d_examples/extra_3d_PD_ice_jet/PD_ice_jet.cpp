@@ -204,8 +204,12 @@ int main(int ac, char *av[]) try
     auto pd_time_integration = execution.makePositionVerlet();
     solid_dynamics::NosbPDStepWithExecution<solid_dynamics::NosbPDFirstStep> nosbpd_first_step(plate, pd_time_integration.get());
     std::cout << "NOSB-PD position Verlet backend " << (pd_time_integration ? "cuda_fp64" : "cpu_fp64") << std::endl;
-    InteractionDynamics<solid_dynamics::BondBreakBySigma1andSigma3> check_bond_live(plate_inner_relation, max_tension_stress, max_shear_stress);
     solid_dynamics::NosbPDBondWorkspace pd_bonds(plate_inner_relation, execution.makeNosbPDBonds());
+    const peridynamics::NosbPDBondFailureParameters failure{
+        peridynamics::NosbPDBondFailureLaw::StressShear, max_tension_stress, max_shear_stress, Dimensions};
+    solid_dynamics::NosbPDBondFractureWithExecution<solid_dynamics::BondBreakBySigma1andSigma3>
+        check_bond_live(plate_inner_relation, &pd_bonds, failure, max_tension_stress, max_shear_stress);
+    std::cout << "NOSB-PD bond failure backend " << (pd_bonds.screensBondFailure() ? "cuda_fp64" : "cpu_fp64") << std::endl;
     auto pd_plastic = execution.makeNosbPDPlastic();
     std::cout << "NOSB-PD drucker_prager stress backend " << (pd_plastic ? "cuda_fp64" : "cpu_fp64") << std::endl;
     solid_dynamics::NosbPDPlasticWithExecution nosbpd_second_step_plastic(

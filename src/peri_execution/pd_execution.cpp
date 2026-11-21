@@ -113,4 +113,13 @@ std::unique_ptr<FluidAcousticBatch> PeriExecution::makeFluidAcoustic() const
 #endif
     return nullptr;
 }
+
+std::unique_ptr<FluidViscosityBatch> PeriExecution::makeFluidViscosity() const
+{
+#if defined(PERI_SPH_HAS_CUDA)
+    if (mode_ == PeriExecutionMode::GPU)
+        return makeCudaFluidViscosity();
+#endif
+    return nullptr;
+}
 }

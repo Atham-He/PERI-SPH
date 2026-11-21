@@ -79,6 +79,61 @@ class ContactRelationSelectKernel : public ContactRelationCrossResolution
     UniquePtrsKeeper<NeighborBuilderContact> neighbor_builder_contacts_keeper_;
     StdVec<NeighborBuilderContact *> get_contact_neighbors_;
 };
+
+namespace peridynamics
+{
+class SPHViscosityWorkspace
+{
+  public:
+    enum class Form { Inner, Wall, ReverseWall };
+
+    void clearTargets() { targets_.clear(); }
+    void addTarget(Form form, const ParticleConfiguration &configuration, const Vecd *velocity,
+                   const Real *volume, std::size_t bound, Real viscosity, Real smoothing_length);
+    void evaluate(FluidViscosityBatch &backend, std::size_t count, const Vecd *velocity,
+                  const Real *volume, Vecd *force);
+
+  private:
+    struct Target
+    {
+        Form form;
+        const ParticleConfiguration *configuration;
+        const Vecd *velocity;
+        const Real *volume;
+        std::size_t bound;
+        Real viscosity, smoothing_length;
+    };
+    std::vector<Target> targets_;
+    std::vector<std::vector<std::size_t>> site_ids_;
+    FluidViscousRows rows_;
+    std::vector<ParticleVector3> forces_;
+};
+
+template <class LocalDynamicsType>
+class ViscousInteractionWithUpdate : public InteractionWithUpdate<LocalDynamicsType>
+{
+    using Base = InteractionWithUpdate<LocalDynamicsType>;
+
+  public:
+    template <class... Args>
+    explicit ViscousInteractionWithUpdate(FluidViscosityBatch *backend, Args &&...args)
+        : Base(std::forward<Args>(args)...), backend_(backend) {}
+
+  protected:
+    void runMainStep(Real dt) override
+    {
+        if (backend_)
+            this->evaluateDevice(*backend_, workspace_);
+        else
+            Base::runMainStep(dt);
+    }
+
+  private:
+    FluidViscosityBatch *backend_;
+    SPHViscosityWorkspace workspace_;
+};
+}
+
 namespace fluid_dynamics
 {
 /** Wall pressure extrapolation is an explicit numerical control, shared by
@@ -98,6 +153,8 @@ class ViscousWallTermsforPD : public ViscousForce<Contact<Wall>, FixedViscosity,
             if (dynamic_cast<HughesWingetSolid *>(&contact_bodies_[k]->getMatterMaterial()))
                 wall_vel_ave_[k]=contact_particles_[k]->registerStateVariableData<Vecd>("Velocity");
     }
+
+    void addDeviceTargets(peridynamics::SPHViscosityWorkspace &workspace);
 };
 class ViscousForceWithWallforPD : public ViscousForceInner
 {
@@ -106,6 +163,9 @@ class ViscousForceWithWallforPD : public ViscousForceInner
         : ViscousForceInner(inner), walls_(walls) {}
     void interaction(size_t i, Real dt=0)
     {ViscousForceInner::interaction(i,dt); walls_.interaction(i,dt);}
+    void evaluateDevice(peridynamics::FluidViscosityBatch &backend,
+                        peridynamics::SPHViscosityWorkspace &workspace);
+
   protected:
     ViscousWallTermsforPD walls_;
 };
@@ -280,12 +340,22 @@ class AcousticDamperWithWallforPD : public LocalDynamics, public DataDelegateCon
 
 namespace solid_dynamics
 {
-class ViscousForceFromFluidforPD : public ViscousForceFromFluid
+class ViscousForceFromFluidWithExecution : public ViscousForceFromFluid
+{
+  public:
+    using ViscousForceFromFluid::ViscousForceFromFluid;
+    void evaluateDevice(peridynamics::FluidViscosityBatch &backend,
+                        peridynamics::SPHViscosityWorkspace &workspace);
+};
+
+class ViscousForceFromFluidforPD : public ViscousForceFromFluidWithExecution
 {
   public:
     explicit ViscousForceFromFluidforPD(BaseContactRelation &relation)
-        : ViscousForceFromFluid(relation)
-    {vel_ave_=particles_->registerStateVariableData<Vecd>("Velocity");}
+        : ViscousForceFromFluidWithExecution(relation)
+    {
+        vel_ave_ = particles_->registerStateVariableData<Vecd>("Velocity");
+    }
 };
 
 /**

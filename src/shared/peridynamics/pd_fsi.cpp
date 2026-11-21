@@ -68,8 +68,101 @@ Real pdWallAccelerationFactor(SPHBody &body, Real factor)
 
 }
 
+namespace peridynamics
+{
+void SPHViscosityWorkspace::addTarget(Form form, const ParticleConfiguration &configuration,
+                                     const Vecd *velocity, const Real *volume, std::size_t bound,
+                                     Real viscosity, Real smoothing_length)
+{
+    targets_.push_back({form, &configuration, velocity, volume, bound, viscosity, smoothing_length});
+}
+
+void SPHViscosityWorkspace::evaluate(FluidViscosityBatch &backend, std::size_t count,
+                                    const Vecd *velocity, const Real *volume, Vecd *force)
+{
+    constexpr auto missing = std::numeric_limits<std::size_t>::max();
+    rows_.sites.resize(count);
+    rows_.offsets.assign(count + 1, 0);
+    rows_.inner_ends.resize(count);
+    rows_.pairs.clear();
+    site_ids_.resize(targets_.size());
+
+    for (std::size_t k = 0; k < targets_.size(); ++k)
+    {
+        const auto &target = targets_[k];
+        const auto shared = target.form == Form::Inner ? count : 0;
+        site_ids_[k].assign(target.bound - shared, missing);
+    }
+
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        rows_.sites[i] = {packFluidVector(velocity[i]), volume[i]};
+        rows_.inner_ends[i] = rows_.pairs.size();
+        for (std::size_t k = 0; k < targets_.size(); ++k)
+        {
+            const auto &target = targets_[k];
+            const auto &neighbors = (*target.configuration)[i];
+            const bool inner = target.form == Form::Inner;
+            const auto shared = inner ? count : 0;
+            const Real velocity_factor = inner ? 1.0 : 2.0;
+            const Real offset = 0.01 * target.smoothing_length;
+            for (std::size_t n = 0; n < neighbors.current_size_; ++n)
+            {
+                const auto j = neighbors.j_[n];
+                auto site = j;
+                if (j >= shared)
+                {
+                    auto &id = site_ids_[k].at(j - shared);
+                    if (id == missing)
+                    {
+                        id = rows_.sites.size();
+                        rows_.sites.push_back({packFluidVector(target.velocity[j]), target.volume[j]});
+                    }
+                    site = id;
+                }
+
+                const auto &e = neighbors.e_ij_[n];
+                Real force_factor = 2.0 * target.viscosity;
+                if (inner)
+                    force_factor = e.dot(2.0 * e) * target.viscosity;
+                else if (target.form == Form::Wall)
+                    force_factor = 2.0 * e.dot(e) * target.viscosity;
+
+                rows_.pairs.push_back({site, neighbors.r_ij_[n] + offset, velocity_factor,
+                                       force_factor, neighbors.dW_ij_[n]});
+            }
+            if (inner)
+                rows_.inner_ends[i] = rows_.pairs.size();
+        }
+        rows_.offsets[i + 1] = rows_.pairs.size();
+    }
+
+    backend.evaluate(rows_, forces_);
+    for (std::size_t i = 0; i < count; ++i)
+        force[i] = unpackFluidVector(forces_[i]);
+}
+}
+
 namespace fluid_dynamics
 {
+void ViscousWallTermsforPD::addDeviceTargets(peridynamics::SPHViscosityWorkspace &workspace)
+{
+    for (std::size_t k = 0; k < contact_configuration_.size(); ++k)
+        workspace.addTarget(peridynamics::SPHViscosityWorkspace::Form::Wall, *contact_configuration_[k],
+                            wall_vel_ave_[k], wall_Vol_[k], contact_particles_[k]->ParticlesBound(),
+                            mu_(0, 0), smoothing_length_);
+}
+
+void ViscousForceWithWallforPD::evaluateDevice(peridynamics::FluidViscosityBatch &backend,
+                                              peridynamics::SPHViscosityWorkspace &workspace)
+{
+    workspace.clearTargets();
+    workspace.addTarget(peridynamics::SPHViscosityWorkspace::Form::Inner, inner_configuration_,
+                        vel_, Vol_, particles_->ParticlesBound(), mu_(0, 0), smoothing_length_);
+    walls_.addDeviceTargets(workspace);
+    workspace.evaluate(backend, particles_->TotalRealParticles(), vel_, Vol_, viscous_force_);
+}
+
 PressureWallTermsforPD::PressureWallTermsforPD(BaseContactRelation &relation, Real factor)
     : Integration1stHalf<Contact<Wall>, AcousticRiemannSolver, NoKernelCorrection>(relation)
 {
@@ -384,6 +477,18 @@ void AcousticDamperWithWallforPD::interaction(size_t index_i, Real dt)
 
 namespace solid_dynamics
 {
+void ViscousForceFromFluidWithExecution::evaluateDevice(peridynamics::FluidViscosityBatch &backend,
+                                                        peridynamics::SPHViscosityWorkspace &workspace)
+{
+    workspace.clearTargets();
+    for (std::size_t k = 0; k < contact_configuration_.size(); ++k)
+        workspace.addTarget(peridynamics::SPHViscosityWorkspace::Form::ReverseWall, *contact_configuration_[k],
+                            contact_vel_[k], contact_Vol_[k], contact_particles_[k]->ParticlesBound(),
+                            mu_[k], smoothing_length_[k]);
+
+    workspace.evaluate(backend, particles_->TotalRealParticles(), vel_ave_, Vol_, force_from_fluid_);
+}
+
 //=================================================================================================//
 template <class RiemannSolverType>
 PressureForceFromFluidforPD<RiemannSolverType>::

@@ -8,6 +8,7 @@
 #include "solid_snsni_reference.h"
 #include "dpc_snsni_adapter.h"
 #include "pd_execution.h"
+#include "pd_smoothed_force_projection.h"
 namespace SPH::solid_dynamics
 {
 class SnsniPlasticSolid
@@ -134,7 +135,9 @@ class SnsniPlasticSolid
             {
                 packSamplingTensor(correction[l], values);
             });
-        tbb::parallel_for(size_t(0),n,[&](size_t l){const auto&cell=reference.cells[l];const auto&inv=inverseF[l];
+        if (derivatives_)
+            device_stress_fields_.resize(n);
+        tbb::parallel_for(size_t(0),n,[&](size_t l){
             Triple derivative;
             if (sampling_derivatives_)
                 derivative=sampledTensorGradient(l,tensor_channels);
@@ -147,15 +150,24 @@ class SnsniPlasticSolid
                     for(int k=0;k<3;++k) derivative[k]+=e.gradient[k]*delta;
                 }
             }
-            Triple sigma_gradient;
-            for(int k=0;k<3;++k){sigma_gradient[k]=pending[l].trial.gradient[k];for(int j=0;j<3;++j)sigma_gradient[k]-=inverseF[l](j,k)*derivative[j];}
-            const Real J=F[l].determinant();Matd moment=J*F[l]*cell.moment*F[l].transpose(),geometric=Matd::Zero();
-            for(int a=0;a<3;++a){auto&T=force_hessian[l][a];T.setZero();
-                for(int k=0;k<3;++k)T+=(inv*sigma_gradient[k].row(a).transpose())*(inv*moment.row(k).transpose()).transpose();
-                for(int b=0;b<3;++b)geometric(a,b)=(T.array()*displacement_hessian[l][b].array()).sum();}
-            // Eq.60 is fully retained: H_x=F^-T(H_X-grad_x(N).hess(u))F^-1.
-            // Contract first, then gather, to avoid recomputing it per DOF.
-            force_gradient[l]=(J*cell.volume*pending[l].material.sigma-geometric)*inv.transpose();
+            const auto &step=pending[l];
+            if (derivatives_)
+            {
+                auto &stress=device_stress_fields_[l];
+                packTensor(stress.stress,step.material.sigma);
+                for (int k=0;k<3;++k)
+                {
+                    packTensor(stress.trial_gradient[k],step.trial.gradient[k]);
+                    packTensor(stress.correction_gradient[k],derivative[k]);
+                }
+            }
+            else
+            {
+                const auto &cell=reference.cells[l];
+                peridynamics::projectSmoothedForce(F[l],inverseF[l],cell.volume,cell.moment,
+                    step.material.sigma,step.trial.gradient,derivative,displacement_hessian[l],
+                    force_gradient[l],force_hessian[l]);
+            }
         });
         internal.resize(reference.X.size());
         if (derivatives_)
@@ -192,6 +204,7 @@ class SnsniPlasticSolid
     std::unique_ptr<peridynamics::SpatialDerivativeBatch> derivatives_;
     std::vector<peridynamics::ParticleVector3> device_field_;
     std::vector<peridynamics::SpatialDerivatives3> device_derivatives_, device_force_coefficients_;
+    std::vector<peridynamics::SmoothedStressField> device_stress_fields_;
     std::vector<peridynamics::ParticleVector3> device_internal_force_;
     std::unique_ptr<dpc::PointBatch> material_points_;
     std::vector<dpc::SnsniPointInput> point_input_;
@@ -332,30 +345,35 @@ class SnsniPlasticSolid
         return result;
     }
 
-    void assembleDeviceInternalForce(size_t cells)
+    static void packTensor(peridynamics::ShapeHessian3 &out,const Matd &tensor)
     {
-        device_force_coefficients_.resize(cells);
-        for (size_t l = 0; l < cells; ++l)
-        {
-            auto &coefficient = device_force_coefficients_[l];
-            for (int a = 0; a < 3; ++a)
-                for (int i = 0; i < 3; ++i)
-                {
-                    coefficient.gradient[a][i] = force_gradient[l](a, i);
-                    for (int j = 0; j < 3; ++j)
-                        coefficient.hessian[a][i][j] = force_hessian[l][a](i, j);
-                }
-        }
-        derivatives_->assembleAdjoint(device_force_coefficients_, device_internal_force_);
-        if (device_internal_force_.size() != internal.size())
-            throw std::logic_error("Spatial adjoint backend returned an incomplete S-NSNI particle field");
-        for (size_t i = 0; i < internal.size(); ++i)
-        {
-            const auto &force = device_internal_force_[i].component;
-            internal[i] = Vecd(force[0], force[1], force[2]);
-        }
+        for (int i=0;i<3;++i)
+            for (int j=0;j<3;++j)
+                out.derivative[i][j]=tensor(i,j);
     }
 
+    void assembleDeviceInternalForce(size_t cells)
+    {
+        derivatives_->assembleSmoothedAdjoint(device_stress_fields_,device_force_coefficients_,device_internal_force_);
+        if (device_internal_force_.size()!=internal.size() || device_force_coefficients_.size()!=cells)
+            throw std::logic_error("Spatial adjoint backend returned incomplete S-NSNI force fields");
+        tbb::parallel_for(size_t(0),cells,[&](size_t l)
+        {
+            const auto &coefficient=device_force_coefficients_[l];
+            for (int a=0;a<3;++a)
+                for (int i=0;i<3;++i)
+                {
+                    force_gradient[l](a,i)=coefficient.gradient[a][i];
+                    for (int j=0;j<3;++j)
+                        force_hessian[l][a](i,j)=coefficient.hessian[a][i][j];
+                }
+        });
+        for (size_t i=0;i<internal.size();++i)
+        {
+            const auto &force=device_internal_force_[i].component;
+            internal[i]=Vecd(force[0],force[1],force[2]);
+        }
+    }
 
     void configureDerivatives()
     {
@@ -363,8 +381,13 @@ class SnsniPlasticSolid
         map.particle_count = reference.X.size();
         map.offsets.push_back(0);
         map.add_identity = true;
+        map.smoothed_sites.reserve(reference.cells.size());
         for (const auto &cell : reference.cells)
         {
+            peridynamics::SmoothedQuadratureSite site{};
+            site.volume=cell.volume;
+            packTensor(site.moment,cell.moment);
+            map.smoothed_sites.push_back(site);
             for (const auto &e : cell.rows)
             {
                 map.neighbors.push_back(e.j);

@@ -75,6 +75,7 @@ foreach(SNSNI_FILE
         ${PERI_SHARED}/../peri_execution/pd_solid_time_step_cuda.cu
         ${PERI_SHARED}/../peri_execution/dpc_point_cuda.cu
         ${PERI_SHARED}/peridynamics/pd_spatial_derivatives.h
+        ${PERI_SHARED}/peridynamics/pd_smoothed_force_projection.h
         ${PERI_SHARED}/peridynamics/pd_spatial_derivatives_cuda.cu
         ${PERI_SHARED}/peridynamics/pd_particle_trace_map.h
         ${PERI_SHARED}/peridynamics/pd_crack_projection.h

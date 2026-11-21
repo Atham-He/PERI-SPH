@@ -23,6 +23,17 @@ struct WeightedDifferenceEntry
     double energy_weight, force_weight;
 };
 
+struct SmoothedQuadratureSite
+{
+    ShapeHessian3 moment;
+    double volume;
+};
+
+struct SmoothedStressField
+{
+    ShapeHessian3 stress, trial_gradient[3], correction_gradient[3];
+};
+
 // Reference gradients and optional Hessians are stored in neighbor order.
 // An origin per row requests differences, as in a live PD support.
 struct SpatialDerivativeMap
@@ -34,6 +45,7 @@ struct SpatialDerivativeMap
     std::vector<WeightedDifferenceEntry> weighted_differences;
     bool add_identity = false;
     bool build_adjoint = true;
+    std::vector<SmoothedQuadratureSite> smoothed_sites;
 };
 
 struct SpatialDerivatives3
@@ -65,6 +77,11 @@ class SpatialDerivativeBatch
     // zero derivative. A difference stencil contributes with both signs.
     virtual void assembleAdjoint(const std::vector<SpatialDerivatives3> &coefficients,
                                  std::vector<ParticleVector3> &result) = 0;
+    // Use the deformation derivatives from the preceding evaluate call.
+    // Coefficients are also returned for checkpoints and virtual-work audits.
+    virtual void assembleSmoothedAdjoint(const std::vector<SmoothedStressField> &stress,
+                                         std::vector<SpatialDerivatives3> &coefficients,
+                                         std::vector<ParticleVector3> &result) = 0;
 };
 
 std::unique_ptr<SpatialDerivativeBatch> makeCudaSpatialDerivatives();

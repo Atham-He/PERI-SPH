@@ -1,4 +1,5 @@
 #include "pd_spatial_derivatives.h"
+#include "pd_smoothed_force_projection.h"
 #include "pd_cuda_buffer.cuh"
 
 #include <algorithm>
@@ -163,6 +164,48 @@ __global__ void assembleSpatialAdjoint(const std::size_t *offsets, const Adjoint
     result[particle].component[axis] = force;
 }
 
+__device__ SmoothedForceTensor loadTensor(const double (&value)[3][3])
+{
+    SmoothedForceTensor result;
+    for (int i=0;i<3;++i)
+        for (int j=0;j<3;++j)
+            result(i,j)=value[i][j];
+    return result;
+}
+
+__global__ void projectSmoothedCoefficients(const SmoothedQuadratureSite *quadrature,
+                                            const SmoothedStressField *stress_field,
+                                            const SpatialDerivatives3 *kinematics,
+                                            std::size_t rows, SpatialDerivatives3 *result)
+{
+    const auto l = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (l >= rows)
+        return;
+
+    const auto &state=kinematics[l];
+    const auto &stress=stress_field[l];
+    const auto &site=quadrature[l];
+    const SmoothedForceTensor F=loadTensor(state.gradient), inverse_F=F.inverse();
+    SmoothedForceGradient trial_gradient, correction_gradient, displacement_hessian, nodal_hessian;
+    for (int a=0;a<3;++a)
+    {
+        trial_gradient[a]=loadTensor(stress.trial_gradient[a].derivative);
+        correction_gradient[a]=loadTensor(stress.correction_gradient[a].derivative);
+        displacement_hessian[a]=loadTensor(state.hessian[a]);
+    }
+    SmoothedForceTensor nodal_gradient;
+    projectSmoothedForce(F,inverse_F,site.volume,loadTensor(site.moment.derivative),
+        loadTensor(stress.stress.derivative),trial_gradient,correction_gradient,displacement_hessian,
+        nodal_gradient,nodal_hessian);
+    for (int a=0;a<3;++a)
+        for (int i=0;i<3;++i)
+        {
+            result[l].gradient[a][i]=nodal_gradient(a,i);
+            for (int j=0;j<3;++j)
+                result[l].hessian[a][i][j]=nodal_hessian[a](i,j);
+        }
+}
+
 class CudaSpatialDerivatives final : public SpatialDerivativeBatch
 {
   public:
@@ -183,6 +226,9 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
             (!map.hessians.empty() && map.hessians.size() != entries))
             throw std::invalid_argument("Invalid spatial derivative stencil");
         const auto rows = map.offsets.size() - 1;
+        if (!map.smoothed_sites.empty() &&
+            (map.smoothed_sites.size()!=rows || map.hessians.empty() || !map.build_adjoint || !map.add_identity))
+            throw std::invalid_argument("Smoothed force projection requires matching integration sites, deformation Hessians and an adjoint stencil");
         if (!map.weighted_differences.empty() &&
             (map.weighted_differences.size() != entries || map.origins.empty() || !map.build_adjoint))
             throw std::invalid_argument("Weighted differences require entry fits, row origins and the adjoint stencil");
@@ -196,11 +242,14 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
                 throw std::invalid_argument("Spatial derivative origin is outside the particle field");
 
         configured_ = false;
+        derivative_result_ready_ = false;
         upload(offsets_, map.offsets, "spatial derivative offsets");
         upload(neighbors_, map.neighbors, "spatial derivative neighbors");
         upload(origins_, map.origins, "spatial derivative origins");
         upload(gradients_, map.gradients, "reference gradients");
         upload(hessians_, map.hessians, "reference Hessians");
+        upload(smoothed_sites_, map.smoothed_sites, "smoothed integration sites");
+        has_smoothed_sites_ = !map.smoothed_sites.empty();
         upload(weighted_differences_, map.weighted_differences, "reference weighted differences");
         if (map.build_adjoint)
             configureAdjoint(map);
@@ -222,6 +271,7 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
             throw std::invalid_argument("Particle field does not match the spatial derivative stencil");
         if (weighted_difference && weighted_differences_count_ == 0)
             throw std::invalid_argument("Stencil has no weighted difference fit");
+        derivative_result_ready_ = false;
         result.resize(rows_);
         if (rows_ == 0)
             return;
@@ -242,6 +292,7 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
         if (weighted_difference)
             evaluateWeightedDifference(*weighted_difference);
         download(result, result_, "spatial derivative results");
+        derivative_result_ready_ = true;
     }
 
     void evaluateChannelGradients(const std::vector<double> &particles, std::size_t channels,
@@ -272,12 +323,35 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
     {
         if (!configured_ || !has_adjoint_ || coefficients.size() != rows_)
             throw std::invalid_argument("Coefficient field does not match an adjoint stencil");
+        upload(adjoint_coefficients_, coefficients, "spatial adjoint coefficients");
+        gatherAdjoint(result);
+    }
+
+    void assembleSmoothedAdjoint(const std::vector<SmoothedStressField> &stress,
+                                 std::vector<SpatialDerivatives3> &coefficients,
+                                 std::vector<ParticleVector3> &result) override
+    {
+        if (!configured_ || !has_smoothed_sites_ || !derivative_result_ready_ || stress.size()!=rows_)
+            throw std::invalid_argument("Smoothed force projection requires a current deformation and matching stress field");
+
+        upload(smoothed_stress_,stress,"smoothed stress fields");
+        adjoint_coefficients_.reserve(rows_);
+        projectSmoothedCoefficients<<<grid(rows_,1),threads>>>(smoothed_sites_.get(),smoothed_stress_.get(),
+            result_.get(),rows_,adjoint_coefficients_.get());
+        check(cudaGetLastError(),"project smoothed force coefficients");
+
+        gatherAdjoint(result);
+        coefficients.resize(rows_);
+        download(coefficients,adjoint_coefficients_,"smoothed force coefficients");
+    }
+
+  private:
+    void gatherAdjoint(std::vector<ParticleVector3> &result)
+    {
         result.resize(particle_count_);
         if (particle_count_ == 0)
             return;
-
-        const auto blocks = grid(particle_count_);
-        upload(adjoint_coefficients_, coefficients, "spatial adjoint coefficients");
+        const auto blocks=grid(particle_count_);
         adjoint_result_.reserve(particle_count_);
         if (use_hessians_)
             assembleSpatialAdjoint<true><<<blocks, threads>>>(adjoint_offsets_.get(), adjoint_entries_.get(),
@@ -289,7 +363,6 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
         download(result, adjoint_result_, "spatial adjoint particle result");
     }
 
-  private:
     static constexpr unsigned int threads = 128;
 
     unsigned int grid(std::size_t sites, std::size_t components = 3) const
@@ -360,11 +433,13 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
 
     std::size_t particle_count_ = 0, rows_ = 0, max_blocks_ = 0;
     bool use_origins_ = false, use_hessians_ = false, add_identity_ = false, configured_ = false;
-    bool has_adjoint_ = false;
+    bool has_adjoint_ = false, has_smoothed_sites_ = false, derivative_result_ready_ = false;
     DeviceBuffer<std::size_t> offsets_, neighbors_, origins_;
     DeviceBuffer<ParticleVector3> gradients_, particles_, channel_gradients_;
     DeviceBuffer<double> channel_field_;
     DeviceBuffer<ShapeHessian3> hessians_;
+    DeviceBuffer<SmoothedQuadratureSite> smoothed_sites_;
+    DeviceBuffer<SmoothedStressField> smoothed_stress_;
     DeviceBuffer<SpatialDerivatives3> result_, adjoint_coefficients_;
     DeviceBuffer<std::size_t> adjoint_offsets_;
     DeviceBuffer<AdjointContribution> adjoint_entries_;

@@ -9,11 +9,13 @@ namespace SPH::peridynamics
 using BondedTraceEntry = ParticleTraceEntry;
 using BondedTraceMap = ParticleTraceMap;
 
-struct BondedInterfaceNode
+struct TraceForceNode
 {
     double position[3], velocity[3], external[3];
     double force_divisor;
 };
+
+using BondedInterfaceNode = TraceForceNode;
 
 struct BondedInterfacePoint
 {
@@ -32,5 +34,21 @@ class BondedInterfaceBatch
                        std::vector<BondedInterfacePoint> &points) = 0;
 };
 
+struct SurfacePlaneContactPoint
+{
+    double position[3], force[3], sum[3], torque[3];
+    double upper, lower, energy, penetration, power, force_scale, power_scale;
+};
+
+class SurfacePlaneContactBatch
+{
+  public:
+    virtual ~SurfacePlaneContactBatch() = default;
+    virtual void configure(const ParticleTraceMap &trace, const std::vector<double> &stiffness) = 0;
+    virtual void apply(double bottom, double top, std::vector<TraceForceNode> &nodes,
+                       std::vector<SurfacePlaneContactPoint> &points) = 0;
+};
+
 std::unique_ptr<BondedInterfaceBatch> makeCudaBondedInterface();
+std::unique_ptr<SurfacePlaneContactBatch> makeCudaSurfacePlaneContact();
 }

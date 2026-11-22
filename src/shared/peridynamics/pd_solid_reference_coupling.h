@@ -199,6 +199,42 @@ class ReferenceSolidSurface
     }
 };
 
+namespace surface_execution_detail
+{
+inline ParticleTraceMap packTrace(const ReferenceSolidSurface &surface)
+{
+    ParticleTraceMap result{surface.port.count, {0}, {}};
+    for (const auto &row : surface.rows)
+    {
+        for (size_t k = 0; k < row.index.size(); ++k)
+            result.entries.push_back({row.index[k], row.weight[k]});
+        result.offsets.push_back(result.entries.size());
+    }
+    return result;
+}
+
+inline void packState(const SolidForcePort &port, std::vector<TraceForceNode> &nodes)
+{
+    for (size_t i = 0; i < nodes.size(); ++i)
+    {
+        auto &node = nodes[i];
+        node.force_divisor = port.storage == SolidForcePort::Storage::ForcePrior ? 1.0 : port.mass[i];
+        for (int d = 0; d < 3; ++d)
+        {
+            node.position[d] = port.position[i][d];
+            node.velocity[d] = port.velocity[i][d];
+            node.external[d] = port.external[i][d];
+        }
+    }
+}
+
+inline Vecd vector(const double *values)
+{
+    return Vecd(values[0], values[1], values[2]);
+}
+
+} // namespace surface_execution_detail
+
 /** One reference interface energy:U=sum(k_i|W_a*x_a-W_b*x_b|^2/2).
  * Both bodies receive the transpose pullback of the SAME physical force.
  * No fluid pressure, velocity overwrite or duplicate repulsion is added. */
@@ -207,38 +243,6 @@ class BondedSolidInterface
     std::unique_ptr<BondedInterfaceBatch> backend_;
     std::vector<BondedInterfaceNode> nodes_a_, nodes_b_;
     std::vector<BondedInterfacePoint> points_;
-
-    static BondedTraceMap packTrace(const ReferenceSolidSurface &surface)
-    {
-        BondedTraceMap result{surface.port.count, {0}, {}};
-        for (const auto &row : surface.rows)
-        {
-            for (size_t k = 0; k < row.index.size(); ++k)
-                result.entries.push_back({row.index[k], row.weight[k]});
-            result.offsets.push_back(result.entries.size());
-        }
-        return result;
-    }
-
-    static void packState(const SolidForcePort &port, std::vector<BondedInterfaceNode> &nodes)
-    {
-        for (size_t i = 0; i < nodes.size(); ++i)
-        {
-            auto &node = nodes[i];
-            node.force_divisor = port.storage == SolidForcePort::Storage::ForcePrior ? 1.0 : port.mass[i];
-            for (int d = 0; d < 3; ++d)
-            {
-                node.position[d] = port.position[i][d];
-                node.velocity[d] = port.velocity[i][d];
-                node.external[d] = port.external[i][d];
-            }
-        }
-    }
-
-    static Vecd vector(const double *values)
-    {
-        return Vecd(values[0], values[1], values[2]);
-    }
 
     void finishAudit(const Vecd &sum, const Vecd &torque, Real power, Real force_scale, Real power_scale)
     {
@@ -252,6 +256,7 @@ class BondedSolidInterface
 
     void applyBackend()
     {
+        using namespace surface_execution_detail;
         packState(a.port, nodes_a_);
         packState(b.port, nodes_b_);
         backend_->apply(nodes_a_, nodes_b_, points_);
@@ -315,7 +320,7 @@ class BondedSolidInterface
         b.ensureCurrent();
         stable_dt = ReferenceSolidSurface::stableBound(a, &b, stiffness);
         if (backend_)
-            backend_->configure(packTrace(a), packTrace(b), std::vector<double>(stiffness.begin(), stiffness.end()));
+            backend_->configure(surface_execution_detail::packTrace(a), surface_execution_detail::packTrace(b), std::vector<double>(stiffness.begin(), stiffness.end()));
         a_mapping_version = a.mappingVersion();
         b_mapping_version = b.mappingVersion();
     }
@@ -358,6 +363,42 @@ class BondedSolidInterface
  * The same surface interpolation and transpose force map serve all components. */
 class SolidSurfacePlaneContact
 {
+    std::unique_ptr<SurfacePlaneContactBatch> backend_;
+    std::vector<TraceForceNode> nodes_;
+    std::vector<SurfacePlaneContactPoint> points_;
+
+    void applyBackend(Real bottom, Real top)
+    {
+        using namespace surface_execution_detail;
+        packState(surface.port, nodes_);
+        backend_->apply(bottom, top, nodes_, points_);
+        if (points_.size() != stiffness.size())
+            throw std::logic_error("Plane contact backend returned the wrong point count");
+        for (size_t i = 0; i < nodes_.size(); ++i)
+            surface.port.external[i] = vector(nodes_[i].external);
+
+        Vecd net_force=Vecd::Zero(), torque=Vecd::Zero();
+        Real power=0, force_scale=0, power_scale=0;
+        for (size_t i = 0; i < points_.size(); ++i)
+        {
+            const auto &point = points_[i];
+            position[i] = vector(point.position);
+            force[i] = vector(point.force);
+            upper += point.upper;
+            lower += point.lower;
+            energy += point.energy;
+            max_penetration = std::max(max_penetration, Real(point.penetration));
+            net_force += vector(point.sum);
+            torque += vector(point.torque);
+            power += point.power;
+            force_scale += point.force_scale;
+            power_scale += point.power_scale;
+        }
+        worst_force=std::max(worst_force,net_force.norm()/std::max(force_scale,Real(1e-30)));
+        worst_torque=std::max(worst_torque,torque.norm()/std::max(length_scale*force_scale,Real(1e-30)));
+        worst_power=std::max(worst_power,std::abs(power)/std::max(power_scale,Real(1e-30)));
+    }
+
   public:
     ReferenceSolidSurface &surface;
     StdVec<Real> areas,stiffness;
@@ -371,8 +412,9 @@ class SolidSurfacePlaneContact
     size_t active_friction_points=0,sliding_points=0,history_commits=0;size_t surface_mapping_version=~size_t(0);
     Real worst_force=0,worst_torque=0,worst_power=0,length_scale;
     SolidSurfacePlaneContact(ReferenceSolidSurface &s,const StdVec<Real> &area,
-                             Real stiffness_per_area,Real length,Real mu=0,Real kt_over_kn=1)
-        : surface(s),areas(area),friction(mu),tangent_factor(kt_over_kn),length_scale(length)
+                             Real stiffness_per_area,Real length,Real mu=0,Real kt_over_kn=1,
+                             std::unique_ptr<SurfacePlaneContactBatch> backend=nullptr)
+        : backend_(std::move(backend)),surface(s),areas(area),friction(mu),tangent_factor(kt_over_kn),length_scale(length)
     {
         if(areas.size()!=s.rows.size()||!std::isfinite(mu)||mu<0||
            !std::isfinite(kt_over_kn)||kt_over_kn<=0)
@@ -382,13 +424,27 @@ class SolidSurfacePlaneContact
         if(friction>0)friction_history.resize(area.size());
         refreshTimeStepBound();
     }
+    bool onDevice() const noexcept { return backend_ && friction == 0; }
+
     void refreshTimeStepBound()
     {
         surface.ensureCurrent();
         // Stick: Kt P_t + Kn n*n^T. Sliding also couples Ft to Fn with
         // derivative bounded by mu*Kn. The sum of these operator norms is
         // a conservative bound; mu=0 preserves the original bound exactly.
-        if(friction==0){Real next=ReferenceSolidSurface::stableBound(surface,nullptr,stiffness);stable_dt=next;surface_mapping_version=surface.mappingVersion();return;}
+        if(friction==0)
+        {
+            const Real next=ReferenceSolidSurface::stableBound(surface,nullptr,stiffness);
+            if (onDevice())
+            {
+                nodes_.resize(surface.port.count);
+                backend_->configure(surface_execution_detail::packTrace(surface),
+                                    std::vector<double>(stiffness.begin(), stiffness.end()));
+            }
+            stable_dt=next;
+            surface_mapping_version=surface.mappingVersion();
+            return;
+        }
         StdVec<Real> bound=stiffness;for(auto &k:bound)k*=1+tangent_factor+friction;
         Real next=ReferenceSolidSurface::stableBound(surface,nullptr,bound);stable_dt=next;surface_mapping_version=surface.mappingVersion();
     }
@@ -397,6 +453,11 @@ class SolidSurfacePlaneContact
         surface.ensureCurrent();if(surface_mapping_version!=surface.mappingVersion())refreshTimeStepBound();
         upper=lower=energy=max_penetration=tangent_energy=max_cone_ratio=tangential_force_sum=0;
         active_friction_points=sliding_points=0;
+        if (onDevice())
+        {
+            applyBackend(bottom, top);
+            return;
+        }
         Vecd ferr=Vecd::Zero(),terr=Vecd::Zero();Real perr=0,fs=0,ps=0;
         for(size_t i=0;i<stiffness.size();++i)
         {

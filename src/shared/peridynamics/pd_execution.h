@@ -50,6 +50,7 @@ class PeriExecution
     std::unique_ptr<CrackProjectionBatch> makeCrackProjection() const;
     std::unique_ptr<CrackStrengthBatch> makeCrackStrength() const;
     std::unique_ptr<BondedInterfaceBatch> makeBondedInterface() const;
+    std::unique_ptr<SurfacePlaneContactBatch> makeSurfacePlaneContact() const;
     std::unique_ptr<SpatialDerivativeBatch> makeSpatialDerivatives() const;
     std::unique_ptr<dpc::PointBatch> makeDpcPoints(const dpc::Model &model) const;
     std::unique_ptr<SolidTimeStepBatch> makeSolidTimeStep(const std::vector<double> &mass) const;

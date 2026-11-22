@@ -105,7 +105,8 @@ int run(const PDSolidCapsuleOptions&o,const std::string&geometry,bool gate,const
     peridynamics::SolidForcePort port(core,peridynamics::SolidForcePort::Storage::ForcePrior);
     StdVec<Vecd>points;StdVec<Real>areas;for(const auto&face:reference.faces)if(face.boundary)for(const auto&q:face.q){points.push_back(q.x);areas.push_back(q.w);}
     RKSurface surface(port,points,reference);Real K=o.contact_factor*o.constraint_E/o.spacing;
-    peridynamics::SolidSurfacePlaneContact contact(surface,areas,K,R);
+    peridynamics::SolidSurfacePlaneContact contact(surface,areas,K,R,0,1,execution.makeSurfacePlaneContact());
+    std::cout << "Solid plane contact backend " << (contact.onDevice() ? "cuda_fp64" : "cpu_fp64") << std::endl;
     SnsniCentralDifference time(reference.mass,execution);Field total(n,Vecd::Zero());
     SnsniDiagnostics audit(out,reference,o.diameter,audit_baseline);
     const Real ramp=o.ramp_steps*o.max_dt,max_duration=o.max_stage_steps*o.max_dt,damping=o.relaxation_damping/o.max_dt;

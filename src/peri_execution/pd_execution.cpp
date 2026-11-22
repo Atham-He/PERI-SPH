@@ -81,6 +81,15 @@ std::unique_ptr<BondedInterfaceBatch> PeriExecution::makeBondedInterface() const
     return nullptr;
 }
 
+std::unique_ptr<SurfacePlaneContactBatch> PeriExecution::makeSurfacePlaneContact() const
+{
+#if defined(PERI_SPH_HAS_CUDA)
+    if (mode_ == PeriExecutionMode::GPU)
+        return makeCudaSurfacePlaneContact();
+#endif
+    return nullptr;
+}
+
 std::unique_ptr<SpatialDerivativeBatch> PeriExecution::makeSpatialDerivatives() const
 {
 #if defined(PERI_SPH_HAS_CUDA)

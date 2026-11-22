@@ -158,7 +158,8 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells,const PeriExec
         si.reset();cs.reset();
     };
     if(use_column_interface&&recovery::checkpoint.resume.empty())installColumnInterface();
-    SolidSurfacePlaneContact contact(so,outer_areas,Kcontact,R);
+    SolidSurfacePlaneContact contact(so,outer_areas,Kcontact,R,0,1,execution.makeSurfacePlaneContact());
+    std::cout << "Solid plane contact backend " << (contact.onDevice() ? "cuda_fp64" : "cpu_fp64") << std::endl;
     auto bank=ExtrinsicCrackGrowth::readBank(fracture_bank_input,geometry);
     using SurfaceLaw=ExtrinsicCrackGrowth::SurfaceLaw;
     auto crack_projection=execution.makeCrackProjection();
@@ -190,10 +191,60 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells,const PeriExec
     auto compression=[&](Real t){Real a=column_hold?0:std::clamp((inner_hold?stage_time:t)/o.ramp_duration,Real(0),Real(1));return o.diameter*o.strain*(Real(stage-1)+.5*(1-std::cos(Pi*a)))/o.load_steps;};
     forceAt(time.displacement,time.velocity,0,false);Real U0=recoverable(),K0=time.kinetic();
     std::ofstream parameters(out/"parameters.json");parameters<<std::setprecision(17)<<"{\"core_backend\":\"SNSNI_RKPM_DPC_unchanged\",\"shell_backend\":\"layered_NOSB_PD_live_reconstruction\",\"shell_constitutive\":\"unchanged_finite_volume_Biot\",\"fracture_representation\":"<<std::quoted(fracture_contact_only?"strength_triggered_bond_deletion_contact_only":"strength_triggered_extrinsic_cohesive_true_bonds")<<",\"cohesive_integrator\":"<<std::quoted(fracture_contact_only?"disabled":"explicit_bulk_half_kicks_implicit_objective_surface_drift")<<",\"Gc_used_for_surface_softening\":"<<(fracture_contact_only?"false":"true")<<",\"mixed_mode_assumption\":"<<std::quoted(fracture_contact_only?"equal_strength":"equal_strength_and_Gc")<<",\"candidate_geometry\":\"through_thickness_radial_Voronoi_facets\",\"E_Pa\":"<<o.shell_E<<",\"nu\":"<<o.shell_nu<<",\"ft_Pa\":"<<o.fracture_stress<<",\"Gc_J_m2\":"<<o.fracture_energy<<",\"delta_f_m\":"<<growth.delta_f<<",\"core_particles\":"<<cn<<",\"shell_particles\":"<<sn<<",\"candidate_facets\":"<<bank.size()<<",\"shell_mass_kg\":"<<shell_mass<<",\"interface_K_Pa_per_m\":"<<Ktie<<",\"platen_and_crack_contact_K_Pa_per_m\":"<<Kcontact<<",\"execution_backend\":"<<std::quoted(execution.backendName())<<",\"crack_projection_backend\":"<<std::quoted(crack_projection?"cuda_fp64":"cpu_fp64")<<",\"crack_local_contact_backend\":"<<std::quoted(crack_projection&&crack_projection->assemblesLocalContact()?"cuda_fp64":"cpu_fp64")<<",\"crack_node_assembly_backend\":"<<std::quoted(crack_projection&&crack_projection->assemblesTracePullback()?"cuda_fp64":"cpu_fp64")<<",\"shell_derivatives_backend\":"<<std::quoted(sb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")<<",\"core_derivatives_backend\":"<<std::quoted(cb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")<<",\"shell_stress_force_backend\":"<<std::quoted(sb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")<<",\"shell_stabilization_backend\":"<<std::quoted(sb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")<<",\"core_internal_force_backend\":"<<std::quoted(cb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")<<",\"core_material_backend\":"<<std::quoted(cb.hasDeviceMaterial()?"cuda_fp64":"cpu_fp64")<<",\"trial_stress_gradient_backend\":"<<std::quoted(cb.hasDeviceMaterial()?"cuda_fp64":"cpu_fp64")<<",\"core_sampling_gradients_backend\":"<<std::quoted(cb.hasDeviceSamplingGradients()?"cuda_fp64":"cpu_fp64")<<",\"core_force_projection_backend\":"<<std::quoted(cb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")<<",\"solid_time_step_backend\":"<<std::quoted(time.hasDeviceTimeStep()?"cuda_fp64":"cpu_fp64")<<",\"bonded_interface_backend\":"<<std::quoted(execution.bondedInterfaceOnDevice()?"cuda_fp64":"cpu_fp64")<<",\"core_parameters_changed\":false,\"source_hash\":"<<std::quoted(CAPSULE_SOURCE_SHA256)<<"}\n";parameters.close();
-    if(o.preflight_only){Field d(count),v(count);Matd A=Matd::Identity();A(0,0)=.998;A(1,1)=1.001;A(2,2)=.999;for(size_t j=0;j<count;++j){d[j]=(A-Matd::Identity())*X[j];if(j<cn)d[j]+=Vecd(5e-8*rc/.0005,0,0);v[j]=Vecd(.2*std::sin(37*X[j][0]/R),-.1,.3*X[j][2]/R);}forceAt(d,v,.004*2*R,false);
-        Real affine=0,native=0;for(size_t l=0;l<cr.cells.size();++l){affine=std::max(affine,(cb.F[l]-A).norm());auto a=cb.model.update(cb.F[l],cb.history[l]);native=std::max(native,(a.sigma-cb.pending[l].material.sigma).norm());}for(size_t j=0;j<sn;++j)affine=std::max(affine,(sF[j]-A).norm());
-        Real power=0;for(size_t j=0;j<cn;++j)power+=core_port.external[j].dot(v[j]);for(size_t j=0;j<sn;++j)power+=sm[j]*pd_port.external[j].dot(v[cn+j]);Real eps=1e-12;Field plus=d,minus=d;for(size_t j=0;j<count;++j){plus[j]+=eps*v[j];minus[j]-=eps*v[j];}forceAt(plus,v,.004*2*R,false);Real ep=tie->energy+contact.energy;forceAt(minus,v,.004*2*R,false);Real em=tie->energy+contact.energy;Real derivative=(ep-em)/(2*eps),error=std::abs(derivative+power)/std::max({Real(1e-20),std::abs(derivative),std::abs(power)});bool pass=affine<1e-8&&native==0&&error<1e-5;
-        std::ofstream f(out/"preflight.json");f<<std::setprecision(17)<<"{\"status\":\""<<(pass?"PASSED":"FAILED")<<"\",\"affine_F_error\":"<<affine<<",\"native_DPC_stress_difference_Pa\":"<<native<<",\"constraint_energy_gradient_relative_error\":"<<error<<",\"fracture_contact_only\":"<<(fracture_contact_only?"true":"false")<<",\"affine_crack_contact\":"<<(affine_crack_contact?"true":"false")<<",\"affine_inner_interface\":"<<(affine_inner_interface?"true":"false")<<",\"physical_histories_advanced\":0}\n";return pass?0:2;}
+    if(o.preflight_only)
+    {
+        Field d(count), v(count);
+        Matd A=Matd::Identity();
+        A(0,0)=.998; A(1,1)=1.001; A(2,2)=.999;
+        for(size_t j=0;j<count;++j)
+        {
+            d[j]=(A-Matd::Identity())*X[j];
+            if(j<cn) d[j]+=Vecd(5e-8*rc/.0005,0,0);
+            v[j]=Vecd(.2*std::sin(37*X[j][0]/R),-.1,.3*X[j][2]/R);
+        }
+        forceAt(d,v,.004*2*R,false);
+        Real affine=0, native=0, native_relative=0, history_error=0;
+        bool branches_match=true;
+        for(size_t l=0;l<cr.cells.size();++l)
+        {
+            affine=std::max(affine,(cb.F[l]-A).norm());
+            const auto exact=cb.model.update(cb.F[l],cb.history[l]);
+            const auto &computed=cb.pending[l].material;
+            const Real difference=(exact.sigma-computed.sigma).norm();
+            native=std::max(native,difference);
+            native_relative=std::max(native_relative,difference/std::max(Real(1),exact.sigma.norm()));
+            history_error=std::max({history_error,
+                (exact.state.inverse_Cp-computed.state.inverse_Cp).norm(),
+                std::abs(exact.state.kappa-computed.state.kappa),std::abs(exact.state.alpha-computed.state.alpha)});
+            branches_match=branches_match&&exact.surface==computed.surface;
+        }
+        for(size_t j=0;j<sn;++j) affine=std::max(affine,(sF[j]-A).norm());
+        Real power=0;
+        for(size_t j=0;j<cn;++j) power+=core_port.external[j].dot(v[j]);
+        for(size_t j=0;j<sn;++j) power+=sm[j]*pd_port.external[j].dot(v[cn+j]);
+        const Real eps=1e-12;
+        Field plus=d, minus=d;
+        for(size_t j=0;j<count;++j){plus[j]+=eps*v[j];minus[j]-=eps*v[j];}
+        forceAt(plus,v,.004*2*R,false);
+        const Real ep=tie->energy+contact.energy;
+        forceAt(minus,v,.004*2*R,false);
+        const Real em=tie->energy+contact.energy, derivative=(ep-em)/(2*eps);
+        const Real error=std::abs(derivative+power)/std::max({Real(1e-20),std::abs(derivative),std::abs(power)});
+        // Keep the CPU self-check exact and use the bare S-NSNI DPC tolerance for FP64 CUDA.
+        const Real material_tolerance=cb.hasDeviceMaterial()?1e-9:0;
+        const bool pass=affine<1e-8&&native_relative<=material_tolerance&&
+            history_error<=material_tolerance&&branches_match&&error<1e-5;
+
+        std::ofstream f(out/"preflight.json");
+        f<<std::setprecision(17)<<"{\"status\":\""<<(pass?"PASSED":"FAILED")
+         <<"\",\"affine_F_error\":"<<affine<<",\"native_DPC_stress_difference_Pa\":"<<native
+         <<",\"native_DPC_stress_relative_error\":"<<native_relative
+         <<",\"native_DPC_history_error\":"<<history_error<<",\"native_DPC_branches_match\":"<<(branches_match?"true":"false")
+         <<",\"constraint_energy_gradient_relative_error\":"<<error<<",\"fracture_contact_only\":"<<(fracture_contact_only?"true":"false")
+         <<",\"affine_crack_contact\":"<<(affine_crack_contact?"true":"false")
+         <<",\"affine_inner_interface\":"<<(affine_inner_interface?"true":"false")<<",\"physical_histories_advanced\":0}\n";
+        return pass?0:2;
+    }
     std::ofstream progress(out/"progress.csv"),eq(out/"equilibria.csv"),events(out/"fracture_events.csv");
     const char*header="step,stage,elapsed_s,strain,compression_m,dt_s,upper_N,lower_N,force_residual,plate_imbalance,kinetic_ratio,core_min_J,shell_min_J,broken_bond_pairs,crack_facets,failed_cohesive_quadrature,max_crack_gap_m,cohesive_stored_J,fracture_work_J,shell_stored_J,interface_energy_J,contact_energy_J,crack_contact_energy_J,max_penetration_m,platen_work_J,core_internal_work_J,damping_loss_J,cohesive_algorithmic_loss_J,stabilizer_transfer_loss_J,insertion_defect_J,mechanical_budget_J\n";
     progress<<std::setprecision(17)<<header;eq<<std::setprecision(17)<<header;events<<std::setprecision(17)<<"event,step,stage,strain,candidate,strength_ratio,broken_bond_pairs,max_gap_m\n";

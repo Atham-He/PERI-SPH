@@ -19,7 +19,7 @@ file(SHA256 ${PERI_SHARED}/materials/dpc_point_batch.h DPC_BATCH_HASH)
 file(SHA256 ${PERI_SHARED}/materials/drucker_prager_cap_solid.h ADAPTER_HASH)
 set(PD_ASSEMBLY_HASHES "${MAIN_HASH};${FIXTURE_HASH};${COUPLING_HASH};${CRACK_CONTACT_HASH}")
 foreach(PD_HEADER pd_quadratic_correspondence.h pd_principal_stress_onset.h
-        pd_fracture_correspondence.h pd_fracture_surface.h pd_fragment_contact.h pd_energy_crack_band.h pd_directional_crack_energy.h
+        pd_fracture_correspondence.h pd_fracture_surface.h pd_fragment_contact.h pd_energy_crack_band.h pd_finite_volume_biot_terms.h pd_directional_crack_energy.h
         pd_layered_geometry.h pd_layered_correspondence.h pd_layered_surface.h pd_coulomb_friction.h
         pd_layered_fracture_reference.h pd_broken_bond_energy.h pd_reference_spectral_bound.h pd_fracture_visible_surface.h
         pd_cohesive_crack_law.h pd_cohesive_interface_imex.h pd_cohesive_surface_evolution.h
@@ -72,6 +72,8 @@ foreach(SNSNI_FILE
         ${PERI_SHARED}/peridynamics/pd_column_face_surface.h
         ${PERI_SHARED}/peridynamics/pd_execution.h
         ${PERI_SHARED}/../peri_execution/pd_execution.cpp
+        ${PERI_SHARED}/peridynamics/pd_finite_volume_biot_batch.h
+        ${PERI_SHARED}/../peri_execution/pd_finite_volume_biot_cuda.cu
         ${PERI_SHARED}/peridynamics/pd_solid_time_step.h
         ${PERI_SHARED}/../peri_execution/pd_solid_time_step_cuda.cu
         ${PERI_SHARED}/../peri_execution/dpc_point_cuda.cu

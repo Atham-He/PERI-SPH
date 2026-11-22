@@ -10,6 +10,7 @@
 #include <Eigen/SVD>
 #include "pd_directional_crack_energy.h"
 #include "pd_layered_geometry.h"
+#include "pd_finite_volume_biot_terms.h"
 
 namespace SPH::solid_dynamics
 {
@@ -56,12 +57,12 @@ struct FiniteVolumeBiotEnergy
         Vecd l=svd.singularValues();if(svd.info()!=Eigen::Success||l.minCoeff()<=0)throw std::runtime_error("Finite-volume polar decomposition failed");
         Matd R=svd.matrixU()*svd.matrixV().transpose();Vecd e=l-Vecd::Constant(l.mean());
         Matd dev=svd.matrixV()*e.asDiagonal()*svd.matrixV().transpose();
-        Real z=std::log(J),j2m1=std::expm1(2*z),vol=.25*K*(j2m1-2*z);
-        Matd pv=.5*K*j2m1*F.inverse().transpose();
-        Result a;a.positive=mu*dev.squaredNorm()+(J>=1?vol:0);a.negative=J<1?vol:0;
+        const auto volumetric=peridynamics::finiteVolumeBiotVolumetric(K,J);
+        Matd pv=volumetric.piola_scale*F.inverse().transpose();
+        Result a;a.positive=mu*dev.squaredNorm()+(J>=1?volumetric.energy:0);a.negative=J<1?volumetric.energy:0;
         a.positive_P=R*(2*mu*dev);a.negative_P=Matd::Zero();
         if(J>=1)a.positive_P+=pv;else a.negative_P=pv;
-        Vecd principal_cauchy=(.5*K*j2m1*Vecd::Ones()+2*mu*e.cwiseProduct(l))/J;
+        Vecd principal_cauchy=(volumetric.piola_scale*Vecd::Ones()+2*mu*e.cwiseProduct(l))/J;
         Eigen::Index direction;a.max_effective_tension=principal_cauchy.maxCoeff(&direction);a.normal=svd.matrixV().col(direction);a.J=J;a.principal_stretches=svd.singularValues();return a;
     }
     Real tangentBound(const Matd&F,Real damage)const
@@ -71,11 +72,8 @@ struct FiniteVolumeBiotEnergy
     /** Reuse singular values already obtained by the energy evaluation. */
     Real tangentBound(const Vecd&l,Real J,Real damage)const
     {
-        Real a=l.minCoeff(),g=1-damage;
-        if(a<=0||J<=0)throw std::runtime_error("Invalid tangent-bound deformation");
-        Real vol=K*J*J*l.cwiseInverse().squaredNorm()+.5*K*std::abs(J*J-1)/(a*a);
-        Real dev=2*mu*(l.maxCoeff()+(l.array()-l.mean()).abs().maxCoeff())/a;
-        return (J<1?1:g)*vol+g*dev;
+        if(l.minCoeff()<=0||J<=0)throw std::runtime_error("Invalid tangent-bound deformation");
+        return peridynamics::finiteVolumeBiotTangent(K,mu,l,J,damage);
     }
     /** Stress-free lateral contraction of an undamaged uniaxial specimen.
      * Solved from this energy, not a small-strain Poisson extrapolation. */

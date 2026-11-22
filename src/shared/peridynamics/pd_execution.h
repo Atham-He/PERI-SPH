@@ -4,6 +4,7 @@
 #include "pd_bonded_interface_batch.h"
 #include "pd_crack_projection.h"
 #include "pd_crack_strength_batch.h"
+#include "pd_finite_volume_biot_batch.h"
 #include "pd_fluid_acoustic_batch.h"
 #include "pd_fluid_cfl_batch.h"
 #include "pd_fluid_traction_batch.h"
@@ -52,6 +53,7 @@ class PeriExecution
     std::unique_ptr<BondedInterfaceBatch> makeBondedInterface() const;
     std::unique_ptr<SurfacePlaneContactBatch> makeSurfacePlaneContact() const;
     std::unique_ptr<SpatialDerivativeBatch> makeSpatialDerivatives() const;
+    std::unique_ptr<FiniteVolumeBiotBatch> makeFiniteVolumeBiot() const;
     std::unique_ptr<dpc::PointBatch> makeDpcPoints(const dpc::Model &model) const;
     std::unique_ptr<SolidTimeStepBatch> makeSolidTimeStep(const std::vector<double> &mass) const;
     std::unique_ptr<PositionVerletBatch> makePositionVerlet() const;

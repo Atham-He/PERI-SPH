@@ -363,6 +363,7 @@ class CudaNosbPDBonds final : public NosbPDBondBatch
                    const std::vector<NosbPDBondGeometry> &bonds) override
     {
         configured_ = false;
+        uploaded_live_.clear();
         if (offsets.empty() || offsets.front() != 0 || offsets.back() != bonds.size() ||
             offsets.size() - 1 > sites || !std::is_sorted(offsets.begin(), offsets.end()) ||
             std::any_of(bonds.begin(), bonds.end(), [sites](const auto &bond) { return bond.particle >= sites; }))
@@ -388,7 +389,7 @@ class CudaNosbPDBonds final : public NosbPDBondBatch
 
         const auto blocks = static_cast<unsigned>((3 * rows_ - 1) / threads_ + 1);
         upload(sites_, sites, "NOSB-PD kinematic sites");
-        upload(live_, bond_live, "NOSB-PD live bond flags");
+        updateLiveMask(bond_live);
         tensors_.reserve(rows_);
         evaluateBondTensors<<<blocks, threads_>>>(offsets_.get(), bonds_.get(), sites_.get(), live_.get(),
             rows_, dt, tensors_.get());
@@ -436,7 +437,7 @@ class CudaNosbPDBonds final : public NosbPDBondBatch
         if (rows_ > max_blocks_)
             throw std::length_error("NOSB-PD failure stencil exceeds the device grid");
         upload(failure_sites_, sites, "NOSB-PD failure sites");
-        upload(live_, bond_live, "NOSB-PD live flags before failure screening");
+        updateLiveMask(bond_live);
         failure_decisions_.reserve(bond_count_);
         screenBondFailures<<<static_cast<unsigned>(rows_), threads_>>>(
             offsets_.get(), bonds_.get(), failure_sites_.get(), live_.get(), parameters, failure_decisions_.get());
@@ -455,7 +456,7 @@ class CudaNosbPDBonds final : public NosbPDBondBatch
 
         const auto blocks = static_cast<unsigned>((3 * rows_ - 1) / threads_ + 1);
         upload(force_sites_, sites, "NOSB-PD force sites");
-        upload(live_, bond_live, "NOSB-PD live bond flags before internal force");
+        updateLiveMask(bond_live);
         force_density_.reserve(rows_);
         assembleInternalBondForce<<<blocks, threads_>>>(offsets_.get(), bonds_.get(), force_sites_.get(),
             live_.get(), rows_, force_density_.get());
@@ -480,6 +481,17 @@ class CudaNosbPDBonds final : public NosbPDBondBatch
     }
 
   private:
+    void updateLiveMask(const std::vector<std::uint8_t> &bond_live)
+    {
+        // All stages interpret the same mask on the resident reference stencil.
+        // Check the bytes so edits, including restored bonds, take effect at the next call.
+        if (uploaded_live_ == bond_live)
+            return;
+        uploaded_live_.clear();
+        upload(live_, bond_live, "NOSB-PD live bond flags");
+        uploaded_live_ = bond_live;
+    }
+
     template <bool Reference>
     void accumulatePositionMoments(const NosbPDPositionSite *positions, const double *reference_volume,
                                    std::vector<ShapeHessian3> &moments)
@@ -504,7 +516,7 @@ class CudaNosbPDBonds final : public NosbPDBondBatch
 
         const auto blocks = static_cast<unsigned>((rows_ - 1) / threads_ + 1);
         upload(correction_sites_, sites, "NOSB-PD correction sites");
-        upload(live_, bond_live, "NOSB-PD live bond flags before force correction");
+        updateLiveMask(bond_live);
         correction_force_.reserve(rows_);
         assembleCorrectionForce<<<blocks, threads_>>>(offsets_.get(), bonds_.get(), correction_sites_.get(),
             live_.get(), rows_, parameters, correction_force_.get());
@@ -534,6 +546,7 @@ class CudaNosbPDBonds final : public NosbPDBondBatch
     DeviceBuffer<NosbPDCorrectionSite> correction_sites_;
     DeviceBuffer<NosbPDCorrectionForce> correction_force_;
     DeviceBuffer<std::uint8_t> live_;
+    std::vector<std::uint8_t> uploaded_live_;
     DeviceBuffer<NosbPDDeformationTensors> tensors_;
 };
 }

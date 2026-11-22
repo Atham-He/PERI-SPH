@@ -1,6 +1,7 @@
 #include "pd_bonded_interface_batch.h"
 #include "pd_cuda_buffer.cuh"
 
+#include <algorithm>
 #include <cmath>
 
 namespace SPH::peridynamics
@@ -12,11 +13,22 @@ using cuda_detail::DeviceBuffer;
 using cuda_detail::download;
 using cuda_detail::upload;
 
+struct TraceKinematics
+{
+    double position[3], velocity[3];
+    double force_divisor;
+};
+
+struct TraceForceIncrement
+{
+    double value[3];
+};
+
 struct TraceView
 {
     const std::size_t *offsets;
     const BondedTraceEntry *entries;
-    const TraceForceNode *nodes;
+    const TraceKinematics *nodes;
 };
 
 __device__ void gather(TraceView trace, std::size_t point, double *position, double *velocity)
@@ -186,7 +198,8 @@ template <class Point>
 __global__ void accumulateNodalForce(const std::size_t *__restrict__ offsets,
                                      const ParticleTraceContribution *__restrict__ entries,
                                      const Point *__restrict__ points, std::size_t count,
-                                     TraceForceNode *__restrict__ nodes)
+                                     const TraceKinematics *__restrict__ nodes,
+                                     TraceForceIncrement *__restrict__ increments)
 {
     const std::size_t thread = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::size_t node = thread / force_lanes;
@@ -196,7 +209,11 @@ __global__ void accumulateNodalForce(const std::size_t *__restrict__ offsets,
 
     const auto begin = offsets[node], end = offsets[node + 1];
     if (begin == end)
+    {
+        if (lane == 0)
+            increments[node] = {};
         return;
+    }
 
     const double divisor = nodes[node].force_divisor;
     double force[3]{};
@@ -215,7 +232,7 @@ __global__ void accumulateNodalForce(const std::size_t *__restrict__ offsets,
 
     if (lane == 0)
         for (int d = 0; d < 3; ++d)
-            nodes[node].external[d] += force[d];
+            increments[node].value[d] = force[d];
 }
 
 struct DeviceTrace
@@ -223,7 +240,11 @@ struct DeviceTrace
     DeviceBuffer<std::size_t> offsets, transpose_offsets;
     DeviceBuffer<BondedTraceEntry> entries;
     DeviceBuffer<ParticleTraceContribution> contributions;
-    DeviceBuffer<TraceForceNode> nodes;
+    DeviceBuffer<TraceKinematics> nodes;
+    DeviceBuffer<TraceForceIncrement> increments;
+    std::vector<TraceKinematics> host_kinematics;
+    std::vector<TraceForceIncrement> host_increments;
+    std::vector<std::size_t> participating_nodes;
     std::size_t count = 0;
 
     template <class IncludeRow>
@@ -237,6 +258,36 @@ struct DeviceTrace
         upload(transpose_offsets, transpose.offsets);
         upload(contributions, transpose.entries);
         nodes.reserve(count);
+        increments.reserve(count);
+        host_kinematics.resize(count);
+        host_increments.resize(count);
+        participating_nodes.clear();
+        for (std::size_t i = 0; i < count; ++i)
+            if (transpose.offsets[i] != transpose.offsets[i + 1])
+                participating_nodes.push_back(i);
+    }
+
+    void uploadKinematics(const std::vector<TraceForceNode> &state)
+    {
+        for (std::size_t i = 0; i < count; ++i)
+        {
+            const auto &src = state[i];
+            auto &dst = host_kinematics[i];
+            std::copy_n(src.position, 3, dst.position);
+            std::copy_n(src.velocity, 3, dst.velocity);
+            dst.force_divisor = src.force_divisor;
+        }
+        upload(nodes, host_kinematics);
+    }
+
+    // The host already owns loads from other physics. Transfer just the
+    // assembled increments and add them to those loads once.
+    void addIncrements(std::vector<TraceForceNode> &state)
+    {
+        download(host_increments, increments);
+        for (auto i : participating_nodes)
+            for (int d = 0; d < 3; ++d)
+                state[i].external[d] += host_increments[i].value[d];
     }
 
     TraceView view() const { return {offsets.get(), entries.get(), nodes.get()}; }
@@ -259,7 +310,7 @@ void accumulate(DeviceTrace &trace, const DeviceBuffer<Point> &points, int maxim
         return;
     static_assert(threads % warp_lanes == 0);
     accumulateNodalForce<<<launchBlocks(trace.count * force_lanes, maximum), threads>>>(trace.transpose_offsets.get(),
-        trace.contributions.get(), points.get(), trace.count, trace.nodes.get());
+        trace.contributions.get(), points.get(), trace.count, trace.nodes.get(), trace.increments.get());
     check(cudaGetLastError(), "surface trace force accumulation");
 }
 
@@ -293,15 +344,15 @@ class CudaBondedInterface final : public BondedInterfaceBatch
         points.resize(point_count_);
         if (point_count_ == 0)
             return;
-        upload(a_.nodes, a);
-        upload(b_.nodes, b);
+        a_.uploadKinematics(a);
+        b_.uploadKinematics(b);
         evaluateInterface<<<launchBlocks(point_count_, properties_.maxGridSize[0]), threads>>>(a_.view(), b_.view(), stiffness_.get(), point_count_, points_.get());
         check(cudaGetLastError(), "bonded interface evaluation");
         accumulate(a_, points_, properties_.maxGridSize[0]);
         accumulate(b_, points_, properties_.maxGridSize[0]);
         download(points, points_);
-        download(a, a_.nodes);
-        download(b, b_.nodes);
+        a_.addIncrements(a);
+        b_.addIncrements(b);
     }
 
   private:
@@ -348,7 +399,7 @@ class CudaSurfacePlaneContact final : public SurfacePlaneContactBatch
             friction->trials.resize(point_count_);
         if (point_count_ == 0)
             return;
-        upload(trace_.nodes, nodes);
+        trace_.uploadKinematics(nodes);
         if (friction)
         {
             upload(history_, friction->committed);
@@ -360,7 +411,7 @@ class CudaSurfacePlaneContact final : public SurfacePlaneContactBatch
         check(cudaGetLastError(), "plane contact evaluation");
         accumulate(trace_, points_, max_grid_);
         download(points, points_);
-        download(nodes, trace_.nodes);
+        trace_.addIncrements(nodes);
         if (friction)
             download(friction->trials, trials_);
     }

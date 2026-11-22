@@ -84,6 +84,13 @@ def accepted_checkpoint(path, fingerprint, step):
 def run(a):
     root=Path(a.output_root).resolve();root.mkdir(parents=True,exist_ok=True)
     source=Path(a.source).resolve();binary=Path(a.binary).resolve();cfg=Path(a.config).resolve();cache=Path(a.cells).resolve();bank=Path(a.bank).resolve()
+    if bool(a.resume_checkpoint)!=bool(a.resume_manifest):
+        raise RuntimeError('Continuation requires both checkpoint and its original production manifest')
+    origin=Path(a.resume_manifest).resolve() if a.resume_manifest else None
+    previous=json.loads(origin.read_text()) if origin else None
+    previous_execution=previous['identity'].get('execution','cpu') if previous else 'cpu'
+    execution=a.execution or previous_execution
+
     acceptance=json.loads((Path(a.benchmark_root)/'acceptance.json').read_text())
     preflight=json.loads(Path(a.preflight).read_text())
     benchmark_manifest=json.loads(Path(a.benchmark_manifest).read_text());preflight_manifest=json.loads(Path(a.preflight_manifest).read_text())
@@ -101,6 +108,20 @@ def run(a):
         if a.column_tied_interface:
             column=json.loads((Path(a.benchmark_root)/'column_interface_acceptance.json').read_text())
             if column.get('status')!='PASSED':raise RuntimeError('Fixed-column fracture benchmark failed')
+    # Older CPU receipts predate the execution option. CUDA always needs
+    # acceptance from the same backend for both fracture and coupled mechanics.
+    def recorded_execution(receipt):
+        return next((arg.partition('=')[2] for arg in reversed(receipt['argv'])
+                     if arg.startswith('--execution=')), 'cpu')
+
+    if recorded_execution(benchmark_manifest)!=execution or recorded_execution(preflight_manifest)!=execution:
+        raise RuntimeError('Fracture benchmark and coupled preflight must use the requested execution backend')
+    if execution=='gpu':
+        coupled_parameters=json.loads(Path(a.preflight).with_name('parameters.json').read_text())
+        if coupled_parameters.get('execution_backend')!='cuda':
+            raise RuntimeError('Coupled preflight did not run with CUDA')
+        if a.fracture_contact_only and acceptance.get('execution_backend')!='cuda':
+            raise RuntimeError('Fracture benchmark did not run with CUDA')
     if benchmark_manifest.get('exit_code')!=0 or benchmark_manifest.get('diagnostic_replay') is not False:
         raise RuntimeError('Formal benchmark did not exit successfully or was a diagnostic replay')
     if a.column_tied_interface and '--column-tied-interface' not in preflight_manifest.get('argv',[]):
@@ -108,6 +129,7 @@ def run(a):
     if subprocess.check_output(['git','status','--porcelain'],cwd=source,text=True).strip():raise RuntimeError('Pin a clean canonical source before the production history')
     values=dict(line.split('=',1) for line in cfg.read_text().splitlines() if line.strip() and not line.lstrip().startswith('#'))
     material=Path(values['dpc-table'].strip());identity={'source_commit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=source,text=True).strip(),'binary_sha256':sha(binary),'config_sha256':sha(cfg),'DPC_table_sha256':sha(material),'core_cache_sha256':sha(cache),'crack_bank_sha256':sha(bank),'checkpoint_schema':(5 if a.column_tied_interface else 4)+(2 if a.fracture_contact_only else 0)}
+    identity['execution']=execution
     if a.fracture_contact_only:identity['fracture_surface_law']='contact_only'
     if a.affine_crack_contact:
         if (not a.fracture_contact_only or preflight.get('affine_crack_contact') is not True
@@ -140,11 +162,10 @@ def run(a):
     if benchmark_manifest.get('binary_sha256')!=sha(benchmark_binary):raise RuntimeError('Accepted benchmark executable has changed')
     execution_fingerprint=hashlib.sha256(json.dumps(identity,sort_keys=True).encode()).hexdigest();fingerprint=execution_fingerprint;owner=process_identity(os.getpid())
     inherited=[];checkpoint=None
-    if bool(a.resume_checkpoint)!=bool(a.resume_manifest):raise RuntimeError('Continuation requires both checkpoint and its original production manifest')
     if a.resume_accepted_step and (not a.column_tied_interface or not a.resume_checkpoint):
         raise RuntimeError('An explicit retained equilibrium is supported for a fixed-column handoff')
     if a.resume_checkpoint:
-        origin=Path(a.resume_manifest).resolve();previous=json.loads(origin.read_text());checkpoint=Path(a.resume_checkpoint).resolve()
+        checkpoint=Path(a.resume_checkpoint).resolve()
         if a.resume_accepted_step:
             latest=accepted_checkpoint(checkpoint,previous['fingerprint'],a.resume_accepted_step)
         else:
@@ -166,6 +187,7 @@ def run(a):
             if len(entries)!=1 or entries[0] is not inherited[-1]:raise RuntimeError('Accepted checkpoint must belong to the last original segment')
             entries[0]['trajectory_end_s']=latest['elapsed_s']
         receipt={'recorded_UTC':utc(),'status':'INPUTS_VERIFIED_NATIVE_STATE_CHECK_PENDING','origin_manifest':str(origin),'origin_manifest_sha256':sha(origin),'origin_source_commit':previous['identity']['source_commit'],'source_commit':identity['source_commit'],'checkpoint':str(checkpoint),'checkpoint_sha256':sha(checkpoint),'checkpoint_step':latest['step'],'history_fingerprint':fingerprint,'execution_fingerprint':execution_fingerprint,'frozen_inputs_unchanged':True,'checkpoint_bytes_modified':False,'loading_history_reset':False,'native_force_and_checksum_verification_required':True}
+        receipt.update(origin_execution=previous_execution,execution=execution)
         put(root/'resume_compatibility.json',receipt)
     manifest={'created_UTC':utc(),'source':str(source),'binary':str(binary),'input_config':str(cfg),'identity':identity,'fingerprint':fingerprint,'execution_fingerprint':execution_fingerprint,'owner':owner,'same_history_checkpoint_handoff':True,'material_parameters_changed':False,'capsule_kinematics':'NOSB_PD_shell_plus_SNSNI_solid_SPH_core','benchmark_root':str(Path(a.benchmark_root).resolve()),'preflight':str(Path(a.preflight).resolve()),'segments':list(inherited)}
     if (root/'production_manifest.json').exists():raise RuntimeError('Output root already has a production manifest')
@@ -175,7 +197,7 @@ def run(a):
         if sha(binary)!=identity['binary_sha256'] or sha(cfg)!=identity['config_sha256'] or sha(material)!=identity['DPC_table_sha256'] or sha(bank)!=identity['crack_bank_sha256'] or sha(cache)!=identity['core_cache_sha256']:raise RuntimeError('Pinned source/input/binary changed before continuation')
         output=root/('mechanics_segment_'+str(segment));runtime=root/('runtime_segment_'+str(segment));runtime.mkdir(exist_ok=True)
         if output.exists() and any(output.iterdir()):raise RuntimeError('Production output segment already contains results')
-        cmd=[str(binary),'--config='+str(cfg),'--snsni-cells='+str(cache),'--fracture-facets='+str(bank),'--output='+str(output),'--checkpoint-fingerprint='+fingerprint]
+        cmd=[str(binary),'--config='+str(cfg),'--snsni-cells='+str(cache),'--fracture-facets='+str(bank),'--output='+str(output),'--checkpoint-fingerprint='+fingerprint,'--execution='+execution]
         if a.column_tied_interface:cmd.append('--column-tied-interface')
         if a.fracture_contact_only:cmd.append('--fracture-contact-only')
         if a.affine_crack_contact:cmd.append('--affine-crack-contact')
@@ -237,6 +259,8 @@ if __name__=='__main__':
     p.add_argument('--affine-crack-contact',action='store_true')
     p.add_argument('--affine-inner-interface',action='store_true')
     p.add_argument('--local-platen-step-bound',action='store_true',help='check the platen step limit using the potentially contacting traces')
+    p.add_argument('--execution',choices=('cpu','gpu'),
+                   help='solver backend (default: original backend on continuation, CPU for a new run)')
     a=p.parse_args()
     if a.checkpoint_wall_seconds is not None and a.checkpoint_wall_seconds<=0:
         p.error('--checkpoint-wall-seconds requires a positive integer')

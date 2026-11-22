@@ -7,6 +7,7 @@
 #include "pd_energy_crack_band.h"
 #include "pd_layered_fracture_reference.h"
 #include "pd_spatial_derivatives.h"
+#include "pd_reference_spectral_bound.h"
 namespace SPH::solid_dynamics {
 class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
   public:
@@ -17,13 +18,14 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
     Real stabilizer,stabilizer_dt=0,maximum_projection_error=0;size_t version=~size_t(0);
     Real *stored_density,*hg_density,*tangent_bound;Matd *F,*P,*stress;Vecd *internal,*hourglass;
     PDBrokenBondEnergy(BaseInnerRelation&r,PDLayeredFractureReference&ref,Real E,Real nu,Real hg,Real horizon,
-                       std::unique_ptr<peridynamics::SpatialDerivativeBatch> derivatives = nullptr)
+                       std::unique_ptr<peridynamics::SpatialDerivativeBatch> derivatives = nullptr,
+                       bool tighter_time_bound = false)
       :LocalDynamics(r.getSPHBody()),DataDelegateInner(r),reference(ref),elastic(E,nu),
        x(particles_->getVariableDataByName<Vecd>("Position")),volume(particles_->getVariableDataByName<Real>("VolumetricMeasure")),
        mass(particles_->getVariableDataByName<Real>("Mass")),acc(particles_->getVariableDataByName<Vecd>("PDAcceleration")),
        F(particles_->getVariableDataByName<Matd>("DeformationGradient")),P(particles_->getVariableDataByName<Matd>("PDPK1")),
        stress(particles_->getVariableDataByName<Matd>("PDStress")),internal(particles_->getVariableDataByName<Vecd>("PDInternalForce")),
-       hourglass(particles_->getVariableDataByName<Vecd>("HourglassForce")), derivatives_(std::move(derivatives)) {
+       hourglass(particles_->getVariableDataByName<Vecd>("HourglassForce")), derivatives_(std::move(derivatives)), tighter_time_bound_(tighter_time_bound) {
         if(hg<0||horizon<=0)throw std::invalid_argument("Invalid live-bond stabilizer");stabilizer=hg*elastic.K/(horizon*horizon);
         stored_density=particles_->registerStateVariableData<Real>("ShellStoredEnergyDensity");hg_density=particles_->registerStateVariableData<Real>("ShellStabilizationEnergyDensity");tangent_bound=particles_->registerStateVariableData<Real>("ShellTangentModulusBound");
     }
@@ -46,7 +48,10 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
             for(size_t n=0;n<nb.current_size_;++n)if(reference.live(i,n)){auto&e=projection[i][n];e.coefficient=e.weight*inverse.inverse*e.basis;Real k=volume[i]*stabilizer*e.weight;rate[i]+=2*k/mass[i];rate[nb.j_[n]]+=2*k/mass[nb.j_[n]];}
             Real error=(moment*inverse.inverse*moment-moment).norm()/moment.norm();maximum_projection_error=std::max(maximum_projection_error,error);if(error>1e-8)throw std::runtime_error("Live residual least-squares projection failed");
         }
-        Real largest=0;for(Real a:rate)largest=std::max(largest,a);stabilizer_dt=largest>0?.2/std::sqrt(largest):std::numeric_limits<Real>::infinity();version=reference.topology_version;
+        Real largest=0;for(Real a:rate)largest=std::max(largest,a);stabilizer_dt=largest>0?.2/std::sqrt(largest):std::numeric_limits<Real>::infinity();
+        if (tighter_time_bound_)
+            gradient_bound_=peridynamics::boundReferenceGradient(reference.rows,volume,mass);
+        version=reference.topology_version;
     }
     bool hasDeviceDerivatives() const noexcept { return derivatives_ != nullptr; }
     // Batched evaluation is required when a device backend owns the force field.
@@ -139,10 +144,24 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
     }
     Real energy()const{Real result=0;for(size_t i=0;i<projection.size();++i)result+=volume[i]*stored_density[i];return result;}
     Real stabilizationEnergy()const{Real result=0;for(size_t i=0;i<projection.size();++i)result+=volume[i]*hg_density[i];return result;}
-    Real finiteStrainTimeStep()const{Real bound=3*elastic.K;for(size_t i=0;i<projection.size();++i)bound=std::max(bound,tangent_bound[i]);return reference.elastic_dt_bound*std::sqrt(3*elastic.K/bound);}
+    Real finiteStrainTimeStep()const
+    {
+        Real tangent=3*elastic.K;
+        for(size_t i=0;i<projection.size();++i)
+            tangent=std::max(tangent,tangent_bound[i]);
+        const Real previous=reference.elastic_dt_bound*std::sqrt(3*elastic.K/tangent);
+        if (!tighter_time_bound_) return previous;
+        const Real certified_dt=.2/std::sqrt(tangent*gradient_bound_.upper);
+        return std::max(previous, certified_dt);
+    }
+
+    const peridynamics::ReferenceSpectralBound &gradientBound() const { return gradient_bound_; }
+
   private:
     Vecd*x;Real*volume,*mass;Vecd*acc;
     std::unique_ptr<peridynamics::SpatialDerivativeBatch> derivatives_;
+    bool tighter_time_bound_;
+    peridynamics::ReferenceSpectralBound gradient_bound_;
     bool derivative_stencil_current_ = false;
     bool device_residual_current_ = false;
     std::vector<peridynamics::ParticleVector3> device_field_;

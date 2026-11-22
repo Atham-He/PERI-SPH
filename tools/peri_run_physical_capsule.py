@@ -3,7 +3,7 @@ No parameter search, retry, memory cap, notification service or scheduler.
 The first accepted load point closes segment 0; segment 1 continues its EXACT
 full state. A failure is saved/reported and never converted into a new case.
 """
-import argparse, csv, hashlib, json, os, struct, subprocess, time, traceback
+import argparse, csv, hashlib, json, math, os, struct, subprocess, time, traceback
 from pathlib import Path
 from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
@@ -90,6 +90,14 @@ def run(a):
     previous=json.loads(origin.read_text()) if origin else None
     previous_execution=previous['identity'].get('execution','cpu') if previous else 'cpu'
     execution=a.execution or previous_execution
+    old_identity=previous['identity'] if previous else {}
+    spectral_mode='mass_normalized_gradient_gram'
+    tighter_shell_step=a.tighter_shell_step_bound or old_identity.get('shell_step_bound')==spectral_mode
+    reaction_window=a.reaction_settling_window_s
+    if reaction_window is None:
+        reaction_window=old_identity.get('reaction_settling_window_s')
+    if reaction_window is not None and (not math.isfinite(reaction_window) or reaction_window<=0):
+        raise ValueError('Reaction settling window must be finite and positive')
 
     acceptance=json.loads((Path(a.benchmark_root)/'acceptance.json').read_text())
     preflight=json.loads(Path(a.preflight).read_text())
@@ -111,7 +119,7 @@ def run(a):
     # Older CPU receipts predate the execution option. CUDA always needs
     # acceptance from the same backend for both fracture and coupled mechanics.
     def recorded_execution(receipt):
-        return next((arg.partition('=')[2] for arg in reversed(receipt['argv'])
+        return next((arg.partition('=')[2] for arg in reversed(receipt.get('argv',[]))
                      if arg.startswith('--execution=')), 'cpu')
 
     if recorded_execution(benchmark_manifest)!=execution or recorded_execution(preflight_manifest)!=execution:
@@ -147,6 +155,21 @@ def run(a):
     if a.fracture_contact_only:
         identity['checkpoint_schema'] = 11
         identity['legacy_contact_checkpoint_schema'] = legacy_checkpoint_schema
+    settling_option=None
+    preflight_args=preflight_manifest.get('argv',[])
+    if tighter_shell_step:
+        if '--tighter-shell-step-bound' not in preflight_args:
+            raise RuntimeError('The shell time-step bound requires a matching coupled preflight')
+        identity['shell_step_bound']=spectral_mode
+    if reaction_window is not None:
+        settling_option=f'--reaction-settling-window-s={reaction_window:.17g}'
+        if settling_option not in preflight_args:
+            raise RuntimeError('The plate-reaction criterion requires a matching coupled preflight')
+        identity['reaction_settling_window_s']=reaction_window
+    if previous and execution!=previous_execution:
+        for option in ('shell_step_bound','reaction_settling_window_s'):
+            if identity.get(option)!=old_identity.get(option):
+                raise RuntimeError('A backend handoff must keep the time-step and reaction acceptance settings')
     # A PASSED file from an earlier executable/input cannot authorize a new run.
     for name,path in [('binary_sha256',binary),('config_sha256',cfg),('DPC_table_sha256',material),('core_cache_sha256',cache),('crack_bank_sha256',bank)]:
         if preflight_manifest.get(name)!=sha(path):raise RuntimeError('Coupled preflight identity mismatch: '+name)
@@ -186,6 +209,14 @@ def run(a):
             entries=[entry for entry in inherited if Path(entry['output']).resolve()==checkpoint.parent]
             if len(entries)!=1 or entries[0] is not inherited[-1]:raise RuntimeError('Accepted checkpoint must belong to the last original segment')
             entries[0]['trajectory_end_s']=latest['elapsed_s']
+        elif execution!=previous_execution:
+            # A live backend handoff may leave later samples in the origin.
+            # Join the trajectory at the common committed checkpoint.
+            with (checkpoint.parent/'progress.csv').open(newline='') as stream:
+                saved=next((sample for sample in csv.DictReader(stream)
+                            if int(sample['step'])==latest['step']),None)
+            if saved:
+                inherited[-1]['trajectory_end_s']=float(saved['elapsed_s'])
         receipt={'recorded_UTC':utc(),'status':'INPUTS_VERIFIED_NATIVE_STATE_CHECK_PENDING','origin_manifest':str(origin),'origin_manifest_sha256':sha(origin),'origin_source_commit':previous['identity']['source_commit'],'source_commit':identity['source_commit'],'checkpoint':str(checkpoint),'checkpoint_sha256':sha(checkpoint),'checkpoint_step':latest['step'],'history_fingerprint':fingerprint,'execution_fingerprint':execution_fingerprint,'frozen_inputs_unchanged':True,'checkpoint_bytes_modified':False,'loading_history_reset':False,'native_force_and_checksum_verification_required':True}
         receipt.update(origin_execution=previous_execution,execution=execution)
         put(root/'resume_compatibility.json',receipt)
@@ -203,6 +234,8 @@ def run(a):
         if a.affine_crack_contact:cmd.append('--affine-crack-contact')
         if a.affine_inner_interface:cmd.append('--affine-inner-interface')
         if a.local_platen_step_bound:cmd.append('--local-platen-step-bound')
+        if tighter_shell_step:cmd.append('--tighter-shell-step-bound')
+        if settling_option:cmd.append(settling_option)
         if a.checkpoint_wall_seconds is not None:cmd.append('--checkpoint-wall-seconds='+str(a.checkpoint_wall_seconds))
         if checkpoint is None:cmd.append('--checkpoint-stop-after-equilibrium')
         else:cmd.append('--resume-state='+str(checkpoint))
@@ -259,6 +292,10 @@ if __name__=='__main__':
     p.add_argument('--affine-crack-contact',action='store_true')
     p.add_argument('--affine-inner-interface',action='store_true')
     p.add_argument('--local-platen-step-bound',action='store_true',help='check the platen step limit using the potentially contacting traces')
+    p.add_argument('--tighter-shell-step-bound',action='store_true',
+                   help='use the mass-normalized bound on the active shell gradient')
+    p.add_argument('--reaction-settling-window-s',type=float,
+                   help='accept a held load using the platen reaction stability window')
     p.add_argument('--execution',choices=('cpu','gpu'),
                    help='solver backend (default: original backend on continuation, CPU for a new run)')
     a=p.parse_args()

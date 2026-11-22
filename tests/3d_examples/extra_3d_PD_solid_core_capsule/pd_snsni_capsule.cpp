@@ -10,6 +10,8 @@
 #include "recovery_checkpoint.h"
 #include "pd_extrinsic_crack_growth.h"
 #include "pd_fracture_topology_checkpoint.h"
+#include "plate_reaction_window.h"
+#include <sstream>
 using namespace SPH::solid_dynamics;
 using namespace SPH::peridynamics;
 using Field=StdVec<Vecd>;
@@ -19,6 +21,9 @@ bool affine_crack_contact=false,affine_contact_handoff_only=false;
 bool affine_inner_interface=false,inner_interface_handoff_only=false;
 constexpr uint64_t split_contact_checkpoint=11;
 uint64_t legacy_contact_layout=0;
+bool tighter_shell_step=false;
+Real reaction_settling_window_s=0;
+constexpr char reaction_settling_option[]="--reaction-settling-window-s=";
 
 uint64_t physicalLayout(uint64_t version)
 {
@@ -103,7 +108,7 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells,const PeriExec
     InteractionWithUpdate<NosbPDQuadraticSecondStep> quadratic_second(relation,sr);
     InteractionDynamics<NosbPDQuadraticThirdStep> quadratic_third(relation,sr);
     PDBrokenBondEnergy sb(relation,sr,o.shell_E,o.shell_nu,o.pd_hourglass,shell.getSPHAdaptation().getKernel()->CutOffRadius(),
-                          execution.makeSpatialDerivatives());
+                          execution.makeSpatialDerivatives(),tighter_shell_step);
     system.initializeSystemCellLinkedLists();system.initializeSystemConfigurations();shape.exec();sr.initialize();sb.rebuild();
     SolidForcePort core_port(core,SolidForcePort::Storage::ForcePrior),pd_port(shell,SolidForcePort::Storage::PDAccelerationPrior);
     StdVec<Vecd>points,outer_points;StdVec<Real>areas;
@@ -617,6 +622,31 @@ std::vector<std::pair<Real,std::string>>frame_index;
         }
         cohesive_force=growth.cohesiveForces(growth.positions());snapshot("resumed",compression(stage_time));
         std::ofstream receipt(out/"resume_validation.json");receipt<<std::setprecision(17)<<"{\"status\":\"PASSED\",\"step\":"<<time.steps<<",\"strain\":"<<compression(stage_time)/o.diameter<<",\"force_relative_error\":"<<error/std::max(scale,Real(1e-20))<<",\"core_commits\":"<<cb.commits<<",\"kinetic_energy_J\":"<<time.kinetic()<<",\"loading_history_reset\":false}\n";}
+    PlateReactionWindow reaction_window(reaction_settling_window_s);
+    if(reaction_settling_window_s>0&&!recovery::checkpoint.resume.empty()&&
+       !column_hold&&!inner_hold&&stage_time>=o.ramp_duration)
+    {
+        // The checkpoint restores the committed CSV prefix, including the
+        // fixed-displacement samples before the restart.
+        const Real hold_start=elapsed-(stage_time-o.ramp_duration);
+        std::ifstream history(out/"progress.csv");
+        std::string line;
+        std::getline(history,line);
+        while(std::getline(history,line)){
+            std::istringstream fields(line);
+            size_t sample_step,sample_stage;
+            Real sample_time,strain,displacement,dt,upper,lower;
+            char comma;
+            if(fields>>sample_step>>comma>>sample_stage>>comma>>sample_time>>comma>>strain>>
+               comma>>displacement>>comma>>dt>>comma>>upper>>comma>>lower&&
+               sample_stage==stage&&sample_step<=time.steps&&sample_time>=hold_start)
+                reaction_window.observe(sample_time,upper,lower);
+        }
+    }
+    if (tighter_shell_step)
+        std::cout<<std::setprecision(17)<<"SHELL_STEP_BOUND gradient_upper "<<sb.gradientBound().upper
+                 <<" gradient_max_diagonal "<<sb.gradientBound().largest_diagonal
+                 <<" shell_dt "<<sb.finiteStrainTimeStep()<<" crack_contact_dt "<<growth.contact_dt<<std::endl;
     save();
     if(column_handoff_only||affine_contact_handoff_only||inner_interface_handoff_only)return 0;
 
@@ -685,9 +715,22 @@ std::vector<std::pair<Real,std::string>>frame_index;
         if(!fully_failed&&growth.failed_quadrature){fully_failed=true;events<<(fracture_contact_only?"first_contact_only_crack":"first_full_cohesive_failure")<<','<<time.steps<<','<<stage<<','<<u/o.diameter<<",0,0,"<<sr.physical_broken_bonds<<','<<growth.max_gap<<'\n';events.flush();snapshot("first_full_failure",u);}
         if(time.steps%200==0){Real residual=0,minc=1,mins=1,newK=time.kinetic();for(size_t j=0;j<count;++j){Vecd f=bulk_force[j];if(j>=cn)f+=cohesive_force[j-cn];residual+=f.squaredNorm();}residual=std::sqrt(residual)/std::max(mean,Real(1e-20));for(const auto&F:cb.F)minc=std::min(minc,F.determinant());for(size_t j=0;j<sn;++j)mins=std::min(mins,sF[j].determinant());Real imbalance=std::abs(contact.upper-contact.lower)/std::max(mean,Real(1e-20)),kr=newK/std::max(mean*u,Real(1e-30));Real budget=Wp+interface_switch_work-Wcore-(recoverable()-U0)-(growth.dissipated-growth.initial_dissipation)-(newK-K0)-Wd-Walgorithmic-growth.stabilizer_transfer_loss+growth.insertion_defect;
             auto row=[&](std::ostream&f){f<<time.steps<<','<<stage<<','<<elapsed<<','<<u/o.diameter<<','<<u<<','<<dt<<','<<contact.upper<<','<<contact.lower<<','<<residual<<','<<imbalance<<','<<kr<<','<<minc<<','<<mins<<','<<sr.physical_broken_bonds<<','<<growth.insertion_events<<','<<growth.failed_quadrature<<','<<growth.max_gap<<','<<growth.stored<<','<<growth.dissipated-growth.initial_dissipation<<','<<sb.energy()<<','<<tie->energy<<','<<contact.energy<<','<<growth.contact_energy<<','<<std::max(contact.max_penetration,growth.max_penetration)<<','<<Wp<<','<<Wcore<<','<<Wd<<','<<Walgorithmic<<','<<growth.stabilizer_transfer_loss<<','<<growth.insertion_defect<<','<<budget<<'\n';f.flush();};row(progress);if(time.steps%1000==0)std::cout<<"PROGRESS step="<<time.steps<<" stage="<<stage<<" strain="<<u/o.diameter<<" force="<<mean<<" residual="<<residual<<" cracks="<<growth.insertion_events<<" gap="<<growth.max_gap<<" dt="<<dt<<std::endl;
-            bool good=(column_hold||inner_hold||stage_time>=o.ramp_duration)&&mean>1e-10&&residual<=o.force_tolerance&&imbalance<=o.balance_tolerance&&kr<=o.kinetic_tolerance;
-            checks=good?checks+1:0;
-            if(checks>=3){
+            const bool use_reaction_window=reaction_settling_window_s>0&&!column_hold&&!inner_hold;
+            Real reaction_span=std::numeric_limits<Real>::infinity();
+            bool accept=false;
+            if(use_reaction_window){
+                if(stage_time>=o.ramp_duration){
+                    reaction_window.observe(elapsed,contact.upper,contact.lower);
+                    reaction_span=reaction_window.relativeSpan();
+                    accept=reaction_span<=o.balance_tolerance;
+                }
+            }else{
+                const bool good=(column_hold||inner_hold||stage_time>=o.ramp_duration)&&
+                    mean>1e-10&&residual<=o.force_tolerance&&imbalance<=o.balance_tolerance&&kr<=o.kinetic_tolerance;
+                checks=good?checks+1:0;
+                accept=checks>=3;
+            }
+            if(accept){
                 if(column_hold||inner_hold){
                     auto file=out/(inner_hold?"affine_inner_reequilibration.json":"column_reequilibration.json");
                     std::ofstream report(file);report<<std::setprecision(17)
@@ -702,6 +745,10 @@ std::vector<std::pair<Real,std::string>>frame_index;
                 }else{
                     row(eq);snapshot(std::to_string(stage),u);
                     std::cout<<"ACCEPTED stage="<<stage<<" force="<<mean<<" cracks="<<growth.insertion_events<<std::endl;
+                    if(use_reaction_window)
+                        std::cout<<"REACTION_PLATEAU stage="<<stage<<" window_s="<<reaction_settling_window_s
+                                 <<" reaction_span="<<reaction_span<<std::endl;
+                    reaction_window.clear();
                     ++stage;stage_time=0;checks=0;
                 }
             }
@@ -714,7 +761,15 @@ std::vector<std::pair<Real,std::string>>frame_index;
 
 int main(int argc,char**argv)
 {
-    try{recovery::checkpoint.schema_version=4;std::string cells;PeriExecution::LegacyGpuSelection legacy{};std::vector<char*>args{argv[0]};for(int i=1;i<argc;++i){std::string a=argv[i];if(a.rfind("--snsni-cells=",0)==0)cells=a.substr(14);else if(a.rfind("--fracture-facets=",0)==0)fracture_bank_input=a.substr(18);else if(a=="--column-tied-interface")use_column_interface=true;else if(a=="--column-interface-handoff-only")column_handoff_only=true;else if(a=="--local-platen-step-bound")local_platen_step_bound=true;else if(a=="--fracture-contact-only")fracture_contact_only=true;else if(a=="--affine-crack-contact")affine_crack_contact=true;else if(a=="--affine-contact-handoff-only")affine_contact_handoff_only=true;else if(a=="--affine-inner-interface")affine_inner_interface=true;else if(a=="--inner-interface-handoff-only")inner_interface_handoff_only=true;else if(a=="--cuda-crack-projection")legacy.crack_projection=true;else if(a=="--cuda-bonded-interface")legacy.bonded_interface=true;else if(recovery::checkpoint.take(a)){}else args.push_back(argv[i]);}
+    try{recovery::checkpoint.schema_version=4;std::string cells;PeriExecution::LegacyGpuSelection legacy{};std::vector<char*>args{argv[0]};for(int i=1;i<argc;++i){std::string a=argv[i];if(a.rfind("--snsni-cells=",0)==0)cells=a.substr(14);else if(a.rfind("--fracture-facets=",0)==0)fracture_bank_input=a.substr(18);else if(a=="--column-tied-interface")use_column_interface=true;else if(a=="--column-interface-handoff-only")column_handoff_only=true;else if(a=="--local-platen-step-bound")local_platen_step_bound=true;else if(a=="--tighter-shell-step-bound")tighter_shell_step=true;
+        else if(a.rfind(reaction_settling_option,0)==0){
+            const std::string value=a.substr(sizeof(reaction_settling_option)-1);
+            size_t parsed=0;
+            reaction_settling_window_s=std::stod(value,&parsed);
+            if(parsed!=value.size()||!std::isfinite(reaction_settling_window_s)||reaction_settling_window_s<=0)
+                throw std::invalid_argument("Reaction settling window must be finite and positive");
+        }
+        else if(a=="--fracture-contact-only")fracture_contact_only=true;else if(a=="--affine-crack-contact")affine_crack_contact=true;else if(a=="--affine-contact-handoff-only")affine_contact_handoff_only=true;else if(a=="--affine-inner-interface")affine_inner_interface=true;else if(a=="--inner-interface-handoff-only")inner_interface_handoff_only=true;else if(a=="--cuda-crack-projection")legacy.crack_projection=true;else if(a=="--cuda-bonded-interface")legacy.bonded_interface=true;else if(recovery::checkpoint.take(a)){}else args.push_back(argv[i]);}
         if(use_column_interface){recovery::checkpoint.schema_version=5;recovery::checkpoint.compatible_read_version=4;}
         if(fracture_contact_only){
             recovery::checkpoint.compatible_read_version=recovery::checkpoint.schema_version;

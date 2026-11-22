@@ -21,7 +21,7 @@ set(PD_ASSEMBLY_HASHES "${MAIN_HASH};${FIXTURE_HASH};${COUPLING_HASH};${CRACK_CO
 foreach(PD_HEADER pd_quadratic_correspondence.h pd_principal_stress_onset.h
         pd_fracture_correspondence.h pd_fracture_surface.h pd_fragment_contact.h pd_energy_crack_band.h pd_directional_crack_energy.h
         pd_layered_geometry.h pd_layered_correspondence.h pd_layered_surface.h pd_coulomb_friction.h
-        pd_layered_fracture_reference.h pd_broken_bond_energy.h pd_fracture_visible_surface.h
+        pd_layered_fracture_reference.h pd_broken_bond_energy.h pd_reference_spectral_bound.h pd_fracture_visible_surface.h
         pd_cohesive_crack_law.h pd_cohesive_interface_imex.h pd_cohesive_surface_evolution.h
         pd_extrinsic_crack_growth.h pd_fracture_patch_partition.h pd_consistent_reconstruction.h pd_isoparametric_crack_surface.h pd_crack_face_contact.h pd_fracture_topology_checkpoint.h)
     set(PD_HEADER_PATH ${PERI_SHARED}/peridynamics/${PD_HEADER})
@@ -64,6 +64,7 @@ set(SNSNI_CAPSULE_HASHES "${ASSEMBLY_HASH};${MATERIAL_HASH}")
 foreach(SNSNI_FILE
         ${CMAKE_CURRENT_SOURCE_DIR}/pd_snsni_capsule.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/pd_snsni_capsule_fixture.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/plate_reaction_window.h
         ${CMAKE_CURRENT_SOURCE_DIR}/recovery_checkpoint.h
         ${PERI_SHARED}/particle_dynamics/solid_dynamics/solid_snsni_plastic.h
         ${PERI_SHARED}/materials/dpc_snsni_adapter.h

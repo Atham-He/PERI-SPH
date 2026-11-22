@@ -139,6 +139,15 @@ std::unique_ptr<NosbPDPlasticBatch> PeriExecution::makeNosbPDPlastic() const
     return nullptr;
 }
 
+std::unique_ptr<GelPointBatch> PeriExecution::makeGelPoints() const
+{
+#if defined(PERI_SPH_HAS_CUDA)
+    if (mode_ == PeriExecutionMode::GPU)
+        return makeCudaGelPoints();
+#endif
+    return nullptr;
+}
+
 std::unique_ptr<PositionVerletBatch> PeriExecution::makePositionVerlet() const
 {
 #if defined(PERI_SPH_HAS_CUDA)

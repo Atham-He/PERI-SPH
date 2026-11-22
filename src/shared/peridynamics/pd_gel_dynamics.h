@@ -4,6 +4,7 @@
 #include "base_local_dynamics.h"
 #include "base_body_relation.h"
 #include "base_particle_dynamics.h"
+#include "dynamics_algorithms.h"
 
 namespace SPH::solid_dynamics
 {
@@ -22,13 +23,41 @@ class GelConstitutiveUpdate : public LocalDynamics, public DataDelegateInner
     GelConstitutiveUpdate(BaseInnerRelation &relation, Stage stage);
     void interaction(size_t i, Real dt = 0);
 
+  protected:
+    void evaluateDevice(peridynamics::GelPointBatch &backend, Real dt);
+
   private:
+    Matd deformationAt(size_t i) const;
+    peridynamics::GelHistory historyAt(size_t i) const;
+    void publish(size_t i, Real dt, const Matd &F, const peridynamics::GelHistory &next,
+                 const peridynamics::GelResponse &response);
+    std::vector<peridynamics::GelPointState> device_points_;
+    std::vector<peridynamics::GelPointResult> device_results_;
     Stage stage_;
     GelViscoelasticSolid &material_;
     Vecd *position_;
     Real *volume_, *density_, *dissipation_, *midpoint_dissipation_, *energy_, *history_time_;
     Matd *inverse_shape_, *deformation_, *stress_, *pk1_, *force_state_, *accepted_stress_;
     Matd *green_, *viscous_, *midpoint_green_, *midpoint_viscous_;
+};
+class GelConstitutiveWithExecution : public InteractionDynamics<GelConstitutiveUpdate>
+{
+    using Base = InteractionDynamics<GelConstitutiveUpdate>;
+
+  public:
+    GelConstitutiveWithExecution(BaseInnerRelation &relation, Stage stage, peridynamics::GelPointBatch *backend)
+        : Base(relation, stage), backend_(backend) {}
+
+    void runMainStep(Real dt) override
+    {
+        if (backend_)
+            evaluateDevice(*backend_, dt);
+        else
+            Base::runMainStep(dt);
+    }
+
+  private:
+    peridynamics::GelPointBatch *backend_;
 };
 } // namespace SPH::solid_dynamics
 #endif

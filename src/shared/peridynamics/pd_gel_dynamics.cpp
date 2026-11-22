@@ -59,10 +59,35 @@ GelConstitutiveUpdate::GelConstitutiveUpdate(BaseInnerRelation &relation, Stage 
       midpoint_green_(particles_->getVariableDataByName<Matd>("GelMidpointGreenStrain")),
       midpoint_viscous_(particles_->getVariableDataByName<Matd>("GelMidpointViscousStrain")) {}
 
-void GelConstitutiveUpdate::interaction(size_t i, Real dt)
+namespace
+{
+void validateStagedTime(Real dt)
 {
     if (!std::isfinite(dt) || dt <= 0)
         throw std::invalid_argument("staged gel integration requires a positive time increment");
+}
+
+peridynamics::ShapeHessian3 packGelTensor(const Matd &tensor)
+{
+    peridynamics::ShapeHessian3 packed{};
+    for (int a = 0; a < Dimensions; ++a)
+        for (int b = 0; b < Dimensions; ++b)
+            packed.derivative[a][b] = tensor(a,b);
+    return packed;
+}
+
+Matd unpackGelTensor(const peridynamics::ShapeHessian3 &tensor)
+{
+    Matd value;
+    for (int a = 0; a < Dimensions; ++a)
+        for (int b = 0; b < Dimensions; ++b)
+            value(a,b) = tensor.derivative[a][b];
+    return value;
+}
+}
+
+Matd GelConstitutiveUpdate::deformationAt(size_t i) const
+{
     Matd moment = Matd::Zero();
     const auto &neighbors = inner_configuration_[i];
     for (size_t n = 0; n < neighbors.current_size_; ++n)
@@ -73,14 +98,59 @@ void GelConstitutiveUpdate::interaction(size_t i, Real dt)
         const Vecd reference = -neighbors.r_ij_[n] * neighbors.e_ij_[n];
         moment += neighbors.W_ij_[n] * volume_[j] * (position_[j] - position_[i]) * reference.transpose();
     }
-    const Matd F = moment * inverse_shape_[i];
-    const bool midpoint = stage_ == Stage::MidpointForce;
-    const peridynamics::GelHistory old = midpoint ? peridynamics::GelHistory{green_[i], viscous_[i], dissipation_[i]} :
-        peridynamics::GelHistory{midpoint_green_[i], midpoint_viscous_[i], midpoint_dissipation_[i]};
-    const auto next = peridynamics::advanceGel(F, 0.5 * dt, material_.gelParameters(), old);
+    return moment * inverse_shape_[i];
+}
+
+peridynamics::GelHistory GelConstitutiveUpdate::historyAt(size_t i) const
+{
+    if (stage_ == Stage::MidpointForce)
+        return {green_[i], viscous_[i], dissipation_[i]};
+    return {midpoint_green_[i], midpoint_viscous_[i], midpoint_dissipation_[i]};
+}
+
+void GelConstitutiveUpdate::interaction(size_t i, Real dt)
+{
+    validateStagedTime(dt);
+    const Matd F = deformationAt(i);
+    const auto next = peridynamics::advanceGel(F, 0.5 * dt, material_.gelParameters(), historyAt(i));
     const auto response = peridynamics::gelResponse(F, material_.gelParameters(), next);
+    publish(i, dt, F, next, response);
+}
+
+void GelConstitutiveUpdate::evaluateDevice(peridynamics::GelPointBatch &backend, Real dt)
+{
+    using namespace peridynamics;
+    validateStagedTime(dt);
+    const size_t count = particles_->TotalRealParticles();
+    device_points_.resize(count);
+    tbb::parallel_for(size_t(0), count, [&](size_t i)
+    {
+        const auto old = historyAt(i);
+        device_points_[i] = {packGelTensor(deformationAt(i)), packGelTensor(old.green),
+                             packGelTensor(old.viscous), old.dissipation};
+    });
+    const auto &p = material_.gelParameters();
+    backend.evaluate(device_points_, {p.bulk, p.equilibrium_shear, p.branch_shear, p.relaxation_time},
+                     0.5 * dt, device_results_);
+    if (device_results_.size() != count)
+        throw std::logic_error("Gel material backend returned an incomplete batch");
+    for (const auto &result : device_results_)
+        requireGelStatus(result.status);
+
+    tbb::parallel_for(size_t(0), count, [&](size_t i)
+    {
+        const auto &result = device_results_[i];
+        const GelHistory next{unpackGelTensor(result.green), unpackGelTensor(result.viscous), result.dissipation};
+        const GelResponse response{unpackGelTensor(result.pk1), unpackGelTensor(result.cauchy), result.free_energy};
+        publish(i, dt, unpackGelTensor(device_points_[i].deformation), next, response);
+    });
+}
+
+void GelConstitutiveUpdate::publish(size_t i, Real dt, const Matd &F, const peridynamics::GelHistory &next,
+                                    const peridynamics::GelResponse &response)
+{
     deformation_[i] = F;
-    if (midpoint)
+    if (stage_ == Stage::MidpointForce)
     {
         midpoint_green_[i] = next.green;
         midpoint_viscous_[i] = next.viscous;

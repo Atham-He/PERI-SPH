@@ -8,6 +8,7 @@
 #include "pd_fluid_cfl_batch.h"
 #include "pd_fluid_traction_batch.h"
 #include "pd_fluid_viscosity_batch.h"
+#include "pd_gel_batch.h"
 #include "pd_nosb_bond_batch.h"
 #include "pd_nosb_elastic_batch.h"
 #include "pd_nosb_plastic_batch.h"
@@ -56,6 +57,7 @@ class PeriExecution
     std::unique_ptr<NosbPDBondBatch> makeNosbPDBonds() const;
     std::unique_ptr<NosbPDElasticBatch> makeNosbPDElastic() const;
     std::unique_ptr<NosbPDPlasticBatch> makeNosbPDPlastic() const;
+    std::unique_ptr<GelPointBatch> makeGelPoints() const;
     std::unique_ptr<FluidTractionBatch> makeFluidTraction() const;
     std::unique_ptr<FluidAcousticBatch> makeFluidAcoustic() const;
     std::unique_ptr<FluidViscosityBatch> makeFluidViscosity() const;

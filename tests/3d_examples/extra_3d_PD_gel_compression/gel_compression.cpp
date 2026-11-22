@@ -9,6 +9,7 @@
 #include "execution_limits.h"
 #include "gel_surface_contact.h"
 #include "pd_contact_impulse.h"
+#include "pd_execution.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -45,7 +46,8 @@ void requireGoodStream(const std::ofstream &stream)
 }
 
 int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptions &options,
-             const peridynamics::CaseParameters &inputs, const peridynamics::CheckpointOptions &restart)
+             const peridynamics::CaseParameters &inputs, const peridynamics::CheckpointOptions &restart,
+             const peridynamics::PeriExecution &execution)
 {
     // Fail before SPHSystem can create/rotate output, and before particle allocation.
     ExecutionLimits limits;
@@ -79,7 +81,12 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
     InteractionWithUpdate<solid_dynamics::NosbPDShapeMatrix> shape(reference);
     SimpleDynamics<solid_dynamics::PDTimeStepInitialization> initialize(particle, makeShared<Gravity>(Vecd::Zero()));
     SimpleDynamics<solid_dynamics::NosbPDFirstStep> first(particle);
-    auto constitutive = peridynamics::makePDConstitutiveDynamics(reference);
+    auto gel_backend = material.isViscoelastic() ? execution.makeGelPoints() : nullptr;
+    auto elastic_backend = material.model == "elastic" ? execution.makeNosbPDElastic() : nullptr;
+    auto plastic_backend = material.isPlastic() ? execution.makeNosbPDPlastic() : nullptr;
+    std::cout << "PD material backend " << (gel_backend || elastic_backend || plastic_backend ? "cuda_fp64" : "cpu_fp64") << std::endl;
+    auto constitutive = peridynamics::makePDConstitutiveDynamics(reference, nullptr, std::move(elastic_backend),
+                                                                std::move(plastic_backend), gel_backend.get());
     auto fracture = peridynamics::makePDFracture(reference, material, options.fracture);
     InteractionDynamics<solid_dynamics::LittleWoodHourGlassControl> hourglass(
         reference, options.numerics.hourglass_coefficient, 0.1);
@@ -441,6 +448,7 @@ int main(int argc, char **argv)
     try
     {
         const bool describe = consumeDescriptionFlag(argc, argv);
+        const auto execution_mode = peridynamics::takePeriExecutionOption(argc, argv);
         peridynamics::ParticleCompressionOptions options;
         peridynamics::CheckpointOptions restart;
         restart.threads = std::max(size_t(1), std::min(restart.threads, ExecutionLimits::max_threads));
@@ -473,7 +481,7 @@ int main(int argc, char **argv)
                       << ",\"contact_trace_format\":1,\"restart_qualified\":false}\n";
             return 0;
         }
-        return simulate(argc, argv, options, inputs, restart);
+        return simulate(argc, argv, options, inputs, restart, peridynamics::PeriExecution(execution_mode));
     }
     catch (const ResourceStop &error)
     {

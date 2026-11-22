@@ -3,6 +3,7 @@
 #define PD_GEL_MATERIAL_H
 
 #include "pd_materials.h"
+#include "pd_gel_batch.h"
 #include <cmath>
 
 namespace SPH::peridynamics
@@ -32,6 +33,7 @@ struct GelResponse
     Real free_energy;
 };
 
+void requireGelStatus(GelKernelStatus status);
 Matd gelDeviatoricGreen(const Matd &deformation);
 GelResponse gelResponse(const Matd &deformation, const GelParameters &parameters, const GelHistory &history);
 /** Exact Maxwell evolution and dissipation for a linear segment in deviatoric

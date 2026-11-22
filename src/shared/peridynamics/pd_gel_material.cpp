@@ -1,29 +1,33 @@
 #include "pd_gel_material.h"
+#include "pd_gel_kernel.h"
 #include "base_particles.hpp"
 #include <stdexcept>
 
 namespace SPH::peridynamics
 {
-namespace
+void requireGelStatus(GelKernelStatus status)
 {
-Real requireDeformation(const Matd &F)
-{
-    const Real J = F.determinant();
-    if (!F.allFinite() || !std::isfinite(J) || J < 0.05)
+    switch (status)
+    {
+    case GelKernelStatus::OK:
+        return;
+    case GelKernelStatus::InvalidDeformation:
         throw std::runtime_error("gel deformation determinant below 0.05 or non-finite");
-    return J;
-}
-
-void requireHistory(const GelHistory &history)
-{
-    for (const Matd *tensor : {&history.green, &history.viscous})
-        if (!tensor->allFinite() || (tensor->transpose() - *tensor).norm() > 1e-12 * (1 + tensor->norm()) ||
-            std::abs(tensor->trace()) > 1e-12 * (1 + tensor->norm()))
-            throw std::runtime_error("invalid gel material history");
-    if (!std::isfinite(history.dissipation) || history.dissipation < 0)
+    case GelKernelStatus::InvalidHistory:
+        throw std::runtime_error("invalid gel material history");
+    case GelKernelStatus::InvalidDissipation:
         throw std::runtime_error("invalid gel dissipation history");
+    case GelKernelStatus::InvalidIncrement:
+        throw std::invalid_argument("gel material time increment must be finite and nonnegative");
+    case GelKernelStatus::InvalidRelaxation:
+        throw std::invalid_argument("gel relaxation increment outside representable range");
+    case GelKernelStatus::InvalidDissipationIntegral:
+        throw std::runtime_error("gel dissipation integral invalid; no clipping applied");
+    case GelKernelStatus::NonfiniteResponse:
+        throw std::runtime_error("non-finite gel response");
+    }
+    throw std::logic_error("unknown gel material status");
 }
-} // namespace
 
 GelParameters GelParameters::fromYoungPoisson(Real young, Real poisson, Real shear_ratio, Real tau)
 {
@@ -59,57 +63,24 @@ Real GelParameters::instantaneousPoisson() const
 
 Matd gelDeviatoricGreen(const Matd &F)
 {
-    requireDeformation(F);
-    const Matd E = 0.5 * (F.transpose() * F - Matd::Identity());
-    return E - (E.trace() / Dimensions) * Matd::Identity();
+    if (!validGelDeformation(F, F.determinant()))
+        requireGelStatus(GelKernelStatus::InvalidDeformation);
+    return deviatoricGelGreen(F);
 }
 
 GelResponse gelResponse(const Matd &F, const GelParameters &p, const GelHistory &history)
 {
     p.validate();
-    requireHistory(history);
-    const Real J = requireDeformation(F);
-    const Real isochoric = std::pow(J, -2.0 / 3.0);
-    const Real trace_C = F.squaredNorm();
-    const Matd inverse_transpose = F.inverse().transpose();
-    const Matd q = gelDeviatoricGreen(F) - history.viscous;
     GelResponse result;
-    result.free_energy = 0.5 * p.equilibrium_shear * (isochoric * trace_C - 3) +
-        0.25 * p.bulk * (J * J - 1 - 2 * std::log(J)) + p.branch_shear * q.squaredNorm();
-    result.pk1 = p.equilibrium_shear * isochoric * (F - trace_C / 3 * inverse_transpose) +
-        0.5 * p.bulk * (J * J - 1) * inverse_transpose + 2 * p.branch_shear * F * q;
-    result.cauchy = result.pk1 * F.transpose() / J;
-    if (!result.pk1.allFinite() || !result.cauchy.allFinite() || !std::isfinite(result.free_energy))
-        throw std::runtime_error("non-finite gel response");
+    requireGelStatus(gelResponseKernel(F, p, history, result));
     return result;
 }
 
 GelHistory advanceGel(const Matd &F, Real dt, const GelParameters &p, const GelHistory &old)
 {
     p.validate();
-    requireHistory(old);
-    const Matd green = gelDeviatoricGreen(F);
-    if (!std::isfinite(dt) || dt < 0)
-        throw std::invalid_argument("gel material time increment must be finite and nonnegative");
-    if (dt == 0)
-        return old;
-    const Real z = dt / p.relaxation_time;
-    if (!std::isfinite(z) || z <= 0)
-        throw std::invalid_argument("gel relaxation increment outside representable range");
-    const Real decay = std::exp(-z), one_minus = -std::expm1(-z);
-    const Matd q0 = old.green - old.viscous, change = green - old.green;
-    const Matd q1 = decay * q0 + (one_minus / z) * change;
-    // Integral of (1-exp(-s))^2 / z^2. The series avoids cancellation.
-    const Real w22 = z < 1e-3 ? z * (1.0 / 3 + z * (-1.0 / 4 + z * (7.0 / 60 +
-        z * (-1.0 / 24 + z * (31.0 / 2520 - z / 320))))) :
-        (1 - (one_minus + 0.5 * one_minus * one_minus) / z) / z;
-    const Real increment = 2 * p.branch_shear * (
-        (-0.5 * std::expm1(-2 * z)) * q0.squaredNorm() +
-        (one_minus * one_minus / z) * q0.cwiseProduct(change).sum() + w22 * change.squaredNorm());
-    if (!std::isfinite(increment) || increment < 0)
-        throw std::runtime_error("gel dissipation integral invalid; no clipping applied");
-    GelHistory next{green, green - q1, old.dissipation + increment};
-    requireHistory(next);
+    GelHistory next;
+    requireGelStatus(advanceGelKernel(F, dt, p, old, next));
     return next;
 }
 } // namespace SPH::peridynamics

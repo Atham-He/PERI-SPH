@@ -39,15 +39,16 @@ struct PDConstitutiveDynamics
 inline PDConstitutiveDynamics makePDConstitutiveDynamics(
     BaseInnerRelation &relation, solid_dynamics::NosbPDBondWorkspace *bond_workspace = nullptr,
     std::unique_ptr<NosbPDElasticBatch> elastic_backend = nullptr,
-    std::unique_ptr<NosbPDPlasticBatch> plastic_backend = nullptr)
+    std::unique_ptr<NosbPDPlasticBatch> plastic_backend = nullptr,
+    GelPointBatch *gel_backend = nullptr)
 {
     auto &material = relation.getSPHBody().getMatterMaterial();
     PDConstitutiveDynamics dynamics;
     if (dynamic_cast<GelViscoelasticSolid *>(&material))
     {
-        using Update = solid_dynamics::GelConstitutiveUpdate;
-        dynamics.force = makeUnique<InteractionDynamics<Update>>(relation, Update::Stage::MidpointForce);
-        dynamics.commit = makeUnique<InteractionDynamics<Update>>(relation, Update::Stage::AcceptedHistory);
+        using Update = solid_dynamics::GelConstitutiveWithExecution;
+        dynamics.force = makeUnique<Update>(relation, Update::Stage::MidpointForce, gel_backend);
+        dynamics.commit = makeUnique<Update>(relation, Update::Stage::AcceptedHistory, gel_backend);
     }
     else if (dynamic_cast<PlasticSolidforPD *>(&material))
         dynamics.force = makeUnique<solid_dynamics::NosbPDPlasticWithExecution>(

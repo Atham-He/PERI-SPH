@@ -1,5 +1,5 @@
 add_executable(extra_3d_PD_gel_compression gel_compression.cpp)
-target_link_libraries(extra_3d_PD_gel_compression PRIVATE sphinxsys_3d)
+target_link_libraries(extra_3d_PD_gel_compression PRIVATE sphinxsys_3d SPHinXsys::peri_execution)
 set_target_properties(extra_3d_PD_gel_compression PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin")
 

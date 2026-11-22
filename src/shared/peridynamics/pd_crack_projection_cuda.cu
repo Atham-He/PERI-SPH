@@ -205,17 +205,14 @@ class CudaCrackProjection final : public CrackProjectionBatch
                         const std::vector<CrackProjectionPair> &pairs,
                         std::vector<CrackProjectionResult> &output) override
     {
-        for (const auto &pair : pairs)
-            if (pair.master >= masters.size() || pair.point >= points.size())
-                throw std::out_of_range("Crack projection pair refers to missing geometry");
         output.resize(pairs.size());
         if (pairs.empty())
             return;
 
         const auto blocks = grid(pairs.size());
+        stageProjectionPairs(masters.size(), points.size(), pairs);
         upload(masters_, masters, "crack projection master faces");
         upload(points_, points, "crack projection integration points");
-        upload(pairs_, pairs, "crack projection candidate pairs");
         output_.reserve(pairs.size());
         projectBatch<<<blocks, threads>>>(nullptr, masters_.get(), points_.get(), pairs_.get(),
                                          output_.get(), pairs.size());
@@ -262,6 +259,7 @@ class CudaCrackProjection final : public CrackProjectionBatch
         validateParticleTrace(map, rows);
         const auto transpose = transposeParticleTrace(map, [](std::size_t) { return true; });
         trace_ready_ = false;
+        cached_contact_address_.clear();
         upload(node_trace_offsets_, transpose.offsets, "crack node trace offsets");
         upload(node_trace_entries_, transpose.entries, "crack node trace entries");
         trace_count_ = rows;
@@ -281,6 +279,71 @@ class CudaCrackProjection final : public CrackProjectionBatch
             address.size() != local_contact_count_)
             throw std::invalid_argument("Crack contact batch does not match the active trace generation");
 
+        for (const auto &particle : particles)
+            if (!std::isfinite(particle.mass) || particle.mass <= 0.0)
+                throw std::invalid_argument("Crack trace assembly requires positive finite particle masses");
+        output.resize(particles.size());
+        if (address.empty())
+        {
+            for (std::size_t i = 0; i < particles.size(); ++i)
+            {
+                const double *external = particles[i].external;
+                output[i] = {{external[0], external[1], external[2]}, {}};
+            }
+            return;
+        }
+        stageContactAddress(address);
+        if (particles.empty())
+            return;
+
+        trace_loads_.reserve(trace_count_);
+        if (trace_count_ > 0)
+        {
+            collectTraceLoads<<<grid(trace_count_), threads>>>(contact_input_.get(), contact_output_.get(),
+                trace_use_device_offsets_.get(), trace_use_device_entries_.get(), trace_count_, trace_loads_.get());
+            check(cudaGetLastError(), "collect crack trace loads");
+        }
+
+        upload(trace_particle_input_, particles, "crack trace particle state");
+        trace_particle_output_.reserve(particle_count_);
+        pullBackCrackTraces<<<grid(particle_count_), threads>>>(node_trace_offsets_.get(), node_trace_entries_.get(),
+            trace_loads_.get(), trace_particle_input_.get(), acceleration_port, particle_count_, trace_particle_output_.get());
+        check(cudaGetLastError(), "pull back crack trace loads");
+        download(output, trace_particle_output_, "crack trace particle forces and rates");
+    }
+
+  private:
+    void stageProjectionPairs(std::size_t master_count, std::size_t point_count,
+                              const std::vector<CrackProjectionPair> &pairs)
+    {
+        const auto same_pair = [](const CrackProjectionPair &a, const CrackProjectionPair &b)
+        {
+            return a.master == b.master && a.point == b.point;
+        };
+        if (master_count == cached_master_count_ && point_count == cached_point_count_ &&
+            std::equal(pairs.begin(), pairs.end(), cached_pairs_.begin(), cached_pairs_.end(), same_pair))
+            return;
+
+        for (const auto &pair : pairs)
+            if (pair.master >= master_count || pair.point >= point_count)
+                throw std::out_of_range("Crack projection pair refers to missing geometry");
+        cached_pairs_.clear();
+        upload(pairs_, pairs, "crack projection candidate pairs");
+        cached_pairs_ = pairs;
+        cached_master_count_ = master_count;
+        cached_point_count_ = point_count;
+    }
+
+    void stageContactAddress(const std::vector<CrackTraceAddress> &address)
+    {
+        const auto same_address = [](const CrackTraceAddress &a, const CrackTraceAddress &b)
+        {
+            return std::equal(a.rows, a.rows + 5, b.rows);
+        };
+        if (std::equal(address.begin(), address.end(), cached_contact_address_.begin(),
+                       cached_contact_address_.end(), same_address))
+            return;
+
         trace_use_offsets_.assign(trace_count_ + 1, 0);
         for (const auto &contact : address)
             for (auto trace : contact.rows)
@@ -296,33 +359,12 @@ class CudaCrackProjection final : public CrackProjectionBatch
         for (std::size_t i = 0; i < address.size(); ++i)
             for (unsigned int leg = 0; leg < 5; ++leg)
                 trace_uses_[trace_use_cursor_[address[i].rows[leg]]++] = {i, leg};
-
-        for (const auto &particle : particles)
-            if (!std::isfinite(particle.mass) || particle.mass <= 0.0)
-                throw std::invalid_argument("Crack trace assembly requires positive finite particle masses");
-        output.resize(particles.size());
-        if (particles.empty())
-            return;
-
-        trace_loads_.reserve(trace_count_);
-        if (trace_count_ > 0)
-        {
-            upload(trace_use_device_offsets_, trace_use_offsets_, "crack trace use offsets");
-            upload(trace_use_device_entries_, trace_uses_, "crack trace uses");
-            collectTraceLoads<<<grid(trace_count_), threads>>>(contact_input_.get(), contact_output_.get(),
-                trace_use_device_offsets_.get(), trace_use_device_entries_.get(), trace_count_, trace_loads_.get());
-            check(cudaGetLastError(), "collect crack trace loads");
-        }
-
-        upload(trace_particle_input_, particles, "crack trace particle state");
-        trace_particle_output_.reserve(particle_count_);
-        pullBackCrackTraces<<<grid(particle_count_), threads>>>(node_trace_offsets_.get(), node_trace_entries_.get(),
-            trace_loads_.get(), trace_particle_input_.get(), acceleration_port, particle_count_, trace_particle_output_.get());
-        check(cudaGetLastError(), "pull back crack trace loads");
-        download(output, trace_particle_output_, "crack trace particle forces and rates");
+        cached_contact_address_.clear();
+        upload(trace_use_device_offsets_, trace_use_offsets_, "crack trace use offsets");
+        upload(trace_use_device_entries_, trace_uses_, "crack trace uses");
+        cached_contact_address_ = address;
     }
 
-  private:
     unsigned int grid(std::size_t count) const
     {
         const auto blocks = (count + threads - 1) / threads;
@@ -338,6 +380,8 @@ class CudaCrackProjection final : public CrackProjectionBatch
     DeviceBuffer<CrackProjectionMaster> masters_;
     DeviceBuffer<CrackProjectionPoint> points_;
     DeviceBuffer<CrackProjectionPair> pairs_;
+    std::vector<CrackProjectionPair> cached_pairs_;
+    std::size_t cached_master_count_ = 0, cached_point_count_ = 0;
     DeviceBuffer<CrackProjectionResult> output_;
     DeviceBuffer<CrackLocalContactInput> contact_input_;
     DeviceBuffer<CrackLocalContactResult> contact_output_;
@@ -346,6 +390,7 @@ class CudaCrackProjection final : public CrackProjectionBatch
     bool trace_ready_ = false, local_contact_valid_ = false;
     std::vector<std::size_t> trace_use_offsets_, trace_use_cursor_;
     std::vector<ContactTraceUse> trace_uses_;
+    std::vector<CrackTraceAddress> cached_contact_address_;
     DeviceBuffer<std::size_t> node_trace_offsets_, trace_use_device_offsets_;
     DeviceBuffer<ParticleTraceContribution> node_trace_entries_;
     DeviceBuffer<ContactTraceUse> trace_use_device_entries_;

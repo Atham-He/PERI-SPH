@@ -57,6 +57,32 @@ __global__ void evaluateBondTensors(const std::size_t *offsets, const NosbPDBond
     }
 }
 
+__global__ void assembleIntactMoments(const std::size_t *offsets, const NosbPDBondGeometry *bonds,
+                                      const NosbPDPositionSite *sites, std::size_t rows, ShapeHessian3 *moments)
+{
+    const auto index = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const auto i = index / 3;
+    const auto axis = index % 3;
+    if (i >= rows)
+        return;
+
+    double row[3]{};
+    for (auto entry = offsets[i]; entry < offsets[i + 1]; ++entry)
+    {
+        const auto &bond = bonds[entry];
+        const auto &target = sites[bond.particle];
+        const double displacement = target.position.component[axis] - sites[i].position.component[axis];
+        const double weighted_displacement = bond.kernel_weight * target.volume * displacement;
+        for (int k = 0; k < 3; ++k)
+        {
+            const double reference = -bond.reference_distance * bond.direction.component[k];
+            row[k] += weighted_displacement * reference;
+        }
+    }
+    for (int k = 0; k < 3; ++k)
+        moments[i].derivative[axis][k] = row[k];
+}
+
 __device__ double projectBond(const ShapeHessian3 &state, std::size_t axis, double weight,
                               const ParticleVector3 &reference, double sign)
 {
@@ -364,6 +390,25 @@ class CudaNosbPDBonds final : public NosbPDBondBatch
         download(tensors, tensors_, "NOSB-PD deformation tensors");
     }
 
+    bool assemblesIntactPositionMoments() const noexcept override { return true; }
+
+    void assembleIntactPositionMoments(const std::vector<NosbPDPositionSite> &sites,
+                                      std::vector<ShapeHessian3> &moments) override
+    {
+        validate(sites.size(), bond_count_);
+        moments.resize(rows_);
+        if (rows_ == 0)
+            return;
+
+        const auto blocks = static_cast<unsigned>((3 * rows_ - 1) / threads_ + 1);
+        upload(position_sites_, sites, "NOSB-PD positions and volumes");
+        position_moments_.reserve(rows_);
+        assembleIntactMoments<<<blocks, threads_>>>(
+            offsets_.get(), bonds_.get(), position_sites_.get(), rows_, position_moments_.get());
+        check(cudaGetLastError(), "assemble NOSB-PD intact position moments");
+        download(moments, position_moments_, "NOSB-PD intact position moments");
+    }
+
     bool screensBondFailure() const noexcept override { return true; }
 
     void screenBondFailure(const std::vector<NosbPDBondFailureSite> &sites,
@@ -455,6 +500,8 @@ class CudaNosbPDBonds final : public NosbPDBondBatch
     DeviceBuffer<std::size_t> offsets_;
     DeviceBuffer<NosbPDBondGeometry> bonds_;
     DeviceBuffer<NosbPDKinematicSite> sites_;
+    DeviceBuffer<NosbPDPositionSite> position_sites_;
+    DeviceBuffer<ShapeHessian3> position_moments_;
     DeviceBuffer<NosbPDForceSite> force_sites_;
     DeviceBuffer<NosbPDBondFailureSite> failure_sites_;
     DeviceBuffer<NosbPDBondDecision> failure_decisions_;

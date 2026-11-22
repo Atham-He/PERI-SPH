@@ -214,7 +214,7 @@ void NosbPDBondWorkspace::configure(std::size_t count, std::size_t bound)
     bound_ = bound;
 }
 
-void NosbPDBondWorkspace::refreshLiveBonds(std::size_t count, std::size_t bound)
+void NosbPDBondWorkspace::refreshLiveBonds(std::size_t count, std::size_t bound, const char *broken_bond_reason)
 {
     // Pack the frozen geometry on first use, after checkpoint restore.
     if (offsets_.size() != count + 1 || bound_ != bound)
@@ -224,9 +224,41 @@ void NosbPDBondWorkspace::refreshLiveBonds(std::size_t count, std::size_t bound)
         const auto &row = relation_.inner_configuration_[i];
         if (row.current_size_ != offsets_[i + 1] - offsets_[i])
             throw std::logic_error("NOSB-PD reference row changed after bond workspace initialization");
+        if (broken_bond_reason)
+        {
+            // The intact operator uses every bond and has no live-mask input.
+            for (std::size_t n = 0; n < row.current_size_; ++n)
+                if (!row.bondLive_[n])
+                    peridynamics::numericalFailure(relation_.getSPHBody().Name(), i, broken_bond_reason);
+            continue;
+        }
         for (std::size_t n = 0; n < row.current_size_; ++n)
             bond_live_[offsets_[i] + n] = row.bondLive_[n];
     }
+}
+
+void NosbPDBondWorkspace::evaluateIntactPositionMoments(std::vector<peridynamics::ShapeHessian3> &moments,
+                                                       const char *broken_bond_reason)
+{
+    auto &particles = relation_.getSPHBody().getBaseParticles();
+    const auto count = particles.TotalRealParticles();
+    refreshLiveBonds(count, particles.ParticlesBound(),
+                     broken_bond_reason ? broken_bond_reason : "intact position moment received a broken reference bond");
+    const auto *position = particles.getVariableDataByName<Vecd>("Position");
+    const auto *volume = particles.getVariableDataByName<Real>("VolumetricMeasure");
+
+    position_sites_.resize(count + ghost_sources_.size());
+    for (size_t i = 0; i < count; ++i)
+        position_sites_[i] = {packPDVector(position[i]), volume[i]};
+    for (size_t g = 0; g < ghost_sources_.size(); ++g)
+    {
+        const auto j = ghost_sources_[g];
+        position_sites_[count + g] = {packPDVector(position[j]), volume[j]};
+    }
+
+    backend_->assembleIntactPositionMoments(position_sites_, moments);
+    if (moments.size() != count)
+        throw std::logic_error("NOSB-PD backend returned an incomplete intact position moment batch");
 }
 
 void NosbPDBondWorkspace::evaluateDeformation(Real dt, Matd *full, Matd *increment, Matd *midpoint)

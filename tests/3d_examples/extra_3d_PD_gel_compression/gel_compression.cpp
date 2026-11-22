@@ -10,6 +10,7 @@
 #include "gel_surface_contact.h"
 #include "pd_contact_impulse.h"
 #include "pd_execution.h"
+#include "pd_time_step_execution.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -80,20 +81,26 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
     InnerRelation reference(particle);
     InteractionWithUpdate<solid_dynamics::NosbPDShapeMatrix> shape(reference);
     SimpleDynamics<solid_dynamics::PDTimeStepInitialization> initialize(particle, makeShared<Gravity>(Vecd::Zero()));
-    SimpleDynamics<solid_dynamics::NosbPDFirstStep> first(particle);
+    auto verlet_backend = execution.makePositionVerlet();
+    solid_dynamics::NosbPDStepWithExecution<solid_dynamics::NosbPDFirstStep> first(particle, verlet_backend.get());
     auto gel_backend = material.isViscoelastic() ? execution.makeGelPoints() : nullptr;
     auto elastic_backend = material.model == "elastic" ? execution.makeNosbPDElastic() : nullptr;
     auto plastic_backend = material.isPlastic() ? execution.makeNosbPDPlastic() : nullptr;
     std::cout << "PD material backend " << (gel_backend || elastic_backend || plastic_backend ? "cuda_fp64" : "cpu_fp64") << std::endl;
-    auto constitutive = peridynamics::makePDConstitutiveDynamics(reference, nullptr, std::move(elastic_backend),
+    solid_dynamics::NosbPDBondWorkspace bond_workspace(reference, execution.makeNosbPDBonds());
+    if (material.isViscoelastic())
+        std::cout << "PD position moment backend "
+                  << (gel_backend && bond_workspace.assemblesIntactPositionMoments() ? "cuda_fp64" : "cpu_fp64") << std::endl;
+    auto constitutive = peridynamics::makePDConstitutiveDynamics(reference, &bond_workspace, std::move(elastic_backend),
                                                                 std::move(plastic_backend), gel_backend.get());
-    auto fracture = peridynamics::makePDFracture(reference, material, options.fracture);
+    auto fracture = peridynamics::makePDFracture(reference, material, options.fracture, &bond_workspace);
     InteractionDynamics<solid_dynamics::LittleWoodHourGlassControl> hourglass(
         reference, options.numerics.hourglass_coefficient, 0.1);
     InteractionDynamics<solid_dynamics::PairNumericalDampingforPD> damping(reference);
-    InteractionDynamics<solid_dynamics::NosbPDThirdStep> third(reference);
-    SimpleDynamics<solid_dynamics::NosbPDFourthStep> fourth(particle);
-    ReduceDynamics<solid_dynamics::PDTimeStep> timestep(particle, options.numerics.cfl);
+    solid_dynamics::NosbPDInternalForceWithExecution third(bond_workspace);
+    solid_dynamics::NosbPDStepWithExecution<solid_dynamics::NosbPDFourthStep> fourth(particle, verlet_backend.get());
+    auto cfl_backend = execution.makePDCfl();
+    solid_dynamics::PDTimeStepExecution timestep(particle, cfl_backend.get(), options.numerics.cfl);
 
     SimpleDynamics<solid_dynamics::RigidBoxContactforPD> contact(
         particle, options.contact.friction_mu, options.contact.friction_velocity);

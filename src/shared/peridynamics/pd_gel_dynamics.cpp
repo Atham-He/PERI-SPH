@@ -1,5 +1,6 @@
 #include "pd_gel_dynamics.h"
 #include "base_particles.hpp"
+#include "nosbpd_dynamics.h"
 #include "pd_numerics.h"
 #include <algorithm>
 
@@ -59,6 +60,14 @@ GelConstitutiveUpdate::GelConstitutiveUpdate(BaseInnerRelation &relation, Stage 
       midpoint_green_(particles_->getVariableDataByName<Matd>("GelMidpointGreenStrain")),
       midpoint_viscous_(particles_->getVariableDataByName<Matd>("GelMidpointViscousStrain")) {}
 
+GelConstitutiveWithExecution::GelConstitutiveWithExecution(
+    BaseInnerRelation &relation, Stage stage, peridynamics::GelPointBatch *backend, NosbPDBondWorkspace *workspace)
+    : Base(relation, stage), backend_(backend), workspace_(workspace)
+{
+    if (workspace_ && &workspace_->relation() != &relation)
+        throw std::invalid_argument("Gel execution workspace must use the same reference relation");
+}
+
 namespace
 {
 void validateStagedTime(Real dt)
@@ -117,17 +126,22 @@ void GelConstitutiveUpdate::interaction(size_t i, Real dt)
     publish(i, dt, F, next, response);
 }
 
-void GelConstitutiveUpdate::evaluateDevice(peridynamics::GelPointBatch &backend, Real dt)
+void GelConstitutiveUpdate::evaluateDevice(peridynamics::GelPointBatch &backend, NosbPDBondWorkspace *workspace, Real dt)
 {
     using namespace peridynamics;
     validateStagedTime(dt);
     const size_t count = particles_->TotalRealParticles();
+    const bool device_moments = workspace && workspace->assemblesIntactPositionMoments();
+    if (device_moments)
+        workspace->evaluateIntactPositionMoments(position_moments_, "gel control does not support broken reference bonds");
+
     device_points_.resize(count);
     tbb::parallel_for(size_t(0), count, [&](size_t i)
     {
         const auto old = historyAt(i);
-        device_points_[i] = {packGelTensor(deformationAt(i)), packGelTensor(old.green),
-                             packGelTensor(old.viscous), old.dissipation};
+        const Matd deformation = device_moments ? Matd(unpackGelTensor(position_moments_[i]) * inverse_shape_[i]) :
+                                                  deformationAt(i);
+        device_points_[i] = {packGelTensor(deformation), packGelTensor(old.green), packGelTensor(old.viscous), old.dissipation};
     });
     const auto &p = material_.gelParameters();
     backend.evaluate(device_points_, {p.bulk, p.equilibrium_shear, p.branch_shear, p.relaxation_time},

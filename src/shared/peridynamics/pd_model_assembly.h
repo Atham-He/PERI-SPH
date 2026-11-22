@@ -47,8 +47,8 @@ inline PDConstitutiveDynamics makePDConstitutiveDynamics(
     if (dynamic_cast<GelViscoelasticSolid *>(&material))
     {
         using Update = solid_dynamics::GelConstitutiveWithExecution;
-        dynamics.force = makeUnique<Update>(relation, Update::Stage::MidpointForce, gel_backend);
-        dynamics.commit = makeUnique<Update>(relation, Update::Stage::AcceptedHistory, gel_backend);
+        dynamics.force = makeUnique<Update>(relation, Update::Stage::MidpointForce, gel_backend, bond_workspace);
+        dynamics.commit = makeUnique<Update>(relation, Update::Stage::AcceptedHistory, gel_backend, bond_workspace);
     }
     else if (dynamic_cast<PlasticSolidforPD *>(&material))
         dynamics.force = makeUnique<solid_dynamics::NosbPDPlasticWithExecution>(

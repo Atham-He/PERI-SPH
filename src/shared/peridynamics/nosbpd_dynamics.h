@@ -166,6 +166,12 @@ class NosbPDBondWorkspace
 
     bool onDevice() const { return static_cast<bool>(backend_); }
     BaseInnerRelation &relation() const { return relation_; }
+    bool assemblesIntactPositionMoments() const noexcept
+    {
+        return backend_ && backend_->assemblesIntactPositionMoments();
+    }
+    void evaluateIntactPositionMoments(std::vector<peridynamics::ShapeHessian3> &moments,
+                                       const char *broken_bond_reason);
     bool screensBondFailure() const noexcept { return backend_ && backend_->screensBondFailure(); }
     void evaluateBondFailure(const Matd *tensor, peridynamics::NosbPDBondFailureParameters parameters,
                              const std::function<bool(Matd &, Real &)> &host_test);
@@ -178,7 +184,7 @@ class NosbPDBondWorkspace
 
   private:
     void configure(std::size_t count, std::size_t bound);
-    void refreshLiveBonds(std::size_t count, std::size_t bound);
+    void refreshLiveBonds(std::size_t count, std::size_t bound, const char *broken_bond_reason = nullptr);
     void gatherCorrectionSites(bool damping);
     void publishCorrection(bool stabilization, Real damage_cutoff, Real reference_density, Vecd *acceleration, Vecd *force);
 
@@ -186,6 +192,7 @@ class NosbPDBondWorkspace
     std::unique_ptr<peridynamics::NosbPDBondBatch> backend_;
     std::vector<std::size_t> offsets_, ghost_sources_;
     std::vector<peridynamics::NosbPDKinematicSite> sites_;
+    std::vector<peridynamics::NosbPDPositionSite> position_sites_;
     std::vector<peridynamics::NosbPDBondFailureSite> failure_sites_;
     std::vector<peridynamics::NosbPDBondDecision> failure_decisions_;
     std::vector<peridynamics::NosbPDForceSite> force_sites_;

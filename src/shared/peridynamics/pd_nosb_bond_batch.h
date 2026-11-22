@@ -21,6 +21,12 @@ struct NosbPDKinematicSite
     bool active;
 };
 
+struct NosbPDPositionSite
+{
+    ParticleVector3 position;
+    double volume;
+};
+
 struct NosbPDForceSite
 {
     ShapeHessian3 force_state;
@@ -86,6 +92,14 @@ class NosbPDBondBatch
     virtual void evaluateDeformation(const std::vector<NosbPDKinematicSite> &sites,
                           const std::vector<std::uint8_t> &bond_live, double dt,
                                      std::vector<NosbPDDeformationTensors> &tensors) = 0;
+    // Use all bonds in an intact reference to assemble the current position
+    // moment, without forming a velocity increment or a midpoint tensor.
+    virtual bool assemblesIntactPositionMoments() const noexcept { return false; }
+    virtual void assembleIntactPositionMoments(const std::vector<NosbPDPositionSite> &,
+                                               std::vector<ShapeHessian3> &)
+    {
+        throw std::logic_error("This NOSB-PD backend does not assemble intact position moments");
+    }
     virtual bool screensBondFailure() const noexcept { return false; }
     virtual void screenBondFailure(const std::vector<NosbPDBondFailureSite> &,
                                    const std::vector<std::uint8_t> &, NosbPDBondFailureParameters,

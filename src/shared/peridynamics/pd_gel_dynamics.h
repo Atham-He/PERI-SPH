@@ -8,6 +8,7 @@
 
 namespace SPH::solid_dynamics
 {
+class NosbPDBondWorkspace;
 /** Canonical packet order before shape construction at a fresh t=0 only.
  * All reference geometry/weights/bond flags stay attached to their target ID.
  * Never call this on a restored/advanced state. */
@@ -24,13 +25,14 @@ class GelConstitutiveUpdate : public LocalDynamics, public DataDelegateInner
     void interaction(size_t i, Real dt = 0);
 
   protected:
-    void evaluateDevice(peridynamics::GelPointBatch &backend, Real dt);
+    void evaluateDevice(peridynamics::GelPointBatch &backend, NosbPDBondWorkspace *workspace, Real dt);
 
   private:
     Matd deformationAt(size_t i) const;
     peridynamics::GelHistory historyAt(size_t i) const;
     void publish(size_t i, Real dt, const Matd &F, const peridynamics::GelHistory &next,
                  const peridynamics::GelResponse &response);
+    std::vector<peridynamics::ShapeHessian3> position_moments_;
     std::vector<peridynamics::GelPointState> device_points_;
     std::vector<peridynamics::GelPointResult> device_results_;
     Stage stage_;
@@ -45,19 +47,20 @@ class GelConstitutiveWithExecution : public InteractionDynamics<GelConstitutiveU
     using Base = InteractionDynamics<GelConstitutiveUpdate>;
 
   public:
-    GelConstitutiveWithExecution(BaseInnerRelation &relation, Stage stage, peridynamics::GelPointBatch *backend)
-        : Base(relation, stage), backend_(backend) {}
+    GelConstitutiveWithExecution(BaseInnerRelation &relation, Stage stage, peridynamics::GelPointBatch *backend,
+                                 NosbPDBondWorkspace *workspace = nullptr);
 
     void runMainStep(Real dt) override
     {
         if (backend_)
-            evaluateDevice(*backend_, dt);
+            evaluateDevice(*backend_, workspace_, dt);
         else
             Base::runMainStep(dt);
     }
 
   private:
     peridynamics::GelPointBatch *backend_;
+    NosbPDBondWorkspace *workspace_;
 };
 } // namespace SPH::solid_dynamics
 #endif

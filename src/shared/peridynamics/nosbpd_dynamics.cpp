@@ -402,7 +402,7 @@ void NosbPDBondWorkspace::evaluateInternalForce(Real reference_density, Vecd *ac
     }
 }
 
-void NosbPDBondWorkspace::gatherCorrectionSites(bool damping)
+void NosbPDBondWorkspace::gatherCorrectionSites(bool stabilization, bool damping)
 {
     auto &particles = relation_.getSPHBody().getBaseParticles();
     const auto count = particles.TotalRealParticles();
@@ -411,7 +411,7 @@ void NosbPDBondWorkspace::gatherCorrectionSites(bool damping)
     const auto *velocity = damping ? particles.getVariableDataByName<Vecd>("Velocity") : nullptr;
     const auto *deformation = particles.getVariableDataByName<Matd>("DeformationGradient");
     const auto *volume = particles.getVariableDataByName<Real>("VolumetricMeasure");
-    const auto *damage = damping ? nullptr : particles.getVariableDataByName<Real>("Damage");
+    const auto *damage = stabilization ? particles.getVariableDataByName<Real>("Damage") : nullptr;
     const auto *active = particles.getVariableDataByName<int>("ParticleLive");
 
     const auto pack = [&](std::size_t i)
@@ -427,40 +427,54 @@ void NosbPDBondWorkspace::gatherCorrectionSites(bool damping)
         correction_sites_[count + n] = pack(ghost_sources_[n]);
 }
 
-void NosbPDBondWorkspace::publishCorrection(bool stabilization, Real damage_cutoff, Real reference_density,
+void NosbPDBondWorkspace::publishCorrection(std::size_t i, const peridynamics::NosbPDCorrectionForce &result,
+                                            bool stabilization, Real damage_cutoff, Real reference_density,
                                             Vecd *acceleration, Vecd *force)
 {
-    for (std::size_t i = 0; i < correction_force_.size(); ++i)
-    {
-        force[i].setZero();
-        const auto &site = correction_sites_[i];
-        if (!site.active || (stabilization && site.damage >= damage_cutoff))
-            continue;
-        const auto &result = correction_force_[i];
-        if (result.collapsed)
-            peridynamics::numericalFailure(relation_.getSPHBody().Name(), i, "collapsed stabilization bond");
-        const auto density = unpackPDVector(result.density);
-        if (stabilization && !density.allFinite())
-            peridynamics::numericalFailure(relation_.getSPHBody().Name(), i, "HourglassForce");
-        acceleration[i] += density / reference_density;
-        force[i] = density * site.volume;
-    }
+    force[i].setZero();
+    const auto &site = correction_sites_[i];
+    if (!site.active || (stabilization && site.damage >= damage_cutoff))
+        return;
+    if (result.collapsed)
+        peridynamics::numericalFailure(relation_.getSPHBody().Name(), i, "collapsed stabilization bond");
+    const auto density = unpackPDVector(result.density);
+    if (stabilization && !density.allFinite())
+        peridynamics::numericalFailure(relation_.getSPHBody().Name(), i, "HourglassForce");
+    acceleration[i] += density / reference_density;
+    force[i] = density * site.volume;
 }
 
 void NosbPDBondWorkspace::evaluateStabilization(peridynamics::NosbPDStabilizationParameters parameters,
                                                Real reference_density, Vecd *acceleration, Vecd *force)
 {
-    gatherCorrectionSites(false);
+    gatherCorrectionSites(true, false);
     backend_->assembleStabilization(correction_sites_, bond_live_, parameters, correction_force_);
-    publishCorrection(true, parameters.damage_cutoff, reference_density, acceleration, force);
+    for (std::size_t i = 0; i < correction_force_.size(); ++i)
+        publishCorrection(i, correction_force_[i], true, parameters.damage_cutoff, reference_density, acceleration, force);
 }
 
 void NosbPDBondWorkspace::evaluateDamping(peridynamics::NosbPDDampingParameters parameters,
                                          Real reference_density, Vecd *acceleration, Vecd *force)
 {
-    gatherCorrectionSites(true);
+    gatherCorrectionSites(false, true);
     backend_->assembleDamping(correction_sites_, bond_live_, parameters, correction_force_);
-    publishCorrection(false, 0, reference_density, acceleration, force);
+    for (std::size_t i = 0; i < correction_force_.size(); ++i)
+        publishCorrection(i, correction_force_[i], false, 0, reference_density, acceleration, force);
+}
+
+void NosbPDBondWorkspace::evaluatePairedCorrections(peridynamics::NosbPDStabilizationParameters stabilization,
+                                                   peridynamics::NosbPDDampingParameters damping, Real reference_density,
+                                                   Vecd *acceleration, Vecd *stabilization_force, Vecd *damping_force)
+{
+    gatherCorrectionSites(true, true);
+    backend_->assemblePairedCorrections(correction_sites_, bond_live_, stabilization, damping, paired_correction_);
+
+    // Keep the same update and failure order as the two individual stages.
+    for (std::size_t i = 0; i < paired_correction_.size(); ++i)
+        publishCorrection(i, paired_correction_[i].stabilization, true, stabilization.damage_cutoff,
+                          reference_density, acceleration, stabilization_force);
+    for (std::size_t i = 0; i < paired_correction_.size(); ++i)
+        publishCorrection(i, paired_correction_[i].damping, false, 0, reference_density, acceleration, damping_force);
 }
 
 NosbPDSecondStep::
@@ -1192,8 +1206,39 @@ void NosbPDStabilizationWithExecution::runMainStep(Real dt)
         Base::runMainStep(dt);
         return;
     }
+    workspace_.evaluateStabilization(deviceParameters(), rho0_, acc_, hourglass_force_);
+}
+
+peridynamics::NosbPDStabilizationParameters NosbPDStabilizationWithExecution::deviceParameters() const
+{
     const Real bond_constant = 12.0 * Kbulk_ / (Pi * std::pow(horizon_, Dimensions + 2));
-    workspace_.evaluateStabilization({Chg_ * bond_constant, damage_cutoff_, SqrtEps}, rho0_, acc_, hourglass_force_);
+    return {Chg_ * bond_constant, damage_cutoff_, SqrtEps};
+}
+
+bool NosbPDStabilizationWithExecution::pairsWithDamping(const NosbPDDampingWithExecution &damping) const
+{
+    return &workspace_ == &damping.workspace_ && Chg_ != 0 && damping.onDevice() &&
+           workspace_.assemblesPairedCorrections() &&
+           pre_processes_.empty() && post_processes_.empty() &&
+           damping.pre_processes_.empty() && damping.post_processes_.empty() &&
+           typeid(*this) == typeid(NosbPDStabilizationWithExecution) &&
+           typeid(damping) == typeid(NosbPDDampingWithExecution);
+}
+
+void NosbPDStabilizationWithExecution::execWithDamping(NosbPDDampingWithExecution &damping, Real dt)
+{
+    if (&workspace_ != &damping.workspace_)
+        throw std::invalid_argument("Paired NOSB-PD corrections require the same bond workspace");
+    if (!pairsWithDamping(damping))
+    {
+        exec(dt);
+        damping.exec(dt);
+        return;
+    }
+
+    setUpdated(getSPHBody());
+    workspace_.evaluatePairedCorrections(deviceParameters(), damping.deviceParameters(), rho0_,
+                                         acc_, hourglass_force_, damping.damping_force_);
 }
 
 NosbPDDampingWithExecution::NosbPDDampingWithExecution(NosbPDBondWorkspace &workspace)
@@ -1209,10 +1254,14 @@ NosbPDDampingWithExecution::NosbPDDampingWithExecution(NosbPDBondWorkspace &work
 void NosbPDDampingWithExecution::runMainStep(Real dt)
 {
     if (onDevice())
-        workspace_.evaluateDamping({rho0_, c0_, smoothing_length_, numerical_dissipation_factor_, inv_W0_, Dimensions},
-                                   rho0_, acc_, damping_force_);
+        workspace_.evaluateDamping(deviceParameters(), rho0_, acc_, damping_force_);
     else
         Base::runMainStep(dt);
+}
+
+peridynamics::NosbPDDampingParameters NosbPDDampingWithExecution::deviceParameters() const
+{
+    return {rho0_, c0_, smoothing_length_, numerical_dissipation_factor_, inv_W0_, Dimensions};
 }
 } // namespace solid_dynamics
 } // namespace SPH

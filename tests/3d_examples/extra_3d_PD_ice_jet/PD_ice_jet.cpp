@@ -220,6 +220,7 @@ int main(int ac, char *av[]) try
     solid_dynamics::NosbPDDampingWithExecution numerical_damping(pd_bonds);
     std::cout << "NOSB-PD stabilization backend " << (pd_bonds.onDevice() ? "cuda_fp64" : "cpu_fp64")
               << "; damping " << (numerical_damping.onDevice() ? "cuda_fp64" : "cpu_fp64") << std::endl;
+    std::cout << "NOSB-PD paired corrections " << (hourglass_control.pairsWithDamping(numerical_damping) ? "cuda_fp64" : "separate") << std::endl;
     solid_dynamics::NosbPDInternalForceWithExecution nosbpd_third_step(pd_bonds);
     solid_dynamics::NosbPDStepWithExecution<solid_dynamics::NosbPDFourthStep> nosbpd_fourth_step(plate, pd_time_integration.get());
     /** normal direction updated from the PD deformation gradient;
@@ -295,8 +296,7 @@ int main(int ac, char *av[]) try
                     nosbpd_first_step.exec(dt_s);
                     check_bond_live.exec(dt_s);
                     nosbpd_second_step_plastic.exec(dt_s);
-                    hourglass_control.exec(dt_s);
-                    numerical_damping.exec(dt_s);
+                    hourglass_control.execWithDamping(numerical_damping, dt_s);
                     nosbpd_third_step.exec(dt_s);
                     nosbpd_fourth_step.exec(dt_s);
 

@@ -64,6 +64,11 @@ struct NosbPDCorrectionForce
     bool collapsed;
 };
 
+struct NosbPDCorrectionPair
+{
+    NosbPDCorrectionForce stabilization, damping;
+};
+
 enum class NosbPDBondFailureLaw { PrincipalStress, StressShear, StressPressure, PrincipalPlasticStrain };
 enum class NosbPDBondDecision : std::uint8_t { Broken, Live, EvaluateOnHost };
 
@@ -123,6 +128,14 @@ class NosbPDBondBatch
                                  const std::vector<std::uint8_t> &bond_live,
                                  NosbPDDampingParameters parameters,
                                  std::vector<NosbPDCorrectionForce> &force) = 0;
+    virtual bool assemblesPairedCorrections() const noexcept { return false; }
+    virtual void assemblePairedCorrections(const std::vector<NosbPDCorrectionSite> &,
+                                           const std::vector<std::uint8_t> &,
+                                           NosbPDStabilizationParameters, NosbPDDampingParameters,
+                                           std::vector<NosbPDCorrectionPair> &)
+    {
+        throw std::logic_error("This NOSB-PD backend does not assemble paired force corrections");
+    }
 };
 
 std::unique_ptr<NosbPDBondBatch> makeCudaNosbPDBonds();

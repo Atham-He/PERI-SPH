@@ -232,6 +232,33 @@ __global__ void assembleCorrectionForce(const std::size_t *offsets, const NosbPD
     force[i] = row;
 }
 
+__global__ void assemblePairedCorrectionForce(const std::size_t *offsets, const NosbPDBondGeometry *bonds,
+                                              const NosbPDCorrectionSite *sites, const std::uint8_t *live,
+                                              std::size_t rows, NosbPDStabilizationParameters stabilization,
+                                              NosbPDDampingParameters damping, NosbPDCorrectionPair *force)
+{
+    const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= rows)
+        return;
+
+    const auto &source = sites[i];
+    NosbPDCorrectionPair row{};
+    const bool stabilize = correctionApplies(stabilization, source);
+    const auto end = correctionApplies(damping, source) ? offsets[i + 1] : offsets[i];
+    for (auto entry = offsets[i]; entry < end; ++entry)
+    {
+        if (!live[entry])
+            continue;
+        const auto &bond = bonds[entry];
+        const auto &target = sites[bond.particle];
+        if (stabilize && !row.stabilization.collapsed)
+            row.stabilization.collapsed = !accumulateCorrection(stabilization, source, target, bond,
+                                                                  row.stabilization.density);
+        accumulateCorrection(damping, source, target, bond, row.damping.density);
+    }
+    force[i] = row;
+}
+
 // Extreme eigenvalues of a finite symmetric tensor, scaled before forming
 // the characteristic invariants. The host resolves decisions near a limit.
 __device__ void principalExtremes(double (&matrix)[3][3], int dim, double scale,
@@ -480,7 +507,35 @@ class CudaNosbPDBonds final : public NosbPDBondBatch
         assembleCorrection(sites, bond_live, parameters, force);
     }
 
+    bool assemblesPairedCorrections() const noexcept override { return true; }
+
+    void assemblePairedCorrections(const std::vector<NosbPDCorrectionSite> &sites,
+                                   const std::vector<std::uint8_t> &bond_live,
+                                   NosbPDStabilizationParameters stabilization, NosbPDDampingParameters damping,
+                                   std::vector<NosbPDCorrectionPair> &force) override
+    {
+        validate(sites.size(), bond_live.size());
+        force.resize(rows_);
+        if (rows_ == 0)
+            return;
+
+        const auto blocks = static_cast<unsigned>((rows_ - 1) / threads_ + 1);
+        prepareCorrectionSites(sites, bond_live);
+        paired_force_.reserve(rows_);
+        assemblePairedCorrectionForce<<<blocks, threads_>>>(offsets_.get(), bonds_.get(), correction_sites_.get(),
+            live_.get(), rows_, stabilization, damping, paired_force_.get());
+        check(cudaGetLastError(), "assemble NOSB-PD paired corrections");
+        download(force, paired_force_, "NOSB-PD paired correction forces");
+    }
+
   private:
+    void prepareCorrectionSites(const std::vector<NosbPDCorrectionSite> &sites,
+                                const std::vector<std::uint8_t> &bond_live)
+    {
+        upload(correction_sites_, sites, "NOSB-PD correction sites");
+        updateLiveMask(bond_live);
+    }
+
     void updateLiveMask(const std::vector<std::uint8_t> &bond_live)
     {
         // All stages interpret the same mask on the resident reference stencil.
@@ -515,8 +570,7 @@ class CudaNosbPDBonds final : public NosbPDBondBatch
             return;
 
         const auto blocks = static_cast<unsigned>((rows_ - 1) / threads_ + 1);
-        upload(correction_sites_, sites, "NOSB-PD correction sites");
-        updateLiveMask(bond_live);
+        prepareCorrectionSites(sites, bond_live);
         correction_force_.reserve(rows_);
         assembleCorrectionForce<<<blocks, threads_>>>(offsets_.get(), bonds_.get(), correction_sites_.get(),
             live_.get(), rows_, parameters, correction_force_.get());
@@ -545,6 +599,7 @@ class CudaNosbPDBonds final : public NosbPDBondBatch
     DeviceBuffer<ParticleVector3> force_density_;
     DeviceBuffer<NosbPDCorrectionSite> correction_sites_;
     DeviceBuffer<NosbPDCorrectionForce> correction_force_;
+    DeviceBuffer<NosbPDCorrectionPair> paired_force_;
     DeviceBuffer<std::uint8_t> live_;
     std::vector<std::uint8_t> uploaded_live_;
     DeviceBuffer<NosbPDDeformationTensors> tensors_;

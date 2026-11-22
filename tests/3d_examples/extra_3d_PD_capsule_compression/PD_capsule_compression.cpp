@@ -264,6 +264,7 @@ int main(int argc, char **argv)
     solid_dynamics::NosbPDDampingWithExecution pd_damping(pd_bonds);
     std::cout << "NOSB-PD stabilization backend " << (pd_bonds.onDevice() ? "cuda_fp64" : "cpu_fp64")
               << "; damping " << (pd_damping.onDevice() ? "cuda_fp64" : "cpu_fp64") << std::endl;
+    std::cout << "NOSB-PD paired corrections " << (hourglass.pairsWithDamping(pd_damping) ? "cuda_fp64" : "separate") << std::endl;
     solid_dynamics::NosbPDInternalForceWithExecution third(pd_bonds);
     solid_dynamics::NosbPDStepWithExecution<solid_dynamics::NosbPDFourthStep> fourth(shell, pd_time_integration.get());
     auto solid_cfl = execution->makePDCfl();
@@ -626,7 +627,7 @@ int main(int argc, char **argv)
                         if (analytic_plate_contact) apply_contact(time + elapsed + 0.5 * ds);
                         constitutive.force->exec(ds);
                         if (fracture && pd_count % size_t(bond_check_interval) == 0) fracture->exec(ds);
-                        hourglass.exec(ds); pd_damping.exec(ds); third.exec(ds); fourth.exec(ds);
+                        hourglass.execWithDamping(pd_damping, ds); third.exec(ds); fourth.exec(ds);
                         shell_check.exec(); ++pd_count;
                         elapsed = ds == dt - elapsed ? dt : elapsed + ds;
                     }

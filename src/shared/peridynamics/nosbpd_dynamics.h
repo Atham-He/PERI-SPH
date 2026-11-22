@@ -187,11 +187,17 @@ class NosbPDBondWorkspace
     void evaluateDamping(peridynamics::NosbPDDampingParameters parameters, Real reference_density,
                          Vecd *acceleration, Vecd *force);
 
+    bool assemblesPairedCorrections() const noexcept { return backend_ && backend_->assemblesPairedCorrections(); }
+    void evaluatePairedCorrections(peridynamics::NosbPDStabilizationParameters stabilization,
+                                   peridynamics::NosbPDDampingParameters damping, Real reference_density,
+                                   Vecd *acceleration, Vecd *stabilization_force, Vecd *damping_force);
+
   private:
     void configure(std::size_t count, std::size_t bound);
     void refreshLiveBonds(std::size_t count, std::size_t bound, const char *broken_bond_reason = nullptr);
-    void gatherCorrectionSites(bool damping);
-    void publishCorrection(bool stabilization, Real damage_cutoff, Real reference_density, Vecd *acceleration, Vecd *force);
+    void gatherCorrectionSites(bool stabilization, bool damping);
+    void publishCorrection(std::size_t i, const peridynamics::NosbPDCorrectionForce &result,
+                           bool stabilization, Real damage_cutoff, Real reference_density, Vecd *acceleration, Vecd *force);
 
     BaseInnerRelation &relation_;
     std::unique_ptr<peridynamics::NosbPDBondBatch> backend_;
@@ -206,6 +212,7 @@ class NosbPDBondWorkspace
     std::vector<peridynamics::ParticleVector3> force_density_;
     std::vector<peridynamics::NosbPDCorrectionSite> correction_sites_;
     std::vector<peridynamics::NosbPDCorrectionForce> correction_force_;
+    std::vector<peridynamics::NosbPDCorrectionPair> paired_correction_;
     std::size_t bound_ = 0;
 };
 
@@ -529,6 +536,8 @@ class ProjectedPairStabilization : public LocalDynamics, public DataDelegateInne
     Matd *F_;
 };
 
+class NosbPDDampingWithExecution;
+
 class NosbPDStabilizationWithExecution : public InteractionDynamics<ProjectedPairStabilization>
 {
     using Base = InteractionDynamics<ProjectedPairStabilization>;
@@ -537,8 +546,12 @@ class NosbPDStabilizationWithExecution : public InteractionDynamics<ProjectedPai
     NosbPDStabilizationWithExecution(NosbPDBondWorkspace &workspace, Real coefficient = 0.5, Real damage_cutoff = 0.1)
         : Base(workspace.relation(), coefficient, damage_cutoff), workspace_(workspace) {}
     void runMainStep(Real dt) override;
+    // Opt in when these stages are adjacent, with no intervening state updates.
+    void execWithDamping(NosbPDDampingWithExecution &damping, Real dt = 0.0);
+    bool pairsWithDamping(const NosbPDDampingWithExecution &damping) const;
 
   private:
+    peridynamics::NosbPDStabilizationParameters deviceParameters() const;
     NosbPDBondWorkspace &workspace_;
 };
 
@@ -575,6 +588,9 @@ class NosbPDDampingWithExecution : public InteractionDynamics<PairNumericalDampi
     void runMainStep(Real dt) override;
 
   private:
+    friend class NosbPDStabilizationWithExecution;
+    peridynamics::NosbPDDampingParameters deviceParameters() const;
+
     NosbPDBondWorkspace &workspace_;
     bool supported_;
 };

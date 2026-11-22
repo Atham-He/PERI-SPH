@@ -103,37 +103,56 @@ __global__ void evaluateInterface(TraceView a, TraceView b, const double *stiffn
 }
 
 __global__ void evaluatePlaneContact(TraceView trace, const double *stiffness, std::size_t count,
-                                     double bottom, double top, SurfacePlaneContactPoint *points)
+                                     double bottom, double top, SurfacePlaneContactPoint *points,
+                                     double friction, double tangent_factor,
+                                     const SurfaceFrictionState *history, SurfaceFrictionTrial *trials)
 {
     const std::size_t point = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     if (point >= count)
         return;
 
     SurfacePlaneContactPoint result{};
+    double velocity[3]{};
+    double pb = 0, pt = 0;
     if (trace.offsets[point] != trace.offsets[point + 1])
     {
-        double velocity[3]{};
         gather(trace, point, result.position, velocity);
         const double lower = bottom - result.position[2];
         const double upper = result.position[2] - top;
-        const double pb = lower < 0 ? 0 : lower;
-        const double pt = upper < 0 ? 0 : upper;
-        if (pb != 0 || pt != 0)
-        {
-            const double k = stiffness[point];
-            const double normal_force = k * (pb - pt);
-            result.force[2] = normal_force;
-            result.lower = k * pb;
-            result.upper = k * pt;
-            result.energy = .5 * k * (pb * pb + pt * pt);
-            result.penetration = fmax(pb, pt);
-            result.sum[2] = -normal_force;
-            result.torque[0] = -result.position[1] * normal_force;
-            result.torque[1] = result.position[0] * normal_force;
-            result.power = -normal_force * velocity[2];
-            result.power_scale = fabs(result.power);
-            audit(trace, point, 1, result.force, fabs(normal_force), result);
-        }
+        pb = lower < 0 ? 0 : lower;
+        pt = upper < 0 ? 0 : upper;
+    }
+    const double k = stiffness[point];
+    if (history)
+    {
+        const auto &old = history[point];
+        auto &trial = trials[point];
+        const int side = pb > 0 ? -1 : pt > 0 ? 1 : 0;
+        const double tangential_stiffness = k * tangent_factor;
+        trial.update = evaluateCoulombSlip(result.position, old.anchor, 2, old.side, old.stored,
+                                           side, k * (pb + pt), tangential_stiffness, friction,
+                                           trial.anchor, trial.elastic_slip);
+        for (int d = 0; d < 2; ++d)
+            result.force[d] = -tangential_stiffness * trial.elastic_slip[d];
+    }
+    if (pb != 0 || pt != 0)
+    {
+        result.force[2] = k * (pb - pt);
+        result.lower = k * pb;
+        result.upper = k * pt;
+        result.energy = .5 * k * (pb * pb + pt * pt);
+        result.penetration = fmax(pb, pt);
+        const double *x = result.position;
+        const double *f = result.force;
+        for (int d = 0; d < 3; ++d)
+            result.sum[d] = -f[d];
+        result.torque[0] = x[2] * f[1] - x[1] * f[2];
+        result.torque[1] = x[0] * f[2] - x[2] * f[0];
+        result.torque[2] = x[1] * f[0] - x[0] * f[1];
+        result.power = -((f[0] * velocity[0] + f[1] * velocity[1]) + f[2] * velocity[2]);
+        result.power_scale = fabs(result.power);
+        const double force_norm = history ? sqrt((f[0] * f[0] + f[1] * f[1]) + f[2] * f[2]) : fabs(f[2]);
+        audit(trace, point, 1, f, force_norm, result);
     }
     points[point] = result;
 }
@@ -304,36 +323,56 @@ class CudaSurfacePlaneContact final : public SurfacePlaneContactBatch
         check(cudaDeviceGetAttribute(&max_grid_, cudaDevAttrMaxGridDimX, device), "plane contact device grid");
     }
 
-    void configure(const ParticleTraceMap &trace, const std::vector<double> &stiffness) override
+    void configure(const ParticleTraceMap &trace, const std::vector<double> &stiffness,
+                   double friction, double tangent_factor) override
     {
         validateParticleTrace(trace, stiffness.size());
         trace_.configure(trace, [](std::size_t) { return true; }, 1);
         upload(stiffness_, stiffness);
         point_count_ = stiffness.size();
         points_.reserve(point_count_);
+        friction_ = friction;
+        tangent_factor_ = tangent_factor;
     }
 
     void apply(double bottom, double top, std::vector<TraceForceNode> &nodes,
-               std::vector<SurfacePlaneContactPoint> &points) override
+               std::vector<SurfacePlaneContactPoint> &points, SurfaceFrictionTransfer *friction) override
     {
         if (nodes.size() != trace_.count)
             throw std::invalid_argument("CUDA plane contact node count changed without map rebuild");
+        if ((friction_ > 0) != (friction != nullptr) ||
+            (friction && friction->committed.size() != point_count_))
+            throw std::invalid_argument("CUDA plane contact friction history does not match the trace");
         points.resize(point_count_);
+        if (friction)
+            friction->trials.resize(point_count_);
         if (point_count_ == 0)
             return;
         upload(trace_.nodes, nodes);
+        if (friction)
+        {
+            upload(history_, friction->committed);
+            trials_.reserve(point_count_);
+        }
         evaluatePlaneContact<<<launchBlocks(point_count_, max_grid_), threads>>>(
-            trace_.view(), stiffness_.get(), point_count_, bottom, top, points_.get());
+            trace_.view(), stiffness_.get(), point_count_, bottom, top, points_.get(), friction_, tangent_factor_,
+            friction ? history_.get() : nullptr, friction ? trials_.get() : nullptr);
         check(cudaGetLastError(), "plane contact evaluation");
         accumulate(trace_, points_, max_grid_);
         download(points, points_);
         download(nodes, trace_.nodes);
+        if (friction)
+            download(friction->trials, trials_);
     }
 
   private:
     DeviceTrace trace_;
     DeviceBuffer<double> stiffness_;
     DeviceBuffer<SurfacePlaneContactPoint> points_;
+    DeviceBuffer<SurfaceFrictionState> history_;
+    DeviceBuffer<SurfaceFrictionTrial> trials_;
+    double friction_ = 0;
+    double tangent_factor_ = 1;
     std::size_t point_count_ = 0;
     int max_grid_ = 0;
 };

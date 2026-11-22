@@ -40,7 +40,7 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
 string(SHA256 ASSEMBLY_HASH "${PD_ASSEMBLY_HASHES}")
 string(SHA256 MATERIAL_HASH "${KERNEL_HASH};${ADAPTER_HASH};${DPC_BATCH_HASH}")
 add_executable(pd_solid_capsule pd_solid_capsule.cpp)
-target_link_libraries(pd_solid_capsule sphinxsys_3d)
+target_link_libraries(pd_solid_capsule sphinxsys_3d SPHinXsys::peri_execution)
 target_compile_features(pd_solid_capsule PRIVATE cxx_std_17)
 target_compile_definitions(pd_solid_capsule PRIVATE
     CAPSULE_SOURCE_SHA256="${ASSEMBLY_HASH}"

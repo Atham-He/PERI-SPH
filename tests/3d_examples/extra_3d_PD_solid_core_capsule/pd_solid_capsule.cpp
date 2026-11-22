@@ -7,6 +7,7 @@
 #include "all_peridynamics.h"
 #include "pd_quadratic_correspondence.h"
 #include "pd_solid_reference_coupling.h"
+#include "pd_execution.h"
 #include "pd_principal_stress_onset.h"
 #include "pd_fragment_contact.h"
 #include "pd_energy_crack_band.h"
@@ -175,7 +176,7 @@ class RelaxedPDFourthStep : public solid_dynamics::NosbPDFourthStep
     }
 };
 
-int runHybrid(const HybridOptions &o)
+int runHybrid(const HybridOptions &o,const peridynamics::PeriExecution &peri)
 {
     using namespace peridynamics;
     fs::path out=fs::absolute(o.output);
@@ -277,7 +278,9 @@ int runHybrid(const HybridOptions &o)
     StdVec<Real> inner_area(inner_points.size(),4*Pi*rc*rc/inner_points.size());
     StdVec<Real> outer_area(outer_points.size(),4*Pi*R*R/outer_points.size());
     BondedSolidInterface tie(pd_inner,core_surface,inner_area,o.tie_factor*Eref/o.spacing,R);
-    SolidSurfacePlaneContact contact(pd_outer,outer_area,o.contact_factor*Eref/o.spacing,R,o.plate_friction,o.plate_tangent_factor);
+    SolidSurfacePlaneContact contact(pd_outer,outer_area,o.contact_factor*Eref/o.spacing,R,o.plate_friction,o.plate_tangent_factor,
+                                     peri.makeSurfacePlaneContact());
+    std::cout<<"Solid plane contact backend "<<(contact.onDevice()?"cuda_fp64":"cpu_fp64")<<std::endl;
     Real constraint_dt=1/std::sqrt(1/(tie.stable_dt*tie.stable_dt)+1/(contact.stable_dt*contact.stable_dt));
     ThicknessQuadrature quadrature(o.shell_layers);
     Real radial_spacing=o.thickness;
@@ -674,11 +677,11 @@ int runHybrid(const HybridOptions &o)
 
 int main(int argc,char **argv)
 {
-    try{HybridOptions options;options.parseHybrid(argc,argv);if(options.fracture_model=="extrinsic_cohesive")throw std::invalid_argument("Extrinsic cohesive growth is qualified through the pd_snsni_capsule entry");
+    try{const peridynamics::PeriExecution peri(peridynamics::takePeriExecutionOption(argc,argv));HybridOptions options;options.parseHybrid(argc,argv);if(options.fracture_model=="extrinsic_cohesive")throw std::invalid_argument("Extrinsic cohesive growth is qualified through the pd_snsni_capsule entry");
         // Match the arena concurrency to the configured worker limit. The
         // implicit hardware-sized arena can retain affinity proxy tasks when
         // oneTBB global_control limits the workers (upstream issue #1403).
         tbb::task_arena arena(options.threads);
-        return arena.execute([&](){return runHybrid(options);});}
+        return arena.execute([&](){return runHybrid(options,peri);});}
     catch(const std::exception &e){std::cerr<<"ERROR: "<<e.what()<<std::endl;return 1;}
 }

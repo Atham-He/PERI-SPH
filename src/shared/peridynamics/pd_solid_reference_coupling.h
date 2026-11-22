@@ -366,12 +366,23 @@ class SolidSurfacePlaneContact
     std::unique_ptr<SurfacePlaneContactBatch> backend_;
     std::vector<TraceForceNode> nodes_;
     std::vector<SurfacePlaneContactPoint> points_;
+    SurfaceFrictionTransfer friction_transfer_;
 
-    void applyBackend(Real bottom, Real top)
+    void applyBackend(Real bottom, Real top, bool commit_history)
     {
         using namespace surface_execution_detail;
         packState(surface.port, nodes_);
-        backend_->apply(bottom, top, nodes_, points_);
+        if (friction>0)
+        {
+            auto &committed=friction_transfer_.committed;
+            committed.resize(friction_history.size());
+            for (size_t i=0;i<friction_history.size();++i)
+            {
+                const auto &h=friction_history[i];
+                committed[i]={{h.anchor[0],h.anchor[1]},h.stored,h.side};
+            }
+        }
+        backend_->apply(bottom, top, nodes_, points_, friction>0?&friction_transfer_:nullptr);
         if (points_.size() != stiffness.size())
             throw std::logic_error("Plane contact backend returned the wrong point count");
         for (size_t i = 0; i < nodes_.size(); ++i)
@@ -393,7 +404,39 @@ class SolidSurfacePlaneContact
             power += point.power;
             force_scale += point.force_scale;
             power_scale += point.power_scale;
+            if (friction>0)
+            {
+                auto &h=friction_history[i];
+                const auto &trial=friction_transfer_.trials[i];
+                const auto &update=trial.update;
+                const Real normal=point.upper+point.lower;
+                if (normal>0)
+                {
+                    const Real tangential=std::sqrt(point.force[0]*point.force[0]+point.force[1]*point.force[1]);
+                    ++active_friction_points;
+                    sliding_points+=update.sliding;
+                    tangential_force_sum+=tangential;
+                    max_cone_ratio=std::max(max_cone_ratio,tangential/(friction*normal));
+                }
+                tangent_energy+=update.stored;
+                if (commit_history&&(point.penetration>0||h.side))
+                {
+                    FrictionHistory::Result result;
+                    result.anchor=Vecd(trial.anchor[0],trial.anchor[1],0);
+                    result.elastic_slip=Vecd(trial.elastic_slip[0],trial.elastic_slip[1],0);
+                    result.stored=update.stored;
+                    result.slip_dissipation=update.slip_dissipation;
+                    result.release_energy=update.release_energy;
+                    result.side=update.side;
+                    result.base_revision=h.revision;
+                    h.commit(result);
+                    slip_dissipation+=update.slip_dissipation;
+                    release_energy+=update.release_energy;
+                }
+            }
         }
+        energy+=tangent_energy;
+        if(friction>0&&commit_history)++history_commits;
         worst_force=std::max(worst_force,net_force.norm()/std::max(force_scale,Real(1e-30)));
         worst_torque=std::max(worst_torque,torque.norm()/std::max(length_scale*force_scale,Real(1e-30)));
         worst_power=std::max(worst_power,std::abs(power)/std::max(power_scale,Real(1e-30)));
@@ -424,7 +467,7 @@ class SolidSurfacePlaneContact
         if(friction>0)friction_history.resize(area.size());
         refreshTimeStepBound();
     }
-    bool onDevice() const noexcept { return backend_ && friction == 0; }
+    bool onDevice() const noexcept { return bool(backend_); }
 
     void refreshTimeStepBound()
     {
@@ -433,20 +476,20 @@ class SolidSurfacePlaneContact
         // derivative bounded by mu*Kn. The sum of these operator norms is
         // a conservative bound; mu=0 preserves the original bound exactly.
         if(friction==0)
+            stable_dt=ReferenceSolidSurface::stableBound(surface,nullptr,stiffness);
+        else
         {
-            const Real next=ReferenceSolidSurface::stableBound(surface,nullptr,stiffness);
-            if (onDevice())
-            {
-                nodes_.resize(surface.port.count);
-                backend_->configure(surface_execution_detail::packTrace(surface),
-                                    std::vector<double>(stiffness.begin(), stiffness.end()));
-            }
-            stable_dt=next;
-            surface_mapping_version=surface.mappingVersion();
-            return;
+            StdVec<Real> bound=stiffness;
+            for(auto &k:bound)k*=1+tangent_factor+friction;
+            stable_dt=ReferenceSolidSurface::stableBound(surface,nullptr,bound);
         }
-        StdVec<Real> bound=stiffness;for(auto &k:bound)k*=1+tangent_factor+friction;
-        Real next=ReferenceSolidSurface::stableBound(surface,nullptr,bound);stable_dt=next;surface_mapping_version=surface.mappingVersion();
+        if (onDevice())
+        {
+            nodes_.resize(surface.port.count);
+            backend_->configure(surface_execution_detail::packTrace(surface),
+                                std::vector<double>(stiffness.begin(),stiffness.end()),friction,tangent_factor);
+        }
+        surface_mapping_version=surface.mappingVersion();
     }
     void apply(Real bottom,Real top,bool commit_history=false)
     {
@@ -455,7 +498,7 @@ class SolidSurfacePlaneContact
         active_friction_points=sliding_points=0;
         if (onDevice())
         {
-            applyBackend(bottom, top);
+            applyBackend(bottom, top, commit_history);
             return;
         }
         Vecd ferr=Vecd::Zero(),terr=Vecd::Zero();Real perr=0,fs=0,ps=0;

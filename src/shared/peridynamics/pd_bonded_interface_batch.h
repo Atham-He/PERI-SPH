@@ -1,5 +1,6 @@
 #pragma once
 
+#include "pd_coulomb_friction.h"
 #include "pd_particle_trace_map.h"
 #include <memory>
 #include <vector>
@@ -40,13 +41,33 @@ struct SurfacePlaneContactPoint
     double upper, lower, energy, penetration, power, force_scale, power_scale;
 };
 
+struct SurfaceFrictionState
+{
+    double anchor[2], stored;
+    int side;
+};
+
+struct SurfaceFrictionTrial
+{
+    double anchor[2], elastic_slip[2];
+    CoulombSlipUpdate<double> update;
+};
+
+struct SurfaceFrictionTransfer
+{
+    std::vector<SurfaceFrictionState> committed;
+    std::vector<SurfaceFrictionTrial> trials;
+};
+
 class SurfacePlaneContactBatch
 {
   public:
     virtual ~SurfacePlaneContactBatch() = default;
-    virtual void configure(const ParticleTraceMap &trace, const std::vector<double> &stiffness) = 0;
+    virtual void configure(const ParticleTraceMap &trace, const std::vector<double> &stiffness,
+                           double friction = 0, double tangent_factor = 1) = 0;
     virtual void apply(double bottom, double top, std::vector<TraceForceNode> &nodes,
-                       std::vector<SurfacePlaneContactPoint> &points) = 0;
+                       std::vector<SurfacePlaneContactPoint> &points,
+                       SurfaceFrictionTransfer *friction = nullptr) = 0;
 };
 
 std::unique_ptr<BondedInterfaceBatch> makeCudaBondedInterface();

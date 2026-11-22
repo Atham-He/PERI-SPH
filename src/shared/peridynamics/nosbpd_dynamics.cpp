@@ -237,6 +237,27 @@ void NosbPDBondWorkspace::refreshLiveBonds(std::size_t count, std::size_t bound,
     }
 }
 
+void NosbPDBondWorkspace::accumulateReferenceShape(Matd *shape)
+{
+    auto &particles = relation_.getSPHBody().getBaseParticles();
+    const auto count = particles.TotalRealParticles();
+    // This defines a fresh reference, even when a newly constructed
+    // relation has the same row lengths as a previous one.
+    configure(count, particles.ParticlesBound());
+    const auto *volume = particles.getVariableDataByName<Real>("VolumetricMeasure");
+    std::vector<double> volume_input(count + ghost_sources_.size());
+    for (size_t i = 0; i < count; ++i)
+        volume_input[i] = volume[i];
+    for (size_t g = 0; g < ghost_sources_.size(); ++g)
+        volume_input[count + g] = volume[ghost_sources_[g]];
+    std::vector<peridynamics::ShapeHessian3> moments;
+    backend_->assembleReferenceShape(volume_input, moments);
+    if (moments.size() != count)
+        throw std::logic_error("NOSB-PD backend returned an incomplete reference shape batch");
+    for (size_t i = 0; i < count; ++i)
+        shape[i] += unpackNosbPDTensor(moments[i]);
+}
+
 void NosbPDBondWorkspace::evaluateIntactPositionMoments(std::vector<peridynamics::ShapeHessian3> &moments,
                                                        const char *broken_bond_reason)
 {

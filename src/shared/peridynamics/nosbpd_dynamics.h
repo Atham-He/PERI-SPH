@@ -166,6 +166,11 @@ class NosbPDBondWorkspace
 
     bool onDevice() const { return static_cast<bool>(backend_); }
     BaseInnerRelation &relation() const { return relation_; }
+    bool assemblesReferenceShape() const noexcept
+    {
+        return backend_ && backend_->assemblesReferenceShape();
+    }
+    void accumulateReferenceShape(Matd *shape);
     bool assemblesIntactPositionMoments() const noexcept
     {
         return backend_ && backend_->assemblesIntactPositionMoments();
@@ -202,6 +207,32 @@ class NosbPDBondWorkspace
     std::vector<peridynamics::NosbPDCorrectionSite> correction_sites_;
     std::vector<peridynamics::NosbPDCorrectionForce> correction_force_;
     std::size_t bound_ = 0;
+};
+
+class NosbPDShapeWithExecution : public InteractionWithUpdate<NosbPDShapeMatrix>
+{
+    using Base = InteractionWithUpdate<NosbPDShapeMatrix>;
+
+  public:
+    NosbPDShapeWithExecution(BaseInnerRelation &relation, NosbPDBondWorkspace *workspace)
+        : Base(relation), workspace_(workspace)
+    {
+        if (workspace_ && &workspace_->relation() != &relation)
+            throw std::invalid_argument("NOSB-PD shape workspace must use the same reference relation");
+    }
+
+    bool onDevice() const noexcept { return workspace_ && workspace_->assemblesReferenceShape(); }
+
+    void runMainStep(Real dt) override
+    {
+        if (onDevice())
+            workspace_->accumulateReferenceShape(this->shape_K_);
+        else
+            Base::runMainStep(dt);
+    }
+
+  private:
+    NosbPDBondWorkspace *workspace_;
 };
 
 template <class Stage>

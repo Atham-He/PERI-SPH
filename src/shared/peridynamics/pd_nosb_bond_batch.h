@@ -92,6 +92,11 @@ class NosbPDBondBatch
     virtual void evaluateDeformation(const std::vector<NosbPDKinematicSite> &sites,
                           const std::vector<std::uint8_t> &bond_live, double dt,
                                      std::vector<NosbPDDeformationTensors> &tensors) = 0;
+    virtual bool assemblesReferenceShape() const noexcept { return false; }
+    virtual void assembleReferenceShape(const std::vector<double> &, std::vector<ShapeHessian3> &)
+    {
+        throw std::logic_error("This NOSB-PD backend does not assemble the reference shape tensor");
+    }
     // Use all bonds in an intact reference to assemble the current position
     // moment, without forming a velocity increment or a midpoint tensor.
     virtual bool assemblesIntactPositionMoments() const noexcept { return false; }

@@ -238,11 +238,14 @@ int main(int argc, char **argv)
     box_contact.applyToCurrentAcceleration(true);
     box_contact.addBox("LowerPlate", Vecd(0, 0.5 * plate_thickness, 0), plate_half_size);
     box_contact.addBox("UpperPlate", Vecd(0, upper_plate_bottom + 0.5 * plate_thickness, 0), plate_half_size);
-    InteractionWithUpdate<solid_dynamics::NosbPDShapeMatrix> shape_matrix(shell_inner);
     auto pd_time_integration = execution->makePositionVerlet();
     solid_dynamics::NosbPDStepWithExecution<solid_dynamics::NosbPDFirstStep> first(shell, pd_time_integration.get());
     std::cout << "NOSB-PD position Verlet backend " << (pd_time_integration ? "cuda_fp64" : "cpu_fp64") << std::endl;
     solid_dynamics::NosbPDBondWorkspace pd_bonds(shell_inner, execution->makeNosbPDBonds());
+    solid_dynamics::NosbPDShapeWithExecution shape_matrix(shell_inner, &pd_bonds);
+    std::cout << "NOSB-PD reference shape backend "
+              << (checkpoint_options.resume.empty() ? (shape_matrix.onDevice() ? "cuda_fp64" : "cpu_fp64") : "checkpoint")
+              << std::endl;
     std::cout << "NOSB-PD internal force backend " << (pd_bonds.onDevice() ? "cuda_fp64" : "cpu_fp64") << std::endl;
     auto pd_elastic = material_options.model == "elastic" ? execution->makeNosbPDElastic() : nullptr;
     if (material_options.model == "elastic")
@@ -532,7 +535,10 @@ int main(int argc, char **argv)
     try
     {
         system.initializeSystemCellLinkedLists(); system.initializeSystemConfigurations();
-        shell_normals.exec(); lower_normals.exec(); upper_normals.exec(); shape_matrix.exec(); move_upper.exec();
+        shell_normals.exec(); lower_normals.exec(); upper_normals.exec();
+        // A full restart restores both reference tensors and neighbor order.
+        if (checkpoint_options.resume.empty()) shape_matrix.exec();
+        move_upper.exec();
         if (with_liquid) {fluid_gravity.exec(); update_fluid_volume.exec();}
         if(checkpoint_options.resume.empty())
         {

@@ -79,7 +79,6 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
         throw std::invalid_argument("gel spatial control requires 1..8192 particles");
 
     InnerRelation reference(particle);
-    InteractionWithUpdate<solid_dynamics::NosbPDShapeMatrix> shape(reference);
     SimpleDynamics<solid_dynamics::PDTimeStepInitialization> initialize(particle, makeShared<Gravity>(Vecd::Zero()));
     auto verlet_backend = execution.makePositionVerlet();
     solid_dynamics::NosbPDStepWithExecution<solid_dynamics::NosbPDFirstStep> first(particle, verlet_backend.get());
@@ -88,6 +87,10 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
     auto plastic_backend = material.isPlastic() ? execution.makeNosbPDPlastic() : nullptr;
     std::cout << "PD material backend " << (gel_backend || elastic_backend || plastic_backend ? "cuda_fp64" : "cpu_fp64") << std::endl;
     solid_dynamics::NosbPDBondWorkspace bond_workspace(reference, execution.makeNosbPDBonds());
+    solid_dynamics::NosbPDShapeWithExecution shape(reference, &bond_workspace);
+    std::cout << "NOSB-PD reference shape backend "
+              << (restart.resume.empty() ? (shape.onDevice() ? "cuda_fp64" : "cpu_fp64") : "checkpoint")
+              << std::endl;
     if (material.isViscoelastic())
         std::cout << "PD position moment backend "
                   << (gel_backend && bond_workspace.assemblesIntactPositionMoments() ? "cuda_fp64" : "cpu_fp64") << std::endl;
@@ -293,9 +296,9 @@ int simulate(int argc, char **argv, const peridynamics::ParticleCompressionOptio
         system.initializeSystemConfigurations();
         if (material.viscoelastic && restart.resume.empty())
             solid_dynamics::canonicalizeInitialGelReference(reference, time);
-        shape.exec();
         if (restart.resume.empty())
         {
+            shape.exec();
             synchronize_plate(time);
             if (surface_contact) surface_contact->referenceFile(false);
             contact_impulses.initialize(momentum());

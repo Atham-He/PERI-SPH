@@ -200,11 +200,12 @@ int main(int ac, char *av[]) try
     //----------------------------------------------------------------------
     //	Algorithms of NOSB-PD dynamics.
     //----------------------------------------------------------------------
-    InteractionWithUpdate<solid_dynamics::NosbPDShapeMatrix> plate_shape_matrix(plate_inner_relation);
     auto pd_time_integration = execution.makePositionVerlet();
     solid_dynamics::NosbPDStepWithExecution<solid_dynamics::NosbPDFirstStep> nosbpd_first_step(plate, pd_time_integration.get());
     std::cout << "NOSB-PD position Verlet backend " << (pd_time_integration ? "cuda_fp64" : "cpu_fp64") << std::endl;
     solid_dynamics::NosbPDBondWorkspace pd_bonds(plate_inner_relation, execution.makeNosbPDBonds());
+    solid_dynamics::NosbPDShapeWithExecution plate_shape_matrix(plate_inner_relation, &pd_bonds);
+    std::cout << "NOSB-PD reference shape backend " << (plate_shape_matrix.onDevice() ? "cuda_fp64" : "cpu_fp64") << std::endl;
     const peridynamics::NosbPDBondFailureParameters failure{
         peridynamics::NosbPDBondFailureLaw::StressShear, max_tension_stress, max_shear_stress, Dimensions};
     solid_dynamics::NosbPDBondFractureWithExecution<solid_dynamics::BondBreakBySigma1andSigma3>

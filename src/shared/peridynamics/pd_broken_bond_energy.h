@@ -20,15 +20,13 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
     Real *stored_density,*hg_density,*tangent_bound;Matd *F,*P,*stress;Vecd *internal,*hourglass;
     PDBrokenBondEnergy(BaseInnerRelation&r,PDLayeredFractureReference&ref,Real E,Real nu,Real hg,Real horizon,
                        std::unique_ptr<peridynamics::SpatialDerivativeBatch> derivatives = nullptr,
-                       bool tighter_time_bound = false,
-                       std::unique_ptr<peridynamics::FiniteVolumeBiotBatch> material = nullptr)
+                       bool tighter_time_bound = false)
       :LocalDynamics(r.getSPHBody()),DataDelegateInner(r),reference(ref),elastic(E,nu),
        x(particles_->getVariableDataByName<Vecd>("Position")),volume(particles_->getVariableDataByName<Real>("VolumetricMeasure")),
        mass(particles_->getVariableDataByName<Real>("Mass")),acc(particles_->getVariableDataByName<Vecd>("PDAcceleration")),
        F(particles_->getVariableDataByName<Matd>("DeformationGradient")),P(particles_->getVariableDataByName<Matd>("PDPK1")),
        stress(particles_->getVariableDataByName<Matd>("PDStress")),internal(particles_->getVariableDataByName<Vecd>("PDInternalForce")),
-       hourglass(particles_->getVariableDataByName<Vecd>("HourglassForce")), derivatives_(std::move(derivatives)), material_(std::move(material)), tighter_time_bound_(tighter_time_bound) {
-        if(material_&&!derivatives_)throw std::invalid_argument("Batched Biot evaluation requires batched deformation gradients");
+       hourglass(particles_->getVariableDataByName<Vecd>("HourglassForce")), derivatives_(std::move(derivatives)), tighter_time_bound_(tighter_time_bound) {
         if(hg<0||horizon<=0)throw std::invalid_argument("Invalid live-bond stabilizer");stabilizer=hg*elastic.K/(horizon*horizon);
         stored_density=particles_->registerStateVariableData<Real>("ShellStoredEnergyDensity");hg_density=particles_->registerStateVariableData<Real>("ShellStabilizationEnergyDensity");tangent_bound=particles_->registerStateVariableData<Real>("ShellTangentModulusBound");
     }
@@ -57,10 +55,10 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
         version=reference.topology_version;
     }
     bool hasDeviceDerivatives() const noexcept { return derivatives_ != nullptr; }
-    bool hasDeviceMaterial() const noexcept { return material_ != nullptr; }
+    bool hasDeviceMaterial() const noexcept { return derivatives_ && derivatives_->supportsResidentBiot(); }
     size_t hostMaterialPoints() const
     {
-        if (!material_) return projection.size();
+        if (!hasDeviceMaterial()) return projection.size();
         return std::count_if(device_material_results_.begin(),device_material_results_.end(),
                              [](const auto &result) { return !result.accepted; });
     }
@@ -79,15 +77,8 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
         const size_t count = projection.size();
         if (derivatives_)
             evaluateDeviceDerivatives(count);
-        if (material_)
-        {
-            device_material_inputs_.resize(count);
-            for (size_t i=0;i<count;++i)
-                for (int a=0;a<3;++a)
-                    for (int b=0;b<3;++b)
-                        device_material_inputs_[i].derivative[a][b]=device_derivatives_[i].gradient[a][b];
-            material_->evaluate(device_material_inputs_,elastic.K,elastic.mu,device_material_results_);
-        }
+        resident_material_complete_=hasDeviceMaterial()&&
+            derivatives_->evaluateResidentBiot(elastic.K,elastic.mu,device_material_results_);
         tbb::parallel_for(size_t(0), count, [&](size_t i)
         {
             evaluatePoint(i, derivatives_ ? &device_derivatives_[i] : nullptr);
@@ -130,7 +121,7 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
         }
         F[i] = f;
         hg_density[i] = hg;
-        if (material_&&device_material_results_[i].accepted)
+        if (!device_material_results_.empty()&&device_material_results_[i].accepted)
         {
             const auto &state=device_material_results_[i];
             for (int a=0;a<3;++a)
@@ -190,9 +181,8 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
   private:
     Vecd*x;Real*volume,*mass;Vecd*acc;
     std::unique_ptr<peridynamics::SpatialDerivativeBatch> derivatives_;
-    std::unique_ptr<peridynamics::FiniteVolumeBiotBatch> material_;
-    std::vector<peridynamics::ShapeHessian3> device_material_inputs_;
     std::vector<peridynamics::FiniteVolumeBiotPointResult> device_material_results_;
+    bool resident_material_complete_=false;
     bool tighter_time_bound_;
     peridynamics::ReferenceSpectralBound gradient_bound_;
     bool derivative_stencil_current_ = false;
@@ -233,6 +223,8 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
         {
             peridynamics::SpatialDerivativeMap map{};
             map.particle_count = count;
+            if (hasDeviceMaterial())
+                map.biot_point_volumes.assign(volume,volume+count);
             map.offsets.push_back(0);
             for (size_t i = 0; i < count; ++i)
             {
@@ -265,12 +257,17 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
     void assembleDeviceStressForce(size_t count)
     {
         prepareDerivativeStencil(count);
-        device_force_coefficients_.resize(count);
-        for (size_t i = 0; i < count; ++i)
-            for (int a = 0; a < 3; ++a)
-                for (int b = 0; b < 3; ++b)
-                    device_force_coefficients_[i].gradient[a][b] = volume[i] * P[i](a, b);
-        derivatives_->assembleAdjoint(device_force_coefficients_, device_stress_force_);
+        if (resident_material_complete_)
+            derivatives_->assembleResidentBiotAdjoint(device_stress_force_);
+        else
+        {
+            device_force_coefficients_.resize(count);
+            for (size_t i = 0; i < count; ++i)
+                for (int a = 0; a < 3; ++a)
+                    for (int b = 0; b < 3; ++b)
+                        device_force_coefficients_[i].gradient[a][b] = volume[i] * P[i](a, b);
+            derivatives_->assembleAdjoint(device_force_coefficients_, device_stress_force_);
+        }
         if (device_stress_force_.size() != count)
             throw std::logic_error("Spatial adjoint backend returned an incomplete live PD force field");
     }

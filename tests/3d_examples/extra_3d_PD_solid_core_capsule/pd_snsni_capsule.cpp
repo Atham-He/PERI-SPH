@@ -108,7 +108,7 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells,const PeriExec
     InteractionWithUpdate<NosbPDQuadraticSecondStep> quadratic_second(relation,sr);
     InteractionDynamics<NosbPDQuadraticThirdStep> quadratic_third(relation,sr);
     PDBrokenBondEnergy sb(relation,sr,o.shell_E,o.shell_nu,o.pd_hourglass,shell.getSPHAdaptation().getKernel()->CutOffRadius(),
-                          execution.makeSpatialDerivatives(),tighter_shell_step,execution.makeFiniteVolumeBiot());
+                          execution.makeSpatialDerivatives(),tighter_shell_step);
     system.initializeSystemCellLinkedLists();system.initializeSystemConfigurations();shape.exec();sr.initialize();sb.rebuild();
     SolidForcePort core_port(core,SolidForcePort::Storage::ForcePrior),pd_port(shell,SolidForcePort::Storage::PDAccelerationPrior);
     StdVec<Vecd>points,outer_points;StdVec<Real>areas;

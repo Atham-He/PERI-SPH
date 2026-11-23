@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 namespace SPH::peridynamics
@@ -46,6 +47,7 @@ struct SpatialDerivativeMap
     bool add_identity = false;
     bool build_adjoint = true;
     std::vector<SmoothedQuadratureSite> smoothed_sites;
+    std::vector<double> biot_point_volumes;
 };
 
 struct SpatialDerivatives3
@@ -59,6 +61,8 @@ struct WeightedDifferenceResult
     std::vector<double> energy_density;
     std::vector<ParticleVector3> forces;
 };
+
+struct FiniteVolumeBiotPointResult;
 
 class SpatialDerivativeBatch
 {
@@ -82,6 +86,19 @@ class SpatialDerivativeBatch
     virtual void assembleSmoothedAdjoint(const std::vector<SmoothedStressField> &stress,
                                          std::vector<SpatialDerivatives3> &coefficients,
                                          std::vector<ParticleVector3> &result) = 0;
+
+    virtual bool supportsResidentBiot() const noexcept { return false; }
+    // Evaluates Biot from the latest deformation gradients. A false result
+    // means the caller must complete the rejected material points on the host.
+    virtual bool evaluateResidentBiot(double, double, std::vector<FiniteVolumeBiotPointResult> &)
+    {
+        throw std::logic_error("This derivative backend does not evaluate resident Biot material");
+    }
+    // Reuses accepted Biot stresses with the configured point volumes.
+    virtual void assembleResidentBiotAdjoint(std::vector<ParticleVector3> &)
+    {
+        throw std::logic_error("This derivative backend does not assemble resident Biot forces");
+    }
 };
 
 std::unique_ptr<SpatialDerivativeBatch> makeCudaSpatialDerivatives();

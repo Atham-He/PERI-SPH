@@ -73,6 +73,7 @@ foreach(SNSNI_FILE
         ${PERI_SHARED}/peridynamics/pd_execution.h
         ${PERI_SHARED}/../peri_execution/pd_execution.cpp
         ${PERI_SHARED}/peridynamics/pd_finite_volume_biot_batch.h
+        ${PERI_SHARED}/peridynamics/pd_finite_volume_biot_cuda.cuh
         ${PERI_SHARED}/../peri_execution/pd_finite_volume_biot_cuda.cu
         ${PERI_SHARED}/peridynamics/pd_solid_time_step.h
         ${PERI_SHARED}/../peri_execution/pd_solid_time_step_cuda.cu

@@ -1,4 +1,5 @@
 #include "pd_spatial_derivatives.h"
+#include "pd_finite_volume_biot_cuda.cuh"
 #include "pd_smoothed_force_projection.h"
 #include "pd_cuda_buffer.cuh"
 
@@ -206,6 +207,24 @@ __global__ void projectSmoothedCoefficients(const SmoothedQuadratureSite *quadra
         }
 }
 
+__global__ void evaluateResidentBiotKernel(const SpatialDerivatives3 *deformation,std::size_t count,
+                                              double bulk,double shear,FiniteVolumeBiotPointResult *result)
+{
+    const auto i=std::size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if (i<count)
+        result[i]=cuda_detail::evaluateFiniteVolumeBiotPoint(deformation[i].gradient,bulk,shear);
+}
+
+__global__ void weightBiotAdjoint(const FiniteVolumeBiotPointResult *material,const double *volume,
+                                  std::size_t count,SpatialDerivatives3 *coefficients)
+{
+    const auto i=std::size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if (i>=count) return;
+    for (int a=0;a<3;++a)
+        for (int b=0;b<3;++b)
+            coefficients[i].gradient[a][b]=volume[i]*material[i].piola.derivative[a][b];
+}
+
 class CudaSpatialDerivatives final : public SpatialDerivativeBatch
 {
   public:
@@ -229,6 +248,8 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
         if (!map.smoothed_sites.empty() &&
             (map.smoothed_sites.size()!=rows || map.hessians.empty() || !map.build_adjoint || !map.add_identity))
             throw std::invalid_argument("Smoothed force projection requires matching integration sites, deformation Hessians and an adjoint stencil");
+        if (!map.biot_point_volumes.empty() && (map.biot_point_volumes.size()!=rows || !map.build_adjoint))
+            throw std::invalid_argument("Biot force assembly requires row volumes and an adjoint stencil");
         if (!map.weighted_differences.empty() &&
             (map.weighted_differences.size() != entries || map.origins.empty() || !map.build_adjoint))
             throw std::invalid_argument("Weighted differences require entry fits, row origins and the adjoint stencil");
@@ -243,12 +264,15 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
 
         configured_ = false;
         derivative_result_ready_ = false;
+        resident_biot_ready_ = false;
         upload(offsets_, map.offsets, "spatial derivative offsets");
         upload(neighbors_, map.neighbors, "spatial derivative neighbors");
         upload(origins_, map.origins, "spatial derivative origins");
         upload(gradients_, map.gradients, "reference gradients");
         upload(hessians_, map.hessians, "reference Hessians");
         upload(smoothed_sites_, map.smoothed_sites, "smoothed integration sites");
+        upload(biot_point_volumes_,map.biot_point_volumes,"Biot integration volumes");
+        has_biot_volumes_ = !map.biot_point_volumes.empty();
         has_smoothed_sites_ = !map.smoothed_sites.empty();
         upload(weighted_differences_, map.weighted_differences, "reference weighted differences");
         if (map.build_adjoint)
@@ -272,6 +296,7 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
         if (weighted_difference && weighted_differences_count_ == 0)
             throw std::invalid_argument("Stencil has no weighted difference fit");
         derivative_result_ready_ = false;
+        resident_biot_ready_ = false;
         result.resize(rows_);
         if (rows_ == 0)
             return;
@@ -324,7 +349,7 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
         if (!configured_ || !has_adjoint_ || coefficients.size() != rows_)
             throw std::invalid_argument("Coefficient field does not match an adjoint stencil");
         upload(adjoint_coefficients_, coefficients, "spatial adjoint coefficients");
-        gatherAdjoint(result);
+        gatherAdjoint(result,use_hessians_);
     }
 
     void assembleSmoothedAdjoint(const std::vector<SmoothedStressField> &stress,
@@ -340,20 +365,48 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
             result_.get(),rows_,adjoint_coefficients_.get());
         check(cudaGetLastError(),"project smoothed force coefficients");
 
-        gatherAdjoint(result);
+        gatherAdjoint(result,true);
         coefficients.resize(rows_);
         download(coefficients,adjoint_coefficients_,"smoothed force coefficients");
     }
 
+    bool supportsResidentBiot() const noexcept override { return true; }
+
+    bool evaluateResidentBiot(double bulk,double shear,std::vector<FiniteVolumeBiotPointResult> &result) override
+    {
+        if (!derivative_result_ready_)
+            throw std::logic_error("Resident Biot material requires a current deformation gradient");
+        resident_biot_ready_=false;
+        result.resize(rows_);
+        biot_material_.reserve(rows_);
+        evaluateResidentBiotKernel<<<grid(rows_,1),threads>>>(result_.get(),rows_,bulk,shear,biot_material_.get());
+        check(cudaGetLastError(),"evaluate Biot material from resident gradients");
+        download(result,biot_material_,"resident Biot material results");
+        resident_biot_ready_=std::all_of(result.begin(),result.end(),
+                                         [](const auto &point){return point.accepted;});
+        return resident_biot_ready_;
+    }
+
+    void assembleResidentBiotAdjoint(std::vector<ParticleVector3> &result) override
+    {
+        if (!has_biot_volumes_ || !resident_biot_ready_)
+            throw std::logic_error("Resident Biot forces require accepted stresses and integration volumes");
+        adjoint_coefficients_.reserve(rows_);
+        weightBiotAdjoint<<<grid(rows_,1),threads>>>(biot_material_.get(),biot_point_volumes_.get(),rows_,
+                                                    adjoint_coefficients_.get());
+        check(cudaGetLastError(),"weight resident Biot Piola stresses");
+        gatherAdjoint(result,false);
+    }
+
   private:
-    void gatherAdjoint(std::vector<ParticleVector3> &result)
+    void gatherAdjoint(std::vector<ParticleVector3> &result,bool second_order)
     {
         result.resize(particle_count_);
         if (particle_count_ == 0)
             return;
         const auto blocks=grid(particle_count_);
         adjoint_result_.reserve(particle_count_);
-        if (use_hessians_)
+        if (second_order)
             assembleSpatialAdjoint<true><<<blocks, threads>>>(adjoint_offsets_.get(), adjoint_entries_.get(),
                 gradients_.get(), hessians_.get(), adjoint_coefficients_.get(), particle_count_, adjoint_result_.get());
         else
@@ -434,6 +487,9 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
     std::size_t particle_count_ = 0, rows_ = 0, max_blocks_ = 0;
     bool use_origins_ = false, use_hessians_ = false, add_identity_ = false, configured_ = false;
     bool has_adjoint_ = false, has_smoothed_sites_ = false, derivative_result_ready_ = false;
+    bool has_biot_volumes_ = false, resident_biot_ready_ = false;
+    DeviceBuffer<double> biot_point_volumes_;
+    DeviceBuffer<FiniteVolumeBiotPointResult> biot_material_;
     DeviceBuffer<std::size_t> offsets_, neighbors_, origins_;
     DeviceBuffer<ParticleVector3> gradients_, particles_, channel_gradients_;
     DeviceBuffer<double> channel_field_;

@@ -21,6 +21,20 @@ __global__ void evaluateHertzPairs(const HertzSphereSite<double> *particles,cons
     }
 }
 
+__global__ void evaluateFrictionalPairs(const FrictionalSphereSite<double> *particles,
+                                        const FrictionalSphereCandidate<double> *candidates,
+                                        std::size_t count,FrictionalSphereParameters<double> parameters,
+                                        FrictionalSphereResult<double> *result)
+{
+    const auto i=std::size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i<count)
+    {
+        const auto &entry=candidates[i];
+        result[i]=evaluateFrictionalSpherePair(particles[entry.indices.first],particles[entry.indices.second],
+                                               entry.old,parameters);
+    }
+}
+
 class CudaHertzSpherePairs final : public HertzSpherePairBatch
 {
   public:
@@ -36,27 +50,62 @@ class CudaHertzSpherePairs final : public HertzSpherePairBatch
     {
         result.resize(candidates.size());
         if (candidates.empty()) return;
-        const auto blocks=(candidates.size()-1)/threads_+1;
-        if (blocks>static_cast<std::size_t>(max_blocks_))
-            throw std::length_error("Hertz sphere contact batch exceeds the CUDA grid");
+        const auto blocks=grid(candidates.size());
         for (const auto &pair:candidates)
-            if (pair.first>=particles.size()||pair.second>=particles.size())
-                throw std::out_of_range("Hertz sphere pair refers to an unknown grain");
+            validatePair(pair,particles.size());
         upload(particles_,particles,"Hertz sphere positions and radii");
         upload(candidates_,candidates,"Hertz sphere candidates");
         result_.reserve(candidates.size());
-        evaluateHertzPairs<<<static_cast<unsigned>(blocks),threads_>>>(particles_.get(),candidates_.get(),candidates.size(),
+        evaluateHertzPairs<<<blocks,threads_>>>(particles_.get(),candidates_.get(),candidates.size(),
                                                                      effective_modulus,result_.get());
         check(cudaGetLastError(),"evaluate Hertz sphere pairs");
         download(result,result_,"Hertz sphere pair results");
     }
 
+    bool supportsFriction() const noexcept override {return true;}
+
+    void evaluateFrictional(const std::vector<FrictionalSphereSite<double>> &particles,
+                            const std::vector<FrictionalSphereCandidate<double>> &candidates,
+                            FrictionalSphereParameters<double> parameters,
+                            std::vector<FrictionalSphereResult<double>> &result) override
+    {
+        result.resize(candidates.size());
+        if(candidates.empty()) return;
+        const auto blocks=grid(candidates.size());
+        for(const auto &pair:candidates)
+            validatePair(pair.indices,particles.size());
+        upload(friction_sites_,particles,"grain positions, velocities and spin");
+        upload(friction_candidates_,candidates,"grain contact indices and committed history");
+        friction_result_.reserve(candidates.size());
+        evaluateFrictionalPairs<<<blocks,threads_>>>(friction_sites_.get(),friction_candidates_.get(),
+                                                      candidates.size(),parameters,friction_result_.get());
+        check(cudaGetLastError(),"evaluate frictional sphere pairs");
+        download(result,friction_result_,"frictional sphere pair results");
+    }
+
   private:
+    unsigned grid(std::size_t count) const
+    {
+        const auto blocks=(count-1)/threads_+1;
+        if(blocks>static_cast<std::size_t>(max_blocks_))
+            throw std::length_error("Hertz sphere contact batch exceeds the CUDA grid");
+        return static_cast<unsigned>(blocks);
+    }
+
+    static void validatePair(HertzSpherePair pair,std::size_t count)
+    {
+        if(pair.first>=count||pair.second>=count)
+            throw std::out_of_range("Hertz sphere pair refers to an unknown grain");
+    }
+
     static constexpr unsigned threads_=128;
     int max_blocks_=0;
     DeviceBuffer<HertzSphereSite<double>> particles_;
     DeviceBuffer<HertzSpherePair> candidates_;
     DeviceBuffer<HertzSphereContact<double>> result_;
+    DeviceBuffer<FrictionalSphereSite<double>> friction_sites_;
+    DeviceBuffer<FrictionalSphereCandidate<double>> friction_candidates_;
+    DeviceBuffer<FrictionalSphereResult<double>> friction_result_;
 };
 }
 

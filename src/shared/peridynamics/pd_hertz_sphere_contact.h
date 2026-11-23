@@ -1,8 +1,11 @@
 #pragma once
 
+#include "pd_objective_contact_friction.h"
+
 #include <cmath>
 #include <cstddef>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 #if defined(__CUDACC__)
@@ -72,6 +75,63 @@ SPH_HERTZ_HD HertzSphereContact<Real> evaluateHertzSpherePair(
     return result;
 }
 
+template<class Real>
+struct FrictionalSphereSite
+{
+    HertzSphereSite<Real> geometry;
+    ContactVector3<Real> velocity,omega;
+};
+
+template<class Real>
+struct FrictionalSphereParameters
+{
+    Real effective_modulus,stiffness,friction,dt;
+    bool commit;
+};
+
+template<class Real>
+struct FrictionalSphereCandidate
+{
+    HertzSpherePair indices;
+    ObjectiveFrictionState<Real> old;
+};
+
+template<class Real>
+struct FrictionalSphereResult
+{
+    HertzSphereContact<Real> contact;
+    ObjectiveFrictionResponse<Real> friction;
+};
+
+template<class Real>
+SPH_HERTZ_HD ObjectiveFrictionResponse<Real> evaluateSphereFriction(
+    const FrictionalSphereSite<Real> &a,const FrictionalSphereSite<Real> &b,
+    const HertzSphereContact<Real> &contact,const ObjectiveFrictionState<Real> &old,
+    FrictionalSphereParameters<Real> parameters)
+{
+    if(contact.status==HertzPairStatus::Coincident)
+        return {old};
+    if(contact.status==HertzPairStatus::Separated)
+        return evaluateObjectiveFriction(old,{},{},Real(0),Real(0),parameters.stiffness,
+                                         parameters.friction,parameters.dt,parameters.commit);
+    const ContactVector3<Real> n{contact.normal[0],contact.normal[1],contact.normal[2]};
+    const ContactVector3<Real> ra{contact.first_arm[0],contact.first_arm[1],contact.first_arm[2]};
+    const ContactVector3<Real> rb{contact.second_arm[0],contact.second_arm[1],contact.second_arm[2]};
+    const auto relative=a.velocity+a.omega.cross(ra)-b.velocity-b.omega.cross(rb);
+    const Real spin=Real(.5)*(a.omega+b.omega).dot(n);
+    return evaluateObjectiveFriction(old,n,relative,spin,contact.force,parameters.stiffness,
+                                     parameters.friction,parameters.dt,parameters.commit);
+}
+
+template<class Real>
+SPH_HERTZ_HD FrictionalSphereResult<Real> evaluateFrictionalSpherePair(
+    const FrictionalSphereSite<Real> &a,const FrictionalSphereSite<Real> &b,
+    const ObjectiveFrictionState<Real> &old,FrictionalSphereParameters<Real> parameters)
+{
+    const auto contact=evaluateHertzSpherePair(a.geometry,b.geometry,parameters.effective_modulus);
+    return {contact,evaluateSphereFriction(a,b,contact,old,parameters)};
+}
+
 class HertzSpherePairBatch
 {
   public:
@@ -79,6 +139,30 @@ class HertzSpherePairBatch
     virtual void evaluate(const std::vector<HertzSphereSite<double>> &particles,
                           const std::vector<HertzSpherePair> &candidates,double effective_modulus,
                           std::vector<HertzSphereContact<double>> &result) = 0;
+    virtual bool supportsFriction() const noexcept { return false; }
+    virtual void evaluateFrictional(const std::vector<FrictionalSphereSite<double>> &sites,
+                                    const std::vector<FrictionalSphereCandidate<double>> &candidates,
+                                    FrictionalSphereParameters<double> parameters,
+                                    std::vector<FrictionalSphereResult<double>> &result)
+    {
+        std::vector<HertzSphereSite<double>> geometry;
+        std::vector<HertzSpherePair> indices;
+        geometry.reserve(sites.size());
+        indices.reserve(candidates.size());
+        for(const auto &site:sites) geometry.push_back(site.geometry);
+        for(const auto &candidate:candidates) indices.push_back(candidate.indices);
+        std::vector<HertzSphereContact<double>> contact;
+        evaluate(geometry,indices,parameters.effective_modulus,contact);
+        if(contact.size()!=indices.size())
+            throw std::logic_error("Sphere contact backend returned an incomplete batch");
+        result.resize(contact.size());
+        for(std::size_t i=0;i<contact.size();++i)
+        {
+            const auto pair=indices[i];
+            result[i]={contact[i],evaluateSphereFriction(sites.at(pair.first),sites.at(pair.second),
+                                                        contact[i],candidates[i].old,parameters)};
+        }
+    }
 };
 
 std::unique_ptr<HertzSpherePairBatch> makeCudaHertzSpherePairs();

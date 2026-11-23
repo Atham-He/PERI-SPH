@@ -46,20 +46,30 @@ struct ObjectiveLinearFriction
     Vecd slip=Vecd::Zero(),normal=Vecd::UnitZ();bool active=false;
     Real stored=0,dissipated=0,released=0;
     void clear(){released+=stored;stored=0;slip.setZero();active=false;}
+    template<class Scalar>
+    ObjectiveFrictionState<Scalar> state()const
+    {
+        return {{Scalar(slip[0]),Scalar(slip[1]),Scalar(slip[2])},
+                {Scalar(normal[0]),Scalar(normal[1]),Scalar(normal[2])},
+                Scalar(stored),Scalar(dissipated),Scalar(released),active};
+    }
+
+    template<class Scalar>
+    void applyState(const ObjectiveFrictionState<Scalar> &next)
+    {
+        slip=Vecd(next.slip.x,next.slip.y,next.slip.z);
+        normal=Vecd(next.normal.x,next.normal.y,next.normal.z);
+        active=next.active;
+        stored=next.stored;dissipated=next.dissipated;released=next.released;
+    }
+
     Vecd force(const Vecd&n,const Vecd&relative_velocity,Real spin,Real fn,Real kt,Real mu,Real dt,bool commit)
     {
-        if(fn<=0||mu==0){if(commit)clear();return Vecd::Zero();}
-        Vecd trial=Vecd::Zero();
-        if(active){Real c=std::clamp(normal.dot(n),Real(-1),Real(1));if(c<-.999999)throw std::runtime_error("Contact frame reversed in one step");
-          Vecd axis=normal.cross(n);Matd skew;skew<<0,-axis[2],axis[1],axis[2],0,-axis[0],-axis[1],axis[0],0;
-          trial=(Matd::Identity()+skew+skew*skew/(1+c))*slip;
-          if(commit&&dt>0)trial=Eigen::AngleAxis<Real>(spin*dt,n)*trial;
-          trial-=n*trial.dot(n);
-          if(commit)trial+=dt*(relative_velocity-n*relative_velocity.dot(n));}
-        Real magnitude=kt*trial.norm(),limit=mu*fn,loss=0;
-        if(magnitude>limit){Vecd before=trial;trial*=limit/magnitude;loss=limit*(before-trial).norm();}
-        if(commit){slip=trial;normal=n;active=true;stored=.5*kt*trial.squaredNorm();dissipated+=loss;}
-        return -kt*trial;
+        const auto result=evaluateObjectiveFriction(state<Real>(),{n[0],n[1],n[2]},
+            {relative_velocity[0],relative_velocity[1],relative_velocity[2]},spin,fn,kt,mu,dt,commit);
+        if(result.reversed)throw std::runtime_error("Contact frame reversed in one step");
+        if(commit)applyState(result.state);
+        return Vecd(result.force.x,result.force.y,result.force.z);
     }
 };
 
@@ -100,14 +110,16 @@ class CurrentSphereBins
 class RigidGrainShearBox
 {
     std::unique_ptr<HertzSpherePairBatch> pair_backend_;
-    std::vector<HertzSphereSite<double>> pair_sites_;
-    std::vector<HertzSpherePair> pair_candidates_;
-    std::vector<HertzSphereContact<double>> pair_contacts_;
+    std::vector<FrictionalSphereSite<double>> pair_sites_;
+    std::vector<FrictionalSphereCandidate<double>> pair_candidates_;
+    std::vector<FrictionalSphereResult<double>> pair_contacts_;
 
     template<class Scalar>
-    static HertzSphereSite<Scalar> pairSite(const RigidGrain &grain)
+    static FrictionalSphereSite<Scalar> pairSite(const RigidGrain &grain)
     {
-        return {{Scalar(grain.x[0]),Scalar(grain.x[1]),Scalar(grain.x[2])},Scalar(grain.radius)};
+        return {{{Scalar(grain.x[0]),Scalar(grain.x[1]),Scalar(grain.x[2])},Scalar(grain.radius)},
+                {Scalar(grain.v[0]),Scalar(grain.v[1]),Scalar(grain.v[2])},
+                {Scalar(grain.omega[0]),Scalar(grain.omega[1]),Scalar(grain.omega[2])}};
     }
 
   public:
@@ -147,6 +159,7 @@ class RigidGrainShearBox
         if(core_surface&&core_surface->rows.size()!=core_areas.size())throw std::runtime_error("Invalid core contact quadrature");core_position.resize(core_areas.size());
     }
     bool hasDeviceHertzPairs()const noexcept{return pair_backend_!=nullptr;}
+    bool hasDevicePairFriction()const noexcept{return pair_backend_&&pair_backend_->supportsFriction();}
     Real hertz(Real penetration,Real radius,bool wall=false)const
     {Real effective=options.grain_E_Pa/((wall?1:2)*(1-options.grain_nu*options.grain_nu));return hertzNormalForce(penetration,radius,effective);}
     Real pressureAt(Real height)const
@@ -189,18 +202,22 @@ class RigidGrainShearBox
                         visit(i,j);
                     }
         };
-        auto applyPair=[&](size_t i,size_t j,const auto &contact)
+        auto applyPair=[&](size_t i,size_t j,const auto &result)
         {
-            auto &history=pairs[i*n+j];
-            if(contact.status==HertzPairStatus::Separated){if(commit)history.clear();return;}
+            const auto &contact=result.contact;
+            const auto &friction=result.friction;
             if(contact.status==HertzPairStatus::Coincident)throw std::runtime_error("Coincident grains");
+            if(friction.reversed)throw std::runtime_error("Contact frame reversed in one step");
+            auto &history=pairs[i*n+j];
+            if(commit)history.applyState(friction.state);
+            if(contact.status==HertzPairStatus::Separated)return;
             auto &a=grains[i],&b=grains[j];
             const Vecd normal(contact.normal[0],contact.normal[1],contact.normal[2]);
             const Vecd ra(contact.first_arm[0],contact.first_arm[1],contact.first_arm[2]);
             const Vecd rb(contact.second_arm[0],contact.second_arm[1],contact.second_arm[2]);
             const Real pen=contact.penetration,fn=contact.force,kn=contact.stiffness;
-            Vecd relative=a.v+a.omega.cross(ra)-b.v-b.omega.cross(rb);
-            Vecd tangential=history.force(normal,relative,.5*(a.omega+b.omega).dot(normal),fn,options.grain_tangent_stiffness_N_m,options.grain_mu,dt,commit),f=fn*normal+tangential;
+            const Vecd tangential(friction.force.x,friction.force.y,friction.force.z);
+            const Vecd f=fn*normal+tangential;
             if(commit&&history.active)next_active_pairs.push_back(i*n+j);
             a.force+=f;b.force-=f;a.torque+=ra.cross(f);b.torque-=rb.cross(f);elastic_energy+=.4*fn*pen;
             ++grain_contacts;max_sphere_penetration=std::max(max_sphere_penetration,pen);max_overlap_ratio=std::max(max_overlap_ratio,pen/std::min(a.radius,b.radius));
@@ -209,23 +226,29 @@ class RigidGrainShearBox
             grainRate(i,ra.norm(),stiffness,sum);grainRate(j,rb.norm(),stiffness,sum);
         };
         const Real pair_modulus=options.grain_E_Pa/(2*(1-options.grain_nu*options.grain_nu));
+        const Real pair_stiffness=options.grain_tangent_stiffness_N_m,pair_mu=options.grain_mu;
         if(pair_backend_)
         {
             pair_sites_.resize(n);
             for(size_t i=0;i<n;++i)pair_sites_[i]=pairSite<double>(grains[i]);
             pair_candidates_.clear();
-            forEachPair([&](size_t i,size_t j){pair_candidates_.push_back({i,j});});
-            pair_backend_->evaluate(pair_sites_,pair_candidates_,pair_modulus,pair_contacts_);
+            forEachPair([&](size_t i,size_t j){pair_candidates_.push_back({{i,j},pairs[i*n+j].state<double>()});});
+            pair_backend_->evaluateFrictional(pair_sites_,pair_candidates_,{pair_modulus,pair_stiffness,pair_mu,dt,commit},
+                                              pair_contacts_);
             for(size_t k=0;k<pair_candidates_.size();++k)
             {
-                const auto pair=pair_candidates_[k];
+                const auto pair=pair_candidates_[k].indices;
                 applyPair(pair.first,pair.second,pair_contacts_[k]);
             }
         }
         else
+        {
+            const FrictionalSphereParameters<Real> parameters{pair_modulus,pair_stiffness,pair_mu,dt,commit};
             forEachPair([&](size_t i,size_t j){
-                applyPair(i,j,evaluateHertzSpherePair(pairSite<Real>(grains[i]),pairSite<Real>(grains[j]),pair_modulus));
+                applyPair(i,j,evaluateFrictionalSpherePair(pairSite<Real>(grains[i]),pairSite<Real>(grains[j]),
+                                                          pairs[i*n+j].state<Real>(),parameters));
             });
+        }
         if(commit){for(size_t k:active_pair_indices)if(!std::binary_search(next_active_pairs.begin(),next_active_pairs.end(),k))pairs[k].clear();active_pair_indices.swap(next_active_pairs);}
         auto wall=[&](size_t i,size_t id,const Vecd&normal,Real pen,const Vecd&velocity,bool lower,Real mu){
             auto&g=grains[i];auto&history=walls[6*i+id];if(pen<=0){if(commit)history.clear();return;}

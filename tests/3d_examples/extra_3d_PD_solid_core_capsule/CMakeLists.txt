@@ -103,10 +103,14 @@ target_compile_definitions(pd_snsni_capsule PRIVATE
 # Resolved NOSB-PD/solid-SPH capsule inside an explicit rigid-grain shear box.
 file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/pd_snsni_direct_shear.cpp DIRECT_SHEAR_MAIN_HASH)
 file(SHA256 ${PERI_SHARED}/peridynamics/rigid_grain_shear.h DIRECT_SHEAR_CONTACT_HASH)
+file(SHA256 ${PERI_SHARED}/peridynamics/pd_hertz_sphere_contact.h DIRECT_SHEAR_HERTZ_HASH)
+file(SHA256 ${PERI_SHARED}/../peri_execution/pd_hertz_sphere_contact_cuda.cu DIRECT_SHEAR_CUDA_HASH)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     ${CMAKE_CURRENT_SOURCE_DIR}/pd_snsni_direct_shear.cpp
-    ${PERI_SHARED}/peridynamics/rigid_grain_shear.h)
-string(SHA256 DIRECT_SHEAR_HASH "${ASSEMBLY_HASH};${DIRECT_SHEAR_MAIN_HASH};${DIRECT_SHEAR_CONTACT_HASH}")
+    ${PERI_SHARED}/peridynamics/rigid_grain_shear.h
+    ${PERI_SHARED}/peridynamics/pd_hertz_sphere_contact.h
+    ${PERI_SHARED}/../peri_execution/pd_hertz_sphere_contact_cuda.cu)
+string(SHA256 DIRECT_SHEAR_HASH "${ASSEMBLY_HASH};${DIRECT_SHEAR_MAIN_HASH};${DIRECT_SHEAR_CONTACT_HASH};${DIRECT_SHEAR_HERTZ_HASH};${DIRECT_SHEAR_CUDA_HASH}")
 add_executable(pd_snsni_direct_shear pd_snsni_direct_shear.cpp)
 target_link_libraries(pd_snsni_direct_shear sphinxsys_3d SPHinXsys::peri_execution)
 target_compile_features(pd_snsni_direct_shear PRIVATE cxx_std_17)

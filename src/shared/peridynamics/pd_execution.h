@@ -10,6 +10,7 @@
 #include "pd_fluid_traction_batch.h"
 #include "pd_fluid_viscosity_batch.h"
 #include "pd_gel_batch.h"
+#include "pd_hertz_sphere_contact.h"
 #include "pd_nosb_bond_batch.h"
 #include "pd_nosb_elastic_batch.h"
 #include "pd_nosb_plastic_batch.h"
@@ -52,6 +53,7 @@ class PeriExecution
     std::unique_ptr<CrackStrengthBatch> makeCrackStrength() const;
     std::unique_ptr<BondedInterfaceBatch> makeBondedInterface() const;
     std::unique_ptr<SurfacePlaneContactBatch> makeSurfacePlaneContact() const;
+    std::unique_ptr<HertzSpherePairBatch> makeHertzSpherePairs() const;
     std::unique_ptr<SpatialDerivativeBatch> makeSpatialDerivatives() const;
     std::unique_ptr<FiniteVolumeBiotBatch> makeFiniteVolumeBiot() const;
     std::unique_ptr<dpc::PointBatch> makeDpcPoints(const dpc::Model &model) const;

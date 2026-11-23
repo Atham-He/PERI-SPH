@@ -19,6 +19,7 @@ if(PERI_SPH_ENABLE_CUDA)
         pd_nosb_bond_cuda.cu
         pd_nosb_elastic_cuda.cu
         pd_finite_volume_biot_cuda.cu
+        pd_hertz_sphere_contact_cuda.cu
         pd_gel_cuda.cu
         pd_fluid_traction_cuda.cu
         pd_fluid_acoustic_cuda.cu

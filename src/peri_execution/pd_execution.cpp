@@ -90,6 +90,15 @@ std::unique_ptr<SurfacePlaneContactBatch> PeriExecution::makeSurfacePlaneContact
     return nullptr;
 }
 
+std::unique_ptr<HertzSpherePairBatch> PeriExecution::makeHertzSpherePairs() const
+{
+#if defined(PERI_SPH_HAS_CUDA)
+    if (mode_ == PeriExecutionMode::GPU)
+        return makeCudaHertzSpherePairs();
+#endif
+    return nullptr;
+}
+
 std::unique_ptr<SpatialDerivativeBatch> PeriExecution::makeSpatialDerivatives() const
 {
 #if defined(PERI_SPH_HAS_CUDA)

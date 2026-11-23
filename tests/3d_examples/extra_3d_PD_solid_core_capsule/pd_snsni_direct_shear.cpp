@@ -131,7 +131,7 @@ int runDirectShear(const HybridOptions&o,const std::string&cells,const std::stri
     Real Eref=o.constraint_E>0?o.constraint_E:o.core_E,Ktie=o.tie_factor*Eref/o.spacing,Kcontact=o.contact_factor*Eref/o.spacing;
     BondedSolidInterface tie(si,cs,areas,Ktie,R,execution.makeBondedInterface());
     StdVec<Real>outer_areas(outer_points.size(),4*Pi*R*R/outer_points.size());
-    RigidGrainShearBox world(so,outer_areas,Kcontact,sand,box,&cs,areas);
+    RigidGrainShearBox world(so,outer_areas,Kcontact,sand,box,&cs,areas,execution.makeHertzSpherePairs());
     const size_t released_preprocessing_bytes=cr.releasePreprocessingCache();
 #if defined(__GLIBC__)
     // Return the one-time construction buffers to the OS, outside time stepping.
@@ -180,6 +180,7 @@ int runDirectShear(const HybridOptions&o,const std::string&cells,const std::stri
       <<",\"core_internal_force_backend\":"<<std::quoted(cb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")
       <<",\"core_material_backend\":"<<std::quoted(cb.hasDeviceMaterial()?"cuda_fp64":"cpu_fp64")<<",\"trial_stress_gradient_backend\":"<<std::quoted(cb.hasDeviceMaterial()?"cuda_fp64":"cpu_fp64")<<",\"core_sampling_gradients_backend\":"<<std::quoted(cb.hasDeviceSamplingGradients()?"cuda_fp64":"cpu_fp64")<<",\"core_force_projection_backend\":"<<std::quoted(cb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")
       <<",\"solid_time_step_backend\":"<<std::quoted(time.hasDeviceTimeStep()?"cuda_fp64":"cpu_fp64")
+      <<",\"hertz_sphere_pair_backend\":"<<std::quoted(world.hasDeviceHertzPairs()?"cuda_fp64":"cpu_fp64")
       <<",\"bonded_interface_backend\":"<<std::quoted(execution.bondedInterfaceOnDevice()?"cuda_fp64":"cpu_fp64")
       <<",\"capsule_count\":1,\"capsule_mass_kg\":"<<capsule_mass<<",\"sand_mass_kg\":"<<grain_mass<<",\"capsule_mass_fraction\":"<<capsule_mass/(grain_mass+capsule_mass)<<",\"capsule_sand_mu\":0,\"initial_height_m\":"<<box.initial_height_m
       <<",\"initial_area_m2\":"<<box.length_x_m*box.length_y_m<<",\"normal_pressure_Pa\":"<<box.normal_pressure_Pa<<",\"normal_load_control\":\"massless_exact_piston_constant_nominal_force\",\"load_steps\":"<<box.normal_increments+box.shear_increments
@@ -206,7 +207,7 @@ int runDirectShear(const HybridOptions&o,const std::string&cells,const std::stri
         Vecd rotated=history.force(Vecd::UnitX(),Vecd::Zero(),0,10,1000,.5,0,true);
         Real rotation_error=std::abs(history.stored-before);
         bool pass=world.capsule_contacts>0&&error<1e-5&&std::abs(fn/expected-1)<1e-12&&friction_error<1e-12&&rotation_error<1e-12&&history.dissipated>=0&&world.normal_control_residual<1e-10&&std::max(world.force_mapping_residual,world.torque_mapping_residual)<1e-10;
-        std::ofstream gate(out/"preflight.json");gate<<std::setprecision(17)<<"{\"status\":\""<<(pass?"PASSED":"FAILED")<<"\",\"active_capsule_contact_quadrature_points\":"<<world.capsule_contacts<<",\"constraint_potential_gradient_relative_error\":"<<error<<",\"Hertz_relative_error\":"<<std::abs(fn/expected-1)<<",\"Coulomb_force_error_N\":"<<friction_error<<",\"contact_frame_rotation_energy_error_J\":"<<rotation_error<<",\"normal_control_residual\":"<<world.normal_control_residual<<",\"force_mapping_residual\":"<<world.force_mapping_residual<<",\"torque_mapping_residual\":"<<world.torque_mapping_residual<<",\"core_histories_advanced\":0,\"shell_damage_advanced\":false,\"shear_curve_generated\":false}\n";
+        std::ofstream gate(out/"preflight.json");gate<<std::setprecision(17)<<"{\"status\":\""<<(pass?"PASSED":"FAILED")<<"\",\"active_grain_contacts\":"<<world.grain_contacts<<",\"active_capsule_contact_quadrature_points\":"<<world.capsule_contacts<<",\"constraint_potential_gradient_relative_error\":"<<error<<",\"Hertz_relative_error\":"<<std::abs(fn/expected-1)<<",\"Coulomb_force_error_N\":"<<friction_error<<",\"contact_frame_rotation_energy_error_J\":"<<rotation_error<<",\"normal_control_residual\":"<<world.normal_control_residual<<",\"force_mapping_residual\":"<<world.force_mapping_residual<<",\"torque_mapping_residual\":"<<world.torque_mapping_residual<<",\"core_histories_advanced\":0,\"shell_damage_advanced\":false,\"shear_curve_generated\":false}\n";
         return pass?0:2;
     }
     size_t stage=1,checks=0;Real stage_time=0,elapsed=0;bool damage_saved=false,failure_saved=false,access_saved=false;

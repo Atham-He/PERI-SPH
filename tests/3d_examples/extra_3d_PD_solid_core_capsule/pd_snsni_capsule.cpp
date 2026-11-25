@@ -11,6 +11,7 @@
 #include "pd_extrinsic_crack_growth.h"
 #include "pd_fracture_topology_checkpoint.h"
 #include "plate_reaction_window.h"
+#include <chrono>
 #include <sstream>
 using namespace SPH::solid_dynamics;
 using namespace SPH::peridynamics;
@@ -24,6 +25,9 @@ uint64_t legacy_contact_layout=0;
 bool tighter_shell_step=false;
 Real reaction_settling_window_s=0;
 constexpr char reaction_settling_option[]="--reaction-settling-window-s=";
+constexpr char pilot_end_option[]="--pilot-end-time=";
+Real pilot_end_time=0;
+bool pilot_implicit=false,hybrid_loading=false;
 
 uint64_t physicalLayout(uint64_t version)
 {
@@ -196,7 +200,8 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells,const PeriExec
     auto compression=[&](Real t){Real a=column_hold?0:std::clamp((inner_hold?stage_time:t)/o.ramp_duration,Real(0),Real(1));return o.diameter*o.strain*(Real(stage-1)+.5*(1-std::cos(Pi*a)))/o.load_steps;};
     forceAt(time.displacement,time.velocity,0,false);Real U0=recoverable(),K0=time.kinetic();
     std::ofstream parameters(out/"parameters.json");parameters<<std::setprecision(17)<<"{\"core_backend\":\"SNSNI_RKPM_DPC_unchanged\",\"shell_backend\":\"layered_NOSB_PD_live_reconstruction\",\"shell_constitutive\":\"unchanged_finite_volume_Biot\",\"fracture_representation\":"<<std::quoted(fracture_contact_only?"strength_triggered_bond_deletion_contact_only":"strength_triggered_extrinsic_cohesive_true_bonds")<<",\"cohesive_integrator\":"<<std::quoted(fracture_contact_only?"disabled":"explicit_bulk_half_kicks_implicit_objective_surface_drift")<<",\"Gc_used_for_surface_softening\":"<<(fracture_contact_only?"false":"true")<<",\"mixed_mode_assumption\":"<<std::quoted(fracture_contact_only?"equal_strength":"equal_strength_and_Gc")<<",\"candidate_geometry\":\"through_thickness_radial_Voronoi_facets\",\"E_Pa\":"<<o.shell_E<<",\"nu\":"<<o.shell_nu<<",\"ft_Pa\":"<<o.fracture_stress<<",\"Gc_J_m2\":"<<o.fracture_energy<<",\"delta_f_m\":"<<growth.delta_f<<",\"core_particles\":"<<cn<<",\"shell_particles\":"<<sn<<",\"candidate_facets\":"<<bank.size()<<",\"shell_mass_kg\":"<<shell_mass<<",\"interface_K_Pa_per_m\":"<<Ktie<<",\"platen_and_crack_contact_K_Pa_per_m\":"<<Kcontact<<",\"execution_backend\":"<<std::quoted(execution.backendName())<<",\"crack_projection_backend\":"<<std::quoted(crack_projection?"cuda_fp64":"cpu_fp64")<<",\"crack_local_contact_backend\":"<<std::quoted(crack_projection&&crack_projection->assemblesLocalContact()?"cuda_fp64":"cpu_fp64")<<",\"crack_node_assembly_backend\":"<<std::quoted(crack_projection&&crack_projection->assemblesTracePullback()?"cuda_fp64":"cpu_fp64")<<",\"shell_derivatives_backend\":"<<std::quoted(sb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")<<",\"core_derivatives_backend\":"<<std::quoted(cb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")<<",\"shell_stress_force_backend\":"<<std::quoted(sb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")<<",\"shell_stabilization_backend\":"<<std::quoted(sb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")
-      <<",\"shell_material_backend\":"<<std::quoted(sb.hasDeviceMaterial()?"cuda_fp64":"cpu_fp64")<<",\"core_internal_force_backend\":"<<std::quoted(cb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")<<",\"core_material_backend\":"<<std::quoted(cb.hasDeviceMaterial()?"cuda_fp64":"cpu_fp64")<<",\"trial_stress_gradient_backend\":"<<std::quoted(cb.hasDeviceMaterial()?"cuda_fp64":"cpu_fp64")<<",\"core_sampling_gradients_backend\":"<<std::quoted(cb.hasDeviceSamplingGradients()?"cuda_fp64":"cpu_fp64")<<",\"core_force_projection_backend\":"<<std::quoted(cb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")<<",\"solid_time_step_backend\":"<<std::quoted(time.hasDeviceTimeStep()?"cuda_fp64":"cpu_fp64")<<",\"bonded_interface_backend\":"<<std::quoted(execution.bondedInterfaceOnDevice()?"cuda_fp64":"cpu_fp64")<<",\"core_parameters_changed\":false,\"source_hash\":"<<std::quoted(CAPSULE_SOURCE_SHA256)<<"}\n";parameters.close();
+      <<",\"shell_material_backend\":"<<std::quoted(sb.hasDeviceMaterial()?"cuda_fp64":"cpu_fp64")<<",\"core_internal_force_backend\":"<<std::quoted(cb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")<<",\"core_material_backend\":"<<std::quoted(cb.hasDeviceMaterial()?"cuda_fp64":"cpu_fp64")<<",\"trial_stress_gradient_backend\":"<<std::quoted(cb.hasDeviceMaterial()?"cuda_fp64":"cpu_fp64")<<",\"core_sampling_gradients_backend\":"<<std::quoted(cb.hasDeviceSamplingGradients()?"cuda_fp64":"cpu_fp64")<<",\"core_force_projection_backend\":"<<std::quoted(cb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")<<",\"solid_time_step_backend\":"<<std::quoted(time.hasDeviceTimeStep()?"cuda_fp64":"cpu_fp64")<<",\"bonded_interface_backend\":"<<std::quoted(execution.bondedInterfaceOnDevice()?"cuda_fp64":"cpu_fp64")<<",\"hybrid_loading\":"<<(hybrid_loading?"true":"false")
+      <<",\"core_parameters_changed\":false,\"source_hash\":"<<std::quoted(CAPSULE_SOURCE_SHA256)<<"}\n";parameters.close();
     if(o.preflight_only)
     {
         Field d(count), v(count);
@@ -652,19 +657,220 @@ std::vector<std::pair<Real,std::string>>frame_index;
     save();
     if(column_handoff_only||affine_contact_handoff_only||inner_interface_handoff_only)return 0;
 
+    if(pilot_end_time>0 && (recovery::checkpoint.resume.empty() || !fracture_contact_only ||
+                            column_hold || inner_hold || pilot_end_time<=elapsed ||
+                            pilot_end_time-elapsed>=o.ramp_duration-stage_time))
+        throw std::invalid_argument("Pilot requires a saved contact-only state and a short interval within one loading ramp");
+    const bool pilot_running=pilot_end_time>0;
+    const size_t pilot_start_step=time.steps, pilot_start_evaluations=cb.evaluations;
+    size_t pilot_large_steps=0;
+    bool large_steps_enabled=pilot_implicit;
+    Real pilot_last_dt=0;
+    Real quiet_since=elapsed, previous_strength_time=elapsed;
+    const char* pilot_fallback=nullptr;
+    const char* pilot_integrator="restart";
+    size_t pilot_switches=0,pilot_resumptions=0,pilot_rejected_resumptions=0;
+    std::vector<Real> old_strength, trial_strength, previous_strength;
+    std::ofstream strength_trace, switch_trace;
+    if(pilot_running||hybrid_loading){
+        switch_trace.open(out/"implicit_switch.csv");
+        switch_trace<<std::setprecision(17)<<"action,reason,step,elapsed_s,strain,compression_m,candidate,step_start_ratio,trial_ratio,projected_ratio,trial_end_s\n";
+        if(!switch_trace)throw std::runtime_error("Cannot open implicit switch diagnostics");
+    }
+    if(pilot_running){
+        strength_trace.open(out/"stepwise_fracture.csv");
+        strength_trace<<std::setprecision(17)<<"step,elapsed_s,strain,compression_m,last_dt_s,integrator,eligible_facets,max_candidate,max_ratio,crack_facets,broken_bond_pairs,upper_N,lower_N,max_crack_gap_m,new_patch_gap_m\n";
+        if(!strength_trace)throw std::runtime_error("Cannot open fracture benchmark diagnostics");
+    }
+    const auto pilot_start=std::chrono::steady_clock::now();
+    auto recordSwitch=[&](const char*action,const char*reason,size_t candidate,Real ratio,Real trial,Real predicted,Real dt){
+        const Real u=compression(stage_time);
+        switch_trace<<action<<','<<reason<<','<<time.steps<<','<<elapsed<<','<<u/o.diameter<<','<<u<<',';
+        if(candidate<bank.size())switch_trace<<bank[candidate].id;
+        switch_trace<<','<<ratio<<','<<trial<<','<<predicted<<','<<elapsed+dt<<'\n';
+        switch_trace.flush();
+        if(pilot_running)std::cout<<std::setprecision(17)<<"PILOT_SWITCH "<<action<<' '<<reason<<" step="<<time.steps
+                 <<" strain="<<u/o.diameter<<" strength_ratio="<<ratio<<std::endl;
+    };
+    auto resumeCandidate=[&](Real duration){
+        // Hu et al. (2025), Sec. 4, resume after a quiet interval without
+        // new failure. Use one proposed large step as the quiet interval.
+        // Reuse the local strength projection as a cheap precheck, then
+        // confirm it with a fully solved trial before accepting a large step.
+        const Real sample_dt=elapsed-previous_strength_time;
+        if(elapsed-quiet_since<duration || sample_dt<=0 || previous_strength.empty())
+            return false;
+        for(size_t k=0;k<bank.size();++k){
+            if(growth.active[k])continue;
+            const Real increment=old_strength[k]-previous_strength[k];
+            if(old_strength[k]+std::max(Real(0),increment)*2*duration/sample_dt>=1)
+                return false;
+        }
+        return true;
+    };
+
+    auto platenSides=[&](){
+        StdVec<int> sides(contact.force.size(),0);
+        for(size_t i=0;i<sides.size();++i)
+            sides[i]=(contact.force[i][2]>0)-(contact.force[i][2]<0);
+        return sides;
+    };
+    auto tryImplicit=[&](Real dt, Real old_u, Field&next_d, Field&half_velocity, Real&factor, Real&dampedK){
+        constexpr size_t max_iterations=8;
+        // This pilot solves the damped, average-acceleration Newmark step
+        // with fixed-point iteration. The production path still uses Verlet.
+        const auto platen_sides=platenSides();
+        const auto crack_pairs=growth.contact_network ?
+            growth.contact_network->activePairs() : std::vector<std::array<size_t,3>>{};
+        factor=std::exp(-.5*o.damping_rate*dt);
+        dampedK=time.predictForceStep(dt,factor,bulk_force,next_d,half_velocity);
+        const Field old_force=bulk_force;
+        Field update=next_d;
+        const Real trial_u=compression(stage_time+dt);
+        const Real missing=std::numeric_limits<Real>::quiet_NaN();
+        const char* reason="iteration_limit";
+        size_t candidate=bank.size();
+        Real step_start_ratio=missing, trial_ratio=missing, projected_ratio=missing;
+        for(size_t iteration=0;iteration<max_iterations;++iteration){
+            setPositions(next_d,half_velocity);
+            try{
+                cb.evaluate(Field(next_d.begin(),next_d.begin()+cn),o.core_rho,o.cfl);
+                assembleShellAndConstraints(trial_u);
+            }catch(const std::runtime_error&){
+                reason="trial_state_rejected";
+                break;
+            }
+            Real error_squared=0,increment_squared=0;
+            for(size_t j=0;j<count;++j){
+                update[j]=time.displacement[j]+dt*(half_velocity[j]+.25*dt*((bulk_force[j]-old_force[j])/mass[j]));
+                error_squared+=(update[j]-next_d[j]).squaredNorm();
+                increment_squared+=(next_d[j]-time.displacement[j]).squaredNorm();
+            }
+            constexpr Real relative_tolerance=1e-4;
+            const Real absolute_tolerance=32*std::numeric_limits<Real>::epsilon()*o.diameter;
+            if(error_squared<=relative_tolerance*relative_tolerance*increment_squared+
+                              count*absolute_tolerance*absolute_tolerance){
+                if(platen_sides!=platenSides() ||
+                   (growth.contact_network && crack_pairs!=growth.contact_network->activePairs())){
+                    reason="contact_changed";
+                    break;
+                }
+
+                const auto scan=growth.scanStrength(&trial_strength);
+                // Willberg & Hesse (2026), Eqs. 43-44, use an early switch
+                // based on the most critical local failure index. They can
+                // scale the total load in their linear static problem.
+                // For this nonlinear ramp, reserve one more load increment
+                // using each facet's secant, with no change to its failure law.
+                // This estimate does not bound an unresolved peak in a step.
+                for(size_t k=0;k<bank.size();++k){
+                    if(growth.active[k])continue;
+                    const Real projected=trial_strength[k]+std::max(Real(0),trial_strength[k]-old_strength[k]);
+                    if(candidate==bank.size()||projected>=projected_ratio){
+                        candidate=k;
+                        projected_ratio=projected;
+                    }
+                }
+                if(candidate==bank.size()||projected_ratio<1){
+                    cb.commit();
+                    return true;
+                }
+                step_start_ratio=old_strength[candidate];
+                trial_ratio=trial_strength[candidate];
+                reason=scan.ratio>=1?"trial_reached_strength":"approaching_strength";
+                break;
+            }
+            cb.discard();
+            next_d.swap(update);
+        }
+        if(cb.pending_commit)cb.discard();
+        forceAt(time.displacement,time.velocity,old_u,false);
+        if(large_steps_enabled){
+            recordSwitch("explicit",reason,candidate,step_start_ratio,trial_ratio,projected_ratio,dt);
+            ++pilot_switches;
+            pilot_fallback=reason;
+        }else{
+            recordSwitch("resume_rejected",reason,candidate,step_start_ratio,trial_ratio,projected_ratio,dt);
+            ++pilot_rejected_resumptions;
+        }
+        large_steps_enabled=false;
+        quiet_since=elapsed;
+        return false;
+    };
+
+    const auto initial_pilot_activity=pilot_running?growth.active:std::vector<unsigned char>{};
     while(stage<=o.load_steps){size_t prior_stage=stage,prior_cracks=growth.insertion_events;
-        if(time.steps%50==0){for(size_t event=0;event<bank.size();++event){size_t k=growth.select();if(k==bank.size())break;
+        const Real ramp_remaining=o.ramp_duration-stage_time;
+        const bool hybrid_ramp=hybrid_loading&&!column_hold&&!inner_hold&&ramp_remaining>0;
+        const bool try_large_steps=pilot_implicit||hybrid_ramp;
+        const bool scan_every_step=pilot_running||hybrid_ramp;
+        ExtrinsicCrackGrowth::StrengthScan pilot_scan{bank.size(),0,0};
+        if(scan_every_step)
+            pilot_scan=growth.scanStrength(try_large_steps?&old_strength:nullptr);
+        const auto initial_scan=pilot_scan;
+        // Include the first fixed-displacement state, even if the final
+        // loading step ended outside the legacy periodic fracture scan.
+        const bool just_entered_hold=hybrid_loading&&ramp_remaining==0;
+        if(scan_every_step||just_entered_hold||time.steps%50==0){for(size_t event=0;event<bank.size();++event){
+            const size_t k=scan_every_step?pilot_scan.exceeded(bank.size()):growth.select();
+            if(k==bank.size())break;
+            if(large_steps_enabled){
+                recordSwitch("explicit","accepted_state_reached_strength",k,pilot_scan.ratio,pilot_scan.ratio,pilot_scan.ratio,0);
+                ++pilot_switches;
+                pilot_fallback="accepted_state_reached_strength";
+                large_steps_enabled=false;
+            }
             surface_transfer_prepared=false;
             Real ratio=growth.strengthRatio(k);size_t prior_core_commits=cb.commits;bool inserted=growth.insert(k,false,refresh,eventEnergy,prepareTransfer,rollbackTransfer);if(cb.commits!=prior_core_commits)throw std::runtime_error("Topology event advanced frozen core material history");
             if(!inserted&&!growth.last_candidate_unresolved){snapshot("stopped_before_rejected_crack",compression(stage_time));save();throw std::runtime_error("Capsule physical insertion rejected: "+growth.last_rejection);}
             if(inserted){onset=true;cohesive_force=growth.cohesiveForces(growth.positions());events<<(fracture_contact_only?"strength_triggered_bond_deletion":"new_cohesive_crack")<<','<<time.steps<<','<<stage<<','<<compression(stage_time)/o.diameter<<','<<bank[k].id<<','<<ratio<<','<<sr.physical_broken_bonds<<','<<growth.max_gap<<'\n';events.flush();
                 surface_audit<<time.steps<<','<<stage<<','<<compression(stage_time)/o.diameter<<','<<bank[k].id<<','<<(si?si->reassignedPoints():0)<<','<<so.reassignedPoints()<<','<<std::max(si?si->affine_error:Real(0),so.affine_error)<<','<<std::max(si?si->polynomial_error:Real(0),so.polynomial_error)<<','<<std::max(si?si->maximum_weight_l1:Real(0),so.maximum_weight_l1)<<','<<growth.last_insertion.fraction<<','<<core_dt<<','<<sb.finiteStrainTimeStep()<<','<<sb.stabilizer_dt<<','<<tie->stable_dt<<','<<contact.stable_dt<<','<<growth.contact_dt<<','<<so.position_fallback_points<<','<<so.extended_position_fallback_points<<'\n';surface_audit.flush();}
             else{events<<"unresolved_geometric_facet_no_material_cut"<<','<<time.steps<<','<<stage<<','<<compression(stage_time)/o.diameter<<','<<bank[k].id<<','<<ratio<<','<<sr.physical_broken_bonds<<','<<growth.max_gap<<'\n';events.flush();}
+            if(scan_every_step){
+                quiet_since=elapsed;
+                pilot_scan=growth.scanStrength(try_large_steps?&old_strength:nullptr);
+            }
         }}
         // A cascade changes topology at one fixed physical time. Preserve
         // every event in CSV and publish its final state once, avoiding many
         // redundant full-core/shell files at the same timestamp.
         if(growth.insertion_events!=prior_cracks)snapshot("crack_"+std::to_string(growth.insertion_events),compression(stage_time));
+        if(pilot_running){
+            const Real u=compression(stage_time);
+            growth.statistics(growth.positions());
+            Real new_patch_gap=0;
+            for(const auto&patch:growth.patches)
+                if(!initial_pilot_activity[patch.candidate])
+                    new_patch_gap=std::max(new_patch_gap,growth.maximumNormalOpening(patch));
+            strength_trace<<time.steps<<','<<elapsed<<','<<u/o.diameter<<','<<u<<','<<pilot_last_dt
+                          <<','<<pilot_integrator<<','<<initial_scan.eligible<<',';
+            if(initial_scan.candidate<bank.size())strength_trace<<bank[initial_scan.candidate].id;
+            strength_trace<<','<<initial_scan.ratio<<','<<growth.insertion_events<<','<<sr.physical_broken_bonds
+                          <<','<<contact.upper<<','<<contact.lower<<','<<growth.max_gap<<','<<new_patch_gap<<'\n';
+            if(pilot_end_time-elapsed<=8*std::numeric_limits<Real>::epsilon()*pilot_end_time){
+                strength_trace.flush();
+                const Real wall=std::chrono::duration<Real>(std::chrono::steady_clock::now()-pilot_start).count();
+                const Real budget=Wp+interface_switch_work-Wcore-(recoverable()-U0)
+                    -(growth.dissipated-growth.initial_dissipation)-(time.kinetic()-K0)-Wd-Walgorithmic
+                    -growth.stabilizer_transfer_loss+growth.insertion_defect;
+                std::ofstream report(out/"time_step_pilot.json");
+                report<<std::setprecision(17)<<"{"
+                      <<"\"start_step\":"<<pilot_start_step<<",\"end_step\":"<<time.steps
+                      <<",\"large_steps\":"<<pilot_large_steps<<",\"fallback\":"<<std::quoted(pilot_fallback?pilot_fallback:"none")
+                      <<",\"switches_to_explicit\":"<<pilot_switches<<",\"resumptions\":"<<pilot_resumptions
+                      <<",\"rejected_resumptions\":"<<pilot_rejected_resumptions
+                      <<",\"force_evaluations\":"<<cb.evaluations-pilot_start_evaluations<<",\"wall_s\":"<<wall
+                      <<",\"elapsed_s\":"<<elapsed<<",\"strain\":"<<u/o.diameter
+                      <<",\"upper_N\":"<<contact.upper<<",\"lower_N\":"<<contact.lower
+                      <<",\"max_crack_gap_m\":"<<growth.max_gap<<",\"new_patch_gap_m\":"<<new_patch_gap
+                      <<",\"crack_facets\":"<<growth.insertion_events<<",\"broken_bond_pairs\":"<<sr.physical_broken_bonds
+                      <<",\"mechanical_budget_J\":"<<budget<<",\"core_commits\":"<<cb.commits
+                      <<",\"last_dt_s\":"<<pilot_last_dt<<"}\n";
+                if(!report||!strength_trace||!switch_trace)
+                    throw std::runtime_error("Could not write the fracture benchmark report");
+                return 0;
+            }
+        }
         const Real shell_dt=sb.finiteStrainTimeStep();
         auto allowedStep=[&](Real platen_dt){
             Real rate=1/(core_dt*core_dt)+1/(shell_dt*shell_dt)+1/(sb.stabilizer_dt*sb.stabilizer_dt)
@@ -675,14 +881,39 @@ std::vector<std::pair<Real,std::string>>frame_index;
         };
         const Real all_rows_dt=allowedStep(contact.stable_dt),old_u=compression(stage_time);
         Real dt=local_platen_step_bound?allowedStep(boundRows(nullptr,old_u)):all_rows_dt;
+        const Real pilot_remaining=pilot_end_time-elapsed;
+        if(pilot_end_time>0)dt=std::min(dt,pilot_remaining);
 
         Field old_d=time.displacement,old_internal=internal,old_shell,vhalf,qfree,next_d;
         if(!fracture_contact_only){old_shell.assign(sx,sx+sn);qfree.resize(sn);}
         const Real oldReaction=.5*(contact.upper+contact.lower),oldK=time.kinetic(),psiold=growth.stored;
         Real dampedK=0,factor=1;
         CohesiveSurfaceEvolution::Result cohesive;
-        for(size_t retry=0;;++retry){
-            if(!std::isfinite(dt)||dt<1e-15||time.steps>=o.max_steps)
+        bool used_large_step=false;
+        const Real proposed_large_dt=std::min(8*dt,hybrid_ramp?ramp_remaining:pilot_remaining);
+        if(try_large_steps&&time.steps<o.max_steps&&dt>=1e-15&&proposed_large_dt>1.5*dt&&
+           (large_steps_enabled||resumeCandidate(proposed_large_dt))){
+            const bool resuming=!large_steps_enabled;
+            used_large_step=tryImplicit(proposed_large_dt,old_u,next_d,vhalf,factor,dampedK);
+            if(used_large_step){
+                dt=proposed_large_dt;
+                ++pilot_large_steps;
+                if(resuming){
+                    const auto candidate=pilot_scan.candidate;
+                    recordSwitch("implicit","quiet_interval",candidate,pilot_scan.ratio,
+                                 candidate<bank.size()?trial_strength[candidate]:0,0,dt);
+                    ++pilot_resumptions;
+                    large_steps_enabled=true;
+                }
+            }
+        }
+        if(try_large_steps){
+            previous_strength_time=elapsed;
+            previous_strength.swap(old_strength);
+        }
+        if(!used_large_step)for(size_t retry=0;;++retry){
+            const bool landing_on_hold=hybrid_ramp&&dt>0&&dt==ramp_remaining;
+            if(!std::isfinite(dt)||(dt<1e-15&&!landing_on_hold)||time.steps>=o.max_steps)
                 throw std::runtime_error("Coupled physical time/count bound exhausted");
             factor=std::exp(-.5*o.damping_rate*dt);
             dampedK=time.predictForceStep(dt,factor,bulk_force,next_d,vhalf);
@@ -710,9 +941,26 @@ std::vector<std::pair<Real,std::string>>frame_index;
             Real velocity_defect=0,surface_work=0;for(size_t j=0;j<sn;++j){next_d[cn+j]=cohesive.positions[j]-sX[j];Vecd after=vhalf[cn+j]+dt*cohesive.force[j]/sm[j];velocity_defect+=.5*sm[j]*(after-vhalf[cn+j]).squaredNorm();surface_work-=cohesive.force[j].dot(cohesive.positions[j]-old_shell[j]);vhalf[cn+j]=after;}
             Walgorithmic+=velocity_defect+surface_work-(cohesive.stored-psiold)-cohesive.dissipation_increment;
         }
-        time.displacement=next_d;forceAt(time.displacement,vhalf,compression(stage_time+dt),true);
+        time.displacement=next_d;
+        if(!used_large_step)forceAt(time.displacement,vhalf,compression(stage_time+dt),true);
         const Real undampedK=time.finishForceStep(dt,factor,vhalf,bulk_force,cohesive_force,cn);
         Wd+=undampedK-time.kinetic();++time.steps;setPositions(time.displacement,time.velocity);Real u=compression(stage_time+dt),mean=.5*(contact.upper+contact.lower);Wp+=.5*(oldReaction+mean)*(u-old_u);for(size_t j=0;j<cn;++j)Wcore+=.5*(old_internal[j]+internal[j]).dot(time.displacement[j]-old_d[j]);if(inner_hold)inner_hold_elapsed+=dt;else stage_time+=dt;elapsed+=dt;
+        if(hybrid_ramp && dt==ramp_remaining){
+            stage_time=o.ramp_duration;
+            if(large_steps_enabled)
+                recordSwitch("explicit","fixed_displacement",bank.size(),0,0,0,0);
+            large_steps_enabled=false;
+            previous_strength.clear();
+            quiet_since=elapsed;
+            std::cout<<std::setprecision(17)<<"HYBRID_HOLD_STARTED stage="<<stage<<" step="<<time.steps
+                     <<" elapsed_s="<<elapsed<<" strain="<<u/o.diameter
+                     <<" large_steps="<<pilot_large_steps<<" upper_N="<<contact.upper
+                     <<" lower_N="<<contact.lower<<std::endl;
+        }
+        if(pilot_running){
+            pilot_last_dt=dt;
+            pilot_integrator=used_large_step?"implicit":"explicit";
+        }
         if(!fracture_contact_only||time.steps%200==0||(!fully_failed&&onset))growth.statistics(growth.positions());
         if(!fully_failed&&growth.failed_quadrature){fully_failed=true;events<<(fracture_contact_only?"first_contact_only_crack":"first_full_cohesive_failure")<<','<<time.steps<<','<<stage<<','<<u/o.diameter<<",0,0,"<<sr.physical_broken_bonds<<','<<growth.max_gap<<'\n';events.flush();snapshot("first_full_failure",u);}
         if(time.steps%200==0){Real residual=0,minc=1,mins=1,newK=time.kinetic();for(size_t j=0;j<count;++j){Vecd f=bulk_force[j];if(j>=cn)f+=cohesive_force[j-cn];residual+=f.squaredNorm();}residual=std::sqrt(residual)/std::max(mean,Real(1e-20));for(const auto&F:cb.F)minc=std::min(minc,F.determinant());for(size_t j=0;j<sn;++j)mins=std::min(mins,sF[j].determinant());Real imbalance=std::abs(contact.upper-contact.lower)/std::max(mean,Real(1e-20)),kr=newK/std::max(mean*u,Real(1e-30));Real budget=Wp+interface_switch_work-Wcore-(recoverable()-U0)-(growth.dissipated-growth.initial_dissipation)-(newK-K0)-Wd-Walgorithmic-growth.stabilizer_transfer_loss+growth.insertion_defect;
@@ -751,6 +999,15 @@ std::vector<std::pair<Real,std::string>>frame_index;
                         std::cout<<"REACTION_PLATEAU stage="<<stage<<" window_s="<<reaction_settling_window_s
                                  <<" reaction_span="<<reaction_span<<std::endl;
                     reaction_window.clear();
+                    if(hybrid_loading){
+                        large_steps_enabled=false;
+                        previous_strength.clear();
+                        quiet_since=elapsed;
+                        std::cout<<std::setprecision(17)<<"HYBRID_STAGE_COMPLETED stage="<<stage
+                                 <<" step="<<time.steps<<" elapsed_s="<<elapsed
+                                 <<" large_steps="<<pilot_large_steps
+                                 <<" reaction_span="<<reaction_span<<std::endl;
+                    }
                     ++stage;stage_time=0;checks=0;
                 }
             }
@@ -771,6 +1028,15 @@ int main(int argc,char**argv)
             if(parsed!=value.size()||!std::isfinite(reaction_settling_window_s)||reaction_settling_window_s<=0)
                 throw std::invalid_argument("Reaction settling window must be finite and positive");
         }
+        else if(a.rfind(pilot_end_option,0)==0){
+            const std::string value=a.substr(sizeof(pilot_end_option)-1);
+            size_t parsed=0;
+            pilot_end_time=std::stod(value,&parsed);
+            if(parsed!=value.size()||!std::isfinite(pilot_end_time)||pilot_end_time<=0)
+                throw std::invalid_argument("Pilot end time must be finite and positive");
+        }
+        else if(a=="--pilot-implicit")pilot_implicit=true;
+        else if(a=="--hybrid-loading")hybrid_loading=true;
         else if(a=="--fracture-contact-only")fracture_contact_only=true;else if(a=="--affine-crack-contact")affine_crack_contact=true;else if(a=="--affine-contact-handoff-only")affine_contact_handoff_only=true;else if(a=="--affine-inner-interface")affine_inner_interface=true;else if(a=="--inner-interface-handoff-only")inner_interface_handoff_only=true;else if(a=="--cuda-crack-projection")legacy.crack_projection=true;else if(a=="--cuda-bonded-interface")legacy.bonded_interface=true;else if(recovery::checkpoint.take(a)){}else args.push_back(argv[i]);}
         if(use_column_interface){recovery::checkpoint.schema_version=5;recovery::checkpoint.compatible_read_version=4;}
         if(fracture_contact_only){
@@ -800,6 +1066,11 @@ int main(int argc,char**argv)
             throw std::invalid_argument("Affine contact handoff audit requires a saved state and --affine-crack-contact");
         if(column_handoff_only&&(!use_column_interface||recovery::checkpoint.resume.empty()))
             throw std::invalid_argument("Column handoff audit requires the fixed-column interface and an accepted checkpoint");
+        if(pilot_implicit&&pilot_end_time<=0)
+            throw std::invalid_argument("The implicit pilot requires --pilot-end-time");
+        if(hybrid_loading&&(pilot_end_time>0||!fracture_contact_only||reaction_settling_window_s<=0||
+           use_column_interface||!affine_inner_interface))
+            throw std::invalid_argument("Hybrid loading requires the affine contact-only capsule and its plate reaction window");
         if(cells.empty())throw std::invalid_argument("--snsni-cells is required");HybridOptions options;options.parseHybrid(int(args.size()),args.data());
         if(local_platen_step_bound&&options.plate_friction!=0)
             throw std::invalid_argument("Local platen step bound requires frictionless analytic planes");

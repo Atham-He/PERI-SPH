@@ -91,6 +91,8 @@ def run(a):
     previous_execution=previous['identity'].get('execution','cpu') if previous else 'cpu'
     execution=a.execution or previous_execution
     old_identity=previous['identity'] if previous else {}
+    hybrid_loading=a.hybrid_loading or old_identity.get('time_integration')=='implicit_ramp_explicit_hold'
+    hybrid_qualification=a.hybrid_qualification or (previous.get('hybrid_qualification') if previous else None)
     spectral_mode='mass_normalized_gradient_gram'
     tighter_shell_step=a.tighter_shell_step_bound or old_identity.get('shell_step_bound')==spectral_mode
     reaction_window=a.reaction_settling_window_s
@@ -166,7 +168,25 @@ def run(a):
         if settling_option not in preflight_args:
             raise RuntimeError('The plate-reaction criterion requires a matching coupled preflight')
         identity['reaction_settling_window_s']=reaction_window
-    if previous and execution!=previous_execution:
+    if hybrid_loading:
+        if (not hybrid_qualification or not (a.fracture_contact_only and a.affine_inner_interface)
+                or reaction_window is None or '--hybrid-loading' not in preflight_args):
+            raise RuntimeError('Hybrid loading requires its matched preflight and verified load/hold/restart qualification')
+        hybrid_qualification=str(Path(hybrid_qualification).resolve())
+        qualification=json.loads(Path(hybrid_qualification).read_text())
+        if (qualification.get('status')!='PASSED'
+                or qualification.get('integration_policy')!='implicit_ramp_explicit_hold'
+                or qualification.get('reaction_window_s')!=reaction_window
+                or qualification.get('reload_receipt',{}).get('status')!='PASSED'):
+            raise RuntimeError('Hybrid loading and checkpoint qualification do not match')
+        for key in ('binary_sha256','config_sha256','DPC_table_sha256','core_cache_sha256','crack_bank_sha256'):
+            if qualification.get(key)!=identity[key]:
+                raise RuntimeError('Hybrid qualification identity mismatch: '+key)
+        identity['time_integration']='implicit_ramp_explicit_hold'
+    elif hybrid_qualification:
+        raise RuntimeError('A hybrid qualification requires --hybrid-loading')
+    integration_handoff=previous and identity.get('time_integration')!=old_identity.get('time_integration')
+    if previous and (execution!=previous_execution or integration_handoff):
         for option in ('shell_step_bound','reaction_settling_window_s'):
             if identity.get(option)!=old_identity.get(option):
                 raise RuntimeError('A backend handoff must keep the time-step and reaction acceptance settings')
@@ -209,8 +229,8 @@ def run(a):
             entries=[entry for entry in inherited if Path(entry['output']).resolve()==checkpoint.parent]
             if len(entries)!=1 or entries[0] is not inherited[-1]:raise RuntimeError('Accepted checkpoint must belong to the last original segment')
             entries[0]['trajectory_end_s']=latest['elapsed_s']
-        elif execution!=previous_execution:
-            # A live backend handoff may leave later samples in the origin.
+        elif execution!=previous_execution or integration_handoff:
+            # A live solver handoff can leave later samples in the origin.
             # Join the trajectory at the common committed checkpoint.
             with (checkpoint.parent/'progress.csv').open(newline='') as stream:
                 saved=next((sample for sample in csv.DictReader(stream)
@@ -219,8 +239,12 @@ def run(a):
                 inherited[-1]['trajectory_end_s']=float(saved['elapsed_s'])
         receipt={'recorded_UTC':utc(),'status':'INPUTS_VERIFIED_NATIVE_STATE_CHECK_PENDING','origin_manifest':str(origin),'origin_manifest_sha256':sha(origin),'origin_source_commit':previous['identity']['source_commit'],'source_commit':identity['source_commit'],'checkpoint':str(checkpoint),'checkpoint_sha256':sha(checkpoint),'checkpoint_step':latest['step'],'history_fingerprint':fingerprint,'execution_fingerprint':execution_fingerprint,'frozen_inputs_unchanged':True,'checkpoint_bytes_modified':False,'loading_history_reset':False,'native_force_and_checksum_verification_required':True}
         receipt.update(origin_execution=previous_execution,execution=execution)
+        if hybrid_loading:
+            receipt.update(time_integration=identity['time_integration'])
         put(root/'resume_compatibility.json',receipt)
     manifest={'created_UTC':utc(),'source':str(source),'binary':str(binary),'input_config':str(cfg),'identity':identity,'fingerprint':fingerprint,'execution_fingerprint':execution_fingerprint,'owner':owner,'same_history_checkpoint_handoff':True,'material_parameters_changed':False,'capsule_kinematics':'NOSB_PD_shell_plus_SNSNI_solid_SPH_core','benchmark_root':str(Path(a.benchmark_root).resolve()),'preflight':str(Path(a.preflight).resolve()),'segments':list(inherited)}
+    if hybrid_loading:
+        manifest['hybrid_qualification']=hybrid_qualification
     if (root/'production_manifest.json').exists():raise RuntimeError('Output root already has a production manifest')
     put(root/'production_manifest.json',manifest)
     sequence=[len(inherited)] if checkpoint else range(2)
@@ -236,6 +260,7 @@ def run(a):
         if a.local_platen_step_bound:cmd.append('--local-platen-step-bound')
         if tighter_shell_step:cmd.append('--tighter-shell-step-bound')
         if settling_option:cmd.append(settling_option)
+        if hybrid_loading:cmd.append('--hybrid-loading')
         if a.checkpoint_wall_seconds is not None:cmd.append('--checkpoint-wall-seconds='+str(a.checkpoint_wall_seconds))
         if checkpoint is None:cmd.append('--checkpoint-stop-after-equilibrium')
         else:cmd.append('--resume-state='+str(checkpoint))
@@ -296,6 +321,9 @@ if __name__=='__main__':
                    help='use the mass-normalized bound on the active shell gradient')
     p.add_argument('--reaction-settling-window-s',type=float,
                    help='accept a held load using the platen reaction stability window')
+    p.add_argument('--hybrid-loading',action='store_true',
+                   help='use implicit large steps on loading ramps and explicit steps for held loads')
+    p.add_argument('--hybrid-qualification',help='verified load/hold/restart report for this solver and its inputs')
     p.add_argument('--execution',choices=('cpu','gpu'),
                    help='solver backend (default: original backend on continuation, CPU for a new run)')
     a=p.parse_args()

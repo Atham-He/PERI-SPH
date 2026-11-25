@@ -177,7 +177,15 @@ class ExtrinsicCrackGrowth {
         return maximum;
     }
 
-    size_t select() const
+    struct StrengthScan
+    {
+        size_t candidate, eligible;
+        Real ratio;
+
+        size_t exceeded(size_t no_candidate) const { return ratio>=1 ? candidate : no_candidate; }
+    };
+
+    StrengthScan scanStrength(std::vector<Real>*ratios=nullptr) const
     {
         if (strength_backend_)
         {
@@ -188,8 +196,9 @@ class ExtrinsicCrackGrowth {
                 throw std::logic_error("Crack strength backend returned an incomplete batch");
         }
 
-        size_t best = candidates.size();
-        Real maximum = 1;
+        StrengthScan scan{candidates.size(),0,0};
+        if(ratios)
+            ratios->assign(candidates.size(),0);
         for (size_t k = 0; k < candidates.size(); ++k)
         {
             if (active[k])
@@ -197,14 +206,20 @@ class ExtrinsicCrackGrowth {
             if (strength_backend_ && !strength_results_[k].valid)
                 throw std::runtime_error("Invalid current crack initiation normal");
             const Real ratio = strength_backend_ ? Real(strength_results_[k].ratio) : strengthRatio(k);
-            if (ratio >= maximum)
-            {
-                maximum = ratio;
-                best = k;
+            if(!std::isfinite(ratio))
+                throw std::runtime_error("Nonfinite crack strength ratio");
+            ++scan.eligible;
+            if(ratios)
+                (*ratios)[k]=ratio;
+            if(ratio>=scan.ratio){
+                scan.ratio=ratio;
+                scan.candidate=k;
             }
         }
-        return best;
+        return scan;
     }
+
+    size_t select() const { return scanStrength().exceeded(candidates.size()); }
     Patch makePatch(size_t k,const StdVec<Vecd>&minus_values={},const StdVec<Vecd>&plus_values={},
                     const StdVec<Vecd>&minus_velocity={},const StdVec<Vecd>&plus_velocity={},
                     std::shared_ptr<const FractureIntegrationPatch> integration={}){

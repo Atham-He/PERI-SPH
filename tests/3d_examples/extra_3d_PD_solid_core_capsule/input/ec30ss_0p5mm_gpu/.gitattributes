@@ -1,0 +1,5 @@
+mechanics.cfg -text
+material.csv -text
+crack_bank.txt -text
+reference_cells_h25.bin binary
+SHA256SUMS text eol=lf

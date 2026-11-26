@@ -194,7 +194,7 @@ __device__ void sumParticleTraceContributions(const ParticleTraceContribution *e
     }
 }
 
-template <class Point>
+template <bool append, class Point>
 __global__ void accumulateNodalForce(const std::size_t *__restrict__ offsets,
                                      const ParticleTraceContribution *__restrict__ entries,
                                      const Point *__restrict__ points, std::size_t count,
@@ -210,8 +210,9 @@ __global__ void accumulateNodalForce(const std::size_t *__restrict__ offsets,
     const auto begin = offsets[node], end = offsets[node + 1];
     if (begin == end)
     {
-        if (lane == 0)
-            increments[node] = {};
+        if constexpr (!append)
+            if (lane == 0)
+                increments[node] = {};
         return;
     }
 
@@ -232,7 +233,12 @@ __global__ void accumulateNodalForce(const std::size_t *__restrict__ offsets,
 
     if (lane == 0)
         for (int d = 0; d < 3; ++d)
-            increments[node].value[d] = force[d];
+        {
+            if constexpr (append)
+                increments[node].value[d] += force[d];
+            else
+                increments[node].value[d] = force[d];
+        }
 }
 
 struct DeviceTrace
@@ -282,15 +288,23 @@ struct DeviceTrace
 
     // The host already owns loads from other physics. Transfer just the
     // assembled increments and add them to those loads once.
-    void addIncrements(std::vector<TraceForceNode> &state)
+    void addIncrements(std::vector<TraceForceNode> &state, bool includes_other_trace = false)
     {
         download(host_increments, increments);
-        for (auto i : participating_nodes)
+        const auto add = [&](std::size_t i) {
             for (int d = 0; d < 3; ++d)
                 state[i].external[d] += host_increments[i].value[d];
+        };
+        if (includes_other_trace)
+            for (std::size_t i = 0; i < count; ++i)
+                add(i);
+        else
+            for (auto i : participating_nodes)
+                add(i);
     }
 
-    TraceView view() const { return {offsets.get(), entries.get(), nodes.get()}; }
+    TraceView view(const TraceKinematics *state) const { return {offsets.get(), entries.get(), state}; }
+    TraceView view() const { return view(nodes.get()); }
 };
 
 constexpr unsigned int threads = 128;
@@ -303,15 +317,22 @@ unsigned int launchBlocks(std::size_t count, int maximum)
     return static_cast<unsigned int>(blocks);
 }
 
-template <class Point>
-void accumulate(DeviceTrace &trace, const DeviceBuffer<Point> &points, int maximum)
+template <bool append, class Point>
+void accumulate(const DeviceTrace &trace, const DeviceBuffer<Point> &points, int maximum,
+                const TraceKinematics *nodes, TraceForceIncrement *increments)
 {
     if (trace.count == 0)
         return;
     static_assert(threads % warp_lanes == 0);
-    accumulateNodalForce<<<launchBlocks(trace.count * force_lanes, maximum), threads>>>(trace.transpose_offsets.get(),
-        trace.contributions.get(), points.get(), trace.count, trace.nodes.get(), trace.increments.get());
+    accumulateNodalForce<append><<<launchBlocks(trace.count * force_lanes, maximum), threads>>>(
+        trace.transpose_offsets.get(), trace.contributions.get(), points.get(), trace.count, nodes, increments);
     check(cudaGetLastError(), "surface trace force accumulation");
+}
+
+template <class Point>
+void accumulate(DeviceTrace &trace, const DeviceBuffer<Point> &points, int maximum)
+{
+    accumulate<false>(trace, points, maximum, trace.nodes.get(), trace.increments.get());
 }
 
 class CudaBondedInterface final : public BondedInterfaceBatch
@@ -319,9 +340,8 @@ class CudaBondedInterface final : public BondedInterfaceBatch
   public:
     CudaBondedInterface()
     {
-        int device = 0;
-        check(cudaGetDevice(&device), "bonded interface device selection");
-        check(cudaGetDeviceProperties(&properties_, device), "bonded interface device properties");
+        check(cudaGetDevice(&device_), "bonded interface device selection");
+        check(cudaDeviceGetAttribute(&max_grid_, cudaDevAttrMaxGridDimX, device_), "bonded interface device grid");
     }
 
     void configure(const BondedTraceMap &a, const BondedTraceMap &b,
@@ -344,24 +364,39 @@ class CudaBondedInterface final : public BondedInterfaceBatch
         points.resize(point_count_);
         if (point_count_ == 0)
             return;
-        a_.uploadKinematics(a);
-        b_.uploadKinematics(b);
-        evaluateInterface<<<launchBlocks(point_count_, properties_.maxGridSize[0]), threads>>>(a_.view(), b_.view(), stiffness_.get(), point_count_, points_.get());
-        check(cudaGetLastError(), "bonded interface evaluation");
-        accumulate(a_, points_, properties_.maxGridSize[0]);
-        accumulate(b_, points_, properties_.maxGridSize[0]);
+        evaluateAndAccumulate(a, b);
         download(points, points_);
         a_.addIncrements(a);
         b_.addIncrements(b);
     }
 
+    bool applyWithPlaneContact(SurfacePlaneContactBatch &plane, double bottom, double top,
+                               std::vector<BondedInterfaceNode> &a, std::vector<BondedInterfaceNode> &b,
+                               std::vector<BondedInterfacePoint> &points,
+                               std::vector<SurfacePlaneContactPoint> &plane_points) override;
+
   private:
+    void evaluateAndAccumulate(const std::vector<BondedInterfaceNode> &a,
+                               const std::vector<BondedInterfaceNode> &b)
+    {
+        a_.uploadKinematics(a);
+        b_.uploadKinematics(b);
+        if (point_count_ != 0)
+        {
+            evaluateInterface<<<launchBlocks(point_count_, max_grid_), threads>>>(
+                a_.view(), b_.view(), stiffness_.get(), point_count_, points_.get());
+            check(cudaGetLastError(), "bonded interface evaluation");
+        }
+        // An empty interface still initializes the shared nodal increments.
+        accumulate(a_, points_, max_grid_);
+        accumulate(b_, points_, max_grid_);
+    }
+
     DeviceTrace a_, b_;
     DeviceBuffer<double> stiffness_;
     DeviceBuffer<BondedInterfacePoint> points_;
     std::size_t point_count_ = 0;
-    cudaDeviceProp properties_{};
-
+    int device_ = 0, max_grid_ = 0;
 };
 
 class CudaSurfacePlaneContact final : public SurfacePlaneContactBatch
@@ -369,9 +404,8 @@ class CudaSurfacePlaneContact final : public SurfacePlaneContactBatch
   public:
     CudaSurfacePlaneContact()
     {
-        int device = 0;
-        check(cudaGetDevice(&device), "plane contact device selection");
-        check(cudaDeviceGetAttribute(&max_grid_, cudaDevAttrMaxGridDimX, device), "plane contact device grid");
+        check(cudaGetDevice(&device_), "plane contact device selection");
+        check(cudaDeviceGetAttribute(&max_grid_, cudaDevAttrMaxGridDimX, device_), "plane contact device grid");
     }
 
     void configure(const ParticleTraceMap &trace, const std::vector<double> &stiffness,
@@ -405,10 +439,7 @@ class CudaSurfacePlaneContact final : public SurfacePlaneContactBatch
             upload(history_, friction->committed);
             trials_.reserve(point_count_);
         }
-        evaluatePlaneContact<<<launchBlocks(point_count_, max_grid_), threads>>>(
-            trace_.view(), stiffness_.get(), point_count_, bottom, top, points_.get(), friction_, tangent_factor_,
-            friction ? history_.get() : nullptr, friction ? trials_.get() : nullptr);
-        check(cudaGetLastError(), "plane contact evaluation");
+        evaluate(bottom, top, trace_.view(), friction != nullptr);
         accumulate(trace_, points_, max_grid_);
         download(points, points_);
         trace_.addIncrements(nodes);
@@ -417,6 +448,16 @@ class CudaSurfacePlaneContact final : public SurfacePlaneContactBatch
     }
 
   private:
+    friend class CudaBondedInterface;
+
+    void evaluate(double bottom, double top, TraceView trace, bool friction_history)
+    {
+        evaluatePlaneContact<<<launchBlocks(point_count_, max_grid_), threads>>>(
+            trace, stiffness_.get(), point_count_, bottom, top, points_.get(), friction_, tangent_factor_,
+            friction_history ? history_.get() : nullptr, friction_history ? trials_.get() : nullptr);
+        check(cudaGetLastError(), "plane contact evaluation");
+    }
+
     DeviceTrace trace_;
     DeviceBuffer<double> stiffness_;
     DeviceBuffer<SurfacePlaneContactPoint> points_;
@@ -425,8 +466,36 @@ class CudaSurfacePlaneContact final : public SurfacePlaneContactBatch
     double friction_ = 0;
     double tangent_factor_ = 1;
     std::size_t point_count_ = 0;
-    int max_grid_ = 0;
+    int device_ = 0, max_grid_ = 0;
 };
+
+bool CudaBondedInterface::applyWithPlaneContact(
+    SurfacePlaneContactBatch &other, double bottom, double top, std::vector<BondedInterfaceNode> &a,
+    std::vector<BondedInterfaceNode> &b, std::vector<BondedInterfacePoint> &points,
+    std::vector<SurfacePlaneContactPoint> &plane_points)
+{
+    auto *plane = dynamic_cast<CudaSurfacePlaneContact *>(&other);
+    if (!plane || plane->device_ != device_ || plane->friction_ != 0)
+        return false;
+    if (a.size() != a_.count || b.size() != b_.count || plane->trace_.count != a_.count)
+        throw std::invalid_argument("CUDA shared surface force node counts changed without map rebuild");
+
+    points.resize(point_count_);
+    plane_points.resize(plane->point_count_);
+    evaluateAndAccumulate(a, b);
+    if (plane->point_count_ != 0)
+    {
+        // The second operator consumes the first body's existing device
+        // state and appends its load before the combined force is read back.
+        plane->evaluate(bottom, top, plane->trace_.view(a_.nodes.get()), false);
+        accumulate<true>(plane->trace_, plane->points_, plane->max_grid_, a_.nodes.get(), a_.increments.get());
+    }
+    download(points, points_);
+    download(plane_points, plane->points_);
+    a_.addIncrements(a, true);
+    b_.addIncrements(b);
+    return true;
+}
 }
 
 std::unique_ptr<BondedInterfaceBatch> makeCudaBondedInterface()

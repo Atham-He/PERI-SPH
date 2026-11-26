@@ -190,7 +190,15 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells,const PeriExec
     auto setPositions=[&](const Field&d,const Field&v){for(size_t j=0;j<cn;++j){cx[j]=cX[j]+d[j];cv[j]=v[j];}for(size_t j=0;j<sn;++j){sx[j]=sX[j]+d[cn+j];sv[j]=v[cn+j];}};
     auto assembleShellAndConstraints=[&](Real compression){
         sb.evaluateAll();sb.recomputeForces();
-        core_port.clear();pd_port.clear();tie->apply();contact.apply(-R+compression/2,R-compression/2);growth.applyContact();
+        core_port.clear();
+        pd_port.clear();
+        const Real top = R - compression / 2;
+        if (!tie->applyWithPlaneContactOnFirstBody(contact, -top, top))
+        {
+            tie->apply();
+            contact.apply(-top, top);
+        }
+        growth.applyContact();
         for(size_t j=0;j<cn;++j){internal[j]=cb.internal[j];bulk_force[j]=core_port.external[j]-internal[j];}
         for(size_t j=0;j<sn;++j){internal[cn+j]=-sb.internal[j]-sb.hourglass[j];bulk_force[cn+j]=sm[j]*pd_port.external[j]-internal[cn+j];}
     };

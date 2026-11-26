@@ -235,6 +235,8 @@ inline Vecd vector(const double *values)
 
 } // namespace surface_execution_detail
 
+class SolidSurfacePlaneContact;
+
 /** One reference interface energy:U=sum(k_i|W_a*x_a-W_b*x_b|^2/2).
  * Both bodies receive the transpose pullback of the SAME physical force.
  * No fluid pressure, velocity overwrite or duplicate repulsion is added. */
@@ -254,12 +256,15 @@ class BondedSolidInterface
         worst_power = std::max(worst_power, power_residual);
     }
 
-    void applyBackend()
+    void packBackendState()
     {
-        using namespace surface_execution_detail;
-        packState(a.port, nodes_a_);
-        packState(b.port, nodes_b_);
-        backend_->apply(nodes_a_, nodes_b_, points_);
+        surface_execution_detail::packState(a.port, nodes_a_);
+        surface_execution_detail::packState(b.port, nodes_b_);
+    }
+
+    void collectBackendResult()
+    {
+        using surface_execution_detail::vector;
         if (points_.size() != stiffness.size())
             throw std::logic_error("Bonded interface backend returned the wrong point count");
         for (size_t i = 0; i < nodes_a_.size(); ++i)
@@ -285,6 +290,14 @@ class BondedSolidInterface
             power_scale += point.power_scale;
         }
         finishAudit(sum, torque, power, force_scale, power_scale);
+    }
+
+    void updateMapping()
+    {
+        a.ensureCurrent();
+        b.ensureCurrent();
+        if (a_mapping_version != a.mappingVersion() || b_mapping_version != b.mappingVersion())
+            refreshTimeStepBound();
     }
 
   public:
@@ -324,12 +337,18 @@ class BondedSolidInterface
         a_mapping_version = a.mappingVersion();
         b_mapping_version = b.mappingVersion();
     }
+    // Combine independent surface loads for an already initialized force
+    // assembly. Call the separate operators when the backends cannot share data.
+    bool applyWithPlaneContactOnFirstBody(SolidSurfacePlaneContact &plane, Real bottom, Real top);
+
     void apply()
     {
-        a.ensureCurrent();b.ensureCurrent();if(a_mapping_version!=a.mappingVersion()||b_mapping_version!=b.mappingVersion())refreshTimeStepBound();
+        updateMapping();
         if (backend_)
         {
-            applyBackend();
+            packBackendState();
+            backend_->apply(nodes_a_, nodes_b_, points_);
+            collectBackendResult();
             return;
         }
         energy=max_gap=0;Vecd sum=Vecd::Zero(),torque=Vecd::Zero();Real power=0,fs=0,ps=0;
@@ -363,6 +382,8 @@ class BondedSolidInterface
  * The same surface interpolation and transpose force map serve all components. */
 class SolidSurfacePlaneContact
 {
+    friend class BondedSolidInterface;
+
     std::unique_ptr<SurfacePlaneContactBatch> backend_;
     std::vector<TraceForceNode> nodes_;
     std::vector<SurfacePlaneContactPoint> points_;
@@ -383,10 +404,16 @@ class SolidSurfacePlaneContact
             }
         }
         backend_->apply(bottom, top, nodes_, points_, friction>0?&friction_transfer_:nullptr);
-        if (points_.size() != stiffness.size())
-            throw std::logic_error("Plane contact backend returned the wrong point count");
         for (size_t i = 0; i < nodes_.size(); ++i)
             surface.port.external[i] = vector(nodes_[i].external);
+        collectBackendPoints(commit_history);
+    }
+
+    void collectBackendPoints(bool commit_history)
+    {
+        using surface_execution_detail::vector;
+        if (points_.size() != stiffness.size())
+            throw std::logic_error("Plane contact backend returned the wrong point count");
 
         Vecd net_force=Vecd::Zero(), torque=Vecd::Zero();
         Real power=0, force_scale=0, power_scale=0;
@@ -442,6 +469,19 @@ class SolidSurfacePlaneContact
         worst_power=std::max(worst_power,std::abs(power)/std::max(power_scale,Real(1e-30)));
     }
 
+    void updateMapping()
+    {
+        surface.ensureCurrent();
+        if (surface_mapping_version != surface.mappingVersion())
+            refreshTimeStepBound();
+    }
+
+    void clearDiagnostics()
+    {
+        upper=lower=energy=max_penetration=tangent_energy=max_cone_ratio=tangential_force_sum=0;
+        active_friction_points=sliding_points=0;
+    }
+
   public:
     ReferenceSolidSurface &surface;
     StdVec<Real> areas,stiffness;
@@ -493,9 +533,8 @@ class SolidSurfacePlaneContact
     }
     void apply(Real bottom,Real top,bool commit_history=false)
     {
-        surface.ensureCurrent();if(surface_mapping_version!=surface.mappingVersion())refreshTimeStepBound();
-        upper=lower=energy=max_penetration=tangent_energy=max_cone_ratio=tangential_force_sum=0;
-        active_friction_points=sliding_points=0;
+        updateMapping();
+        clearDiagnostics();
         if (onDevice())
         {
             applyBackend(bottom, top, commit_history);
@@ -545,6 +584,23 @@ class SolidSurfacePlaneContact
         worst_power=std::max(worst_power,std::abs(perr)/std::max(ps,Real(1e-30)));
     }
 };
+
+inline bool BondedSolidInterface::applyWithPlaneContactOnFirstBody(
+    SolidSurfacePlaneContact &plane, Real bottom, Real top)
+{
+    if (!backend_ || !plane.backend_ || &a.port != &plane.surface.port || plane.friction != 0)
+        return false;
+
+    updateMapping();
+    plane.updateMapping();
+    packBackendState();
+    if (!backend_->applyWithPlaneContact(*plane.backend_, bottom, top, nodes_a_, nodes_b_, points_, plane.points_))
+        return false;
+    collectBackendResult();
+    plane.clearDiagnostics();
+    plane.collectBackendPoints(false);
+    return true;
+}
 
 } // namespace SPH::peridynamics
 #endif

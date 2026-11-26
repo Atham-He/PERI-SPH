@@ -24,6 +24,9 @@ struct BondedInterfacePoint
     double energy, gap, power, force_scale, power_scale;
 };
 
+class SurfacePlaneContactBatch;
+struct SurfacePlaneContactPoint;
+
 class BondedInterfaceBatch
 {
   public:
@@ -33,6 +36,17 @@ class BondedInterfaceBatch
     virtual void apply(std::vector<BondedInterfaceNode> &a,
                        std::vector<BondedInterfaceNode> &b,
                        std::vector<BondedInterfacePoint> &points) = 0;
+
+    // Both operators use the first body's unchanged kinematics. A backend
+    // that cannot share the state returns false without changing any loads.
+    virtual bool applyWithPlaneContact(SurfacePlaneContactBatch &, double, double,
+                                       std::vector<BondedInterfaceNode> &,
+                                       std::vector<BondedInterfaceNode> &,
+                                       std::vector<BondedInterfacePoint> &,
+                                       std::vector<SurfacePlaneContactPoint> &)
+    {
+        return false;
+    }
 };
 
 struct SurfacePlaneContactPoint

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pd_particle_trace_map.h"
+#include "pd_spatial_derivatives.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -115,6 +116,16 @@ class CrackProjectionBatch
         throw std::logic_error("This crack backend does not implement trace assembly");
     }
 
+    virtual DeviceParticleVectorView assembleContactTraceOnDevice(
+        std::uint64_t, const std::vector<CrackTraceAddress> &, DeviceParticleVectorView,
+        const double *, bool, double &)
+    {
+        throw std::logic_error("This crack backend does not assemble device forces");
+    }
+    virtual void copyDeviceForces(DeviceParticleVectorView, std::vector<ParticleVector3> &)
+    {
+        throw std::logic_error("This crack backend does not own device forces");
+    }
 };
 
 std::unique_ptr<CrackProjectionBatch> makeCudaCrackProjection(bool assemble_local_contact = false);

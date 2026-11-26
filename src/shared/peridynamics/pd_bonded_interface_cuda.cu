@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <type_traits>
 
 namespace SPH::peridynamics
 {
@@ -19,10 +20,7 @@ struct TraceKinematics
     double force_divisor;
 };
 
-struct TraceForceIncrement
-{
-    double value[3];
-};
+using TraceForceIncrement = ParticleVector3;
 
 struct TraceView
 {
@@ -235,10 +233,26 @@ __global__ void accumulateNodalForce(const std::size_t *__restrict__ offsets,
         for (int d = 0; d < 3; ++d)
         {
             if constexpr (append)
-                increments[node].value[d] += force[d];
+                increments[node].component[d] += force[d];
             else
-                increments[node].value[d] = force[d];
+                increments[node].component[d] = force[d];
         }
+}
+
+__global__ void assembleTraceKinematics(DeviceSurfaceKinematics state, std::size_t count, TraceKinematics *nodes)
+{
+    const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= count)
+        return;
+    auto &node = nodes[i];
+    const auto &position = state.position.data[i];
+    const auto &velocity = state.velocity.data[i];
+    for (int d = 0; d < 3; ++d)
+    {
+        node.position[d] = position.component[d];
+        node.velocity[d] = velocity.component[d];
+    }
+    node.force_divisor = state.force_divisor ? state.force_divisor[i] : 1.0;
 }
 
 struct DeviceTrace
@@ -293,7 +307,7 @@ struct DeviceTrace
         download(host_increments, increments);
         const auto add = [&](std::size_t i) {
             for (int d = 0; d < 3; ++d)
-                state[i].external[d] += host_increments[i].value[d];
+                state[i].external[d] += host_increments[i].component[d];
         };
         if (includes_other_trace)
             for (std::size_t i = 0; i < count; ++i)
@@ -309,12 +323,87 @@ struct DeviceTrace
 
 constexpr unsigned int threads = 128;
 
+template <class Point>
+__host__ __device__ void addDiagnostics(Point &total, const Point &point)
+{
+    for (int d = 0; d < 3; ++d)
+    {
+        total.sum[d] += point.sum[d];
+        total.torque[d] += point.torque[d];
+    }
+    total.energy += point.energy;
+    total.power += point.power;
+    total.power_scale += point.power_scale;
+    total.force_scale += point.force_scale;
+    if constexpr (std::is_same_v<Point, BondedInterfacePoint>)
+        total.gap = total.gap < point.gap ? point.gap : total.gap;
+    else
+    {
+        total.upper += point.upper;
+        total.lower += point.lower;
+        total.penetration = total.penetration < point.penetration ? point.penetration : total.penetration;
+    }
+}
+
+template <class Point>
+__global__ void summarizeSurface(const Point *points, std::size_t count, Point *block_totals, PlaneZForce *plate_rows)
+{
+    __shared__ Point totals[threads];
+    const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    auto &local = totals[threadIdx.x];
+    local = {};
+    if (i < count)
+    {
+        addDiagnostics(local, points[i]);
+        if constexpr (std::is_same_v<Point, SurfacePlaneContactPoint>)
+            plate_rows[i] = {points[i].position[2], points[i].force[2]};
+    }
+    __syncthreads();
+    for (unsigned stride = threads / 2; stride != 0; stride /= 2)
+    {
+        if (threadIdx.x < stride)
+            addDiagnostics(local, totals[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+        block_totals[blockIdx.x] = local;
+}
+
 unsigned int launchBlocks(std::size_t count, int maximum)
 {
     const auto blocks = (count + threads - 1) / threads;
     if (blocks > static_cast<std::size_t>(maximum))
         throw std::length_error("CUDA surface trace exceeds the device grid");
     return static_cast<unsigned int>(blocks);
+}
+
+template <class Point>
+Point collectSurfaceDiagnostics(const DeviceBuffer<Point> &points, std::size_t count, int maximum,
+                                DeviceBuffer<Point> &partials, std::vector<Point> &host_partials,
+                                PlaneZForce *plate_rows = nullptr)
+{
+    Point total{};
+    const auto blocks = launchBlocks(count, maximum);
+    if (blocks == 0)
+        return total;
+    partials.reserve(blocks);
+    summarizeSurface<<<blocks, threads>>>(points.get(), count, partials.get(), plate_rows);
+    check(cudaGetLastError(), "summarize coupled surface diagnostics");
+    host_partials.resize(blocks);
+    download(host_partials, partials, "surface block totals");
+    for (const auto &part : host_partials)
+        addDiagnostics(total, part);
+    return total;
+}
+
+void prepareDeviceKinematics(DeviceTrace &trace, DeviceSurfaceKinematics state, int maximum)
+{
+    if (!state.position || !state.velocity || state.position.count != trace.count || state.velocity.count != trace.count)
+        throw std::invalid_argument("Shared motion does not match the surface trace");
+    if (!trace.count)
+        return;
+    assembleTraceKinematics<<<launchBlocks(trace.count, maximum), threads>>>(state, trace.count, trace.nodes.get());
+    check(cudaGetLastError(), "build surface kinematics from device motion");
 }
 
 template <bool append, class Point>
@@ -373,14 +462,26 @@ class CudaBondedInterface final : public BondedInterfaceBatch
     bool applyWithPlaneContact(SurfacePlaneContactBatch &plane, double bottom, double top,
                                std::vector<BondedInterfaceNode> &a, std::vector<BondedInterfaceNode> &b,
                                std::vector<BondedInterfacePoint> &points,
-                               std::vector<SurfacePlaneContactPoint> &plane_points) override;
+                               std::vector<SurfacePlaneContactPoint> &plane_points,
+                               BondedDeviceForces *device_forces,
+                               const BondedDeviceKinematics *device_motion,
+                               CoupledSurfaceDiagnostics *diagnostics) override;
 
   private:
     void evaluateAndAccumulate(const std::vector<BondedInterfaceNode> &a,
-                               const std::vector<BondedInterfaceNode> &b)
+                               const std::vector<BondedInterfaceNode> &b,
+                               const BondedDeviceKinematics *device_motion = nullptr)
     {
-        a_.uploadKinematics(a);
-        b_.uploadKinematics(b);
+        if (device_motion)
+        {
+            prepareDeviceKinematics(a_, device_motion->first, max_grid_);
+            prepareDeviceKinematics(b_, device_motion->second, max_grid_);
+        }
+        else
+        {
+            a_.uploadKinematics(a);
+            b_.uploadKinematics(b);
+        }
         if (point_count_ != 0)
         {
             evaluateInterface<<<launchBlocks(point_count_, max_grid_), threads>>>(
@@ -394,7 +495,8 @@ class CudaBondedInterface final : public BondedInterfaceBatch
 
     DeviceTrace a_, b_;
     DeviceBuffer<double> stiffness_;
-    DeviceBuffer<BondedInterfacePoint> points_;
+    DeviceBuffer<BondedInterfacePoint> points_, partials_;
+    std::vector<BondedInterfacePoint> host_partials_;
     std::size_t point_count_ = 0;
     int device_ = 0, max_grid_ = 0;
 };
@@ -460,7 +562,9 @@ class CudaSurfacePlaneContact final : public SurfacePlaneContactBatch
 
     DeviceTrace trace_;
     DeviceBuffer<double> stiffness_;
-    DeviceBuffer<SurfacePlaneContactPoint> points_;
+    DeviceBuffer<SurfacePlaneContactPoint> points_, partials_;
+    std::vector<SurfacePlaneContactPoint> host_partials_;
+    DeviceBuffer<PlaneZForce> plate_rows_;
     DeviceBuffer<SurfaceFrictionState> history_;
     DeviceBuffer<SurfaceFrictionTrial> trials_;
     double friction_ = 0;
@@ -472,7 +576,8 @@ class CudaSurfacePlaneContact final : public SurfacePlaneContactBatch
 bool CudaBondedInterface::applyWithPlaneContact(
     SurfacePlaneContactBatch &other, double bottom, double top, std::vector<BondedInterfaceNode> &a,
     std::vector<BondedInterfaceNode> &b, std::vector<BondedInterfacePoint> &points,
-    std::vector<SurfacePlaneContactPoint> &plane_points)
+    std::vector<SurfacePlaneContactPoint> &plane_points, BondedDeviceForces *device_forces,
+    const BondedDeviceKinematics *device_motion, CoupledSurfaceDiagnostics *diagnostics)
 {
     auto *plane = dynamic_cast<CudaSurfacePlaneContact *>(&other);
     if (!plane || plane->device_ != device_ || plane->friction_ != 0)
@@ -480,9 +585,7 @@ bool CudaBondedInterface::applyWithPlaneContact(
     if (a.size() != a_.count || b.size() != b_.count || plane->trace_.count != a_.count)
         throw std::invalid_argument("CUDA shared surface force node counts changed without map rebuild");
 
-    points.resize(point_count_);
-    plane_points.resize(plane->point_count_);
-    evaluateAndAccumulate(a, b);
+    evaluateAndAccumulate(a, b, device_motion);
     if (plane->point_count_ != 0)
     {
         // The second operator consumes the first body's existing device
@@ -490,10 +593,31 @@ bool CudaBondedInterface::applyWithPlaneContact(
         plane->evaluate(bottom, top, plane->trace_.view(a_.nodes.get()), false);
         accumulate<true>(plane->trace_, plane->points_, plane->max_grid_, a_.nodes.get(), a_.increments.get());
     }
-    download(points, points_);
-    download(plane_points, plane->points_);
-    a_.addIncrements(a, true);
-    b_.addIncrements(b);
+    if (diagnostics)
+    {
+        diagnostics->interface_totals = collectSurfaceDiagnostics(points_, point_count_, max_grid_,
+                                                                  partials_, host_partials_);
+        plane->plate_rows_.reserve(plane->point_count_);
+        diagnostics->plane_totals = collectSurfaceDiagnostics(plane->points_, plane->point_count_, plane->max_grid_,
+                                                               plane->partials_, plane->host_partials_,
+                                                               plane->plate_rows_.get());
+        diagnostics->plate_rows.resize(plane->point_count_);
+        download(diagnostics->plate_rows, plane->plate_rows_, "platen geometry and active normal loads");
+    }
+    else
+    {
+        points.resize(point_count_);
+        plane_points.resize(plane->point_count_);
+        download(points, points_);
+        download(plane_points, plane->points_);
+    }
+    if (device_forces)
+        *device_forces = {{a_.increments.get(), a_.count}, {b_.increments.get(), b_.count}};
+    else
+    {
+        a_.addIncrements(a, true);
+        b_.addIncrements(b);
+    }
     return true;
 }
 }

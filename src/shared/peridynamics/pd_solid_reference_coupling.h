@@ -245,6 +245,7 @@ class BondedSolidInterface
     std::unique_ptr<BondedInterfaceBatch> backend_;
     std::vector<BondedInterfaceNode> nodes_a_, nodes_b_;
     std::vector<BondedInterfacePoint> points_;
+    CoupledSurfaceDiagnostics compact_diagnostics_;
 
     void finishAudit(const Vecd &sum, const Vecd &torque, Real power, Real force_scale, Real power_scale)
     {
@@ -262,15 +263,18 @@ class BondedSolidInterface
         surface_execution_detail::packState(b.port, nodes_b_);
     }
 
-    void collectBackendResult()
+    void collectBackendResult(bool collect_forces = true)
     {
         using surface_execution_detail::vector;
         if (points_.size() != stiffness.size())
             throw std::logic_error("Bonded interface backend returned the wrong point count");
-        for (size_t i = 0; i < nodes_a_.size(); ++i)
-            a.port.external[i] = vector(nodes_a_[i].external);
-        for (size_t i = 0; i < nodes_b_.size(); ++i)
-            b.port.external[i] = vector(nodes_b_[i].external);
+        if (collect_forces)
+        {
+            for (size_t i = 0; i < nodes_a_.size(); ++i)
+                a.port.external[i] = vector(nodes_a_[i].external);
+            for (size_t i = 0; i < nodes_b_.size(); ++i)
+                b.port.external[i] = vector(nodes_b_[i].external);
+        }
 
         energy = max_gap = 0;
         Vecd sum = Vecd::Zero(), torque = Vecd::Zero();
@@ -339,7 +343,10 @@ class BondedSolidInterface
     }
     // Combine independent surface loads for an already initialized force
     // assembly. Call the separate operators when the backends cannot share data.
-    bool applyWithPlaneContactOnFirstBody(SolidSurfacePlaneContact &plane, Real bottom, Real top);
+    bool applyWithPlaneContactOnFirstBody(SolidSurfacePlaneContact &plane, Real bottom, Real top,
+                                          BondedDeviceForces *device_forces = nullptr,
+                                          const BondedDeviceKinematics *device_motion = nullptr,
+                                          bool detailed = true);
 
     void apply()
     {
@@ -469,6 +476,24 @@ class SolidSurfacePlaneContact
         worst_power=std::max(worst_power,std::abs(power)/std::max(power_scale,Real(1e-30)));
     }
 
+    void collectCompactDiagnostics(const CoupledSurfaceDiagnostics &diagnostics)
+    {
+        if (diagnostics.plate_rows.size() != stiffness.size())
+            throw std::logic_error("Plane contact diagnostics do not match the trace");
+        const auto &total = diagnostics.plane_totals;
+        upper=total.upper; lower=total.lower; energy=total.energy; max_penetration=total.penetration;
+        for (size_t j=0;j<diagnostics.plate_rows.size();++j)
+        {
+            position[j]=Vecd(0,0,diagnostics.plate_rows[j].z);
+            force[j]=Vecd(0,0,diagnostics.plate_rows[j].force_z);
+        }
+        using surface_execution_detail::vector;
+        const Real scale=std::max(total.force_scale,Real(1e-30));
+        worst_force=std::max(worst_force,vector(total.sum).norm()/scale);
+        worst_torque=std::max(worst_torque,vector(total.torque).norm()/std::max(length_scale*total.force_scale,Real(1e-30)));
+        worst_power=std::max(worst_power,std::abs(total.power)/std::max(total.power_scale,Real(1e-30)));
+    }
+
     void updateMapping()
     {
         surface.ensureCurrent();
@@ -586,19 +611,36 @@ class SolidSurfacePlaneContact
 };
 
 inline bool BondedSolidInterface::applyWithPlaneContactOnFirstBody(
-    SolidSurfacePlaneContact &plane, Real bottom, Real top)
+    SolidSurfacePlaneContact &plane, Real bottom, Real top, BondedDeviceForces *device_forces,
+    const BondedDeviceKinematics *device_motion, bool detailed)
 {
     if (!backend_ || !plane.backend_ || &a.port != &plane.surface.port || plane.friction != 0)
         return false;
 
     updateMapping();
     plane.updateMapping();
-    packBackendState();
-    if (!backend_->applyWithPlaneContact(*plane.backend_, bottom, top, nodes_a_, nodes_b_, points_, plane.points_))
+    if (!device_motion || !device_forces)
+        packBackendState();
+    // The compact result is for force assemblies that only consume device
+    // loads, reductions and the frictionless plate's normal traces.
+    auto *compact = device_forces && !detailed ? &compact_diagnostics_ : nullptr;
+    if (!backend_->applyWithPlaneContact(*plane.backend_, bottom, top, nodes_a_, nodes_b_,
+                                        points_, plane.points_, device_forces, device_motion, compact))
         return false;
-    collectBackendResult();
     plane.clearDiagnostics();
-    plane.collectBackendPoints(false);
+    if (compact)
+    {
+        using surface_execution_detail::vector;
+        const auto &total=compact->interface_totals;
+        energy=total.energy; max_gap=total.gap;
+        finishAudit(vector(total.sum),vector(total.torque),total.power,total.force_scale,total.power_scale);
+        plane.collectCompactDiagnostics(*compact);
+    }
+    else
+    {
+        collectBackendResult(device_forces == nullptr);
+        plane.collectBackendPoints(false);
+    }
     return true;
 }
 

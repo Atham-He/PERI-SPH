@@ -70,7 +70,8 @@ void CrackSurfaceContactNetwork::updateDeviceTraceMap()
     trace_generation_ = projection_batch_->configureContactTrace(map);
 }
 
-void CrackSurfaceContactNetwork::applyDeviceTracePullback(SolidForcePort &port)
+DeviceParticleVectorView CrackSurfaceContactNetwork::applyDeviceTracePullback(
+    SolidForcePort &port, DeviceParticleVectorView base, const double *device_mass, Real &max_rate)
 {
     updateDeviceTraceMap();
     contact_addresses_.clear();
@@ -80,13 +81,21 @@ void CrackSurfaceContactNetwork::applyDeviceTracePullback(SolidForcePort &port)
         const auto master = trace_side_offsets_[point.master];
         contact_addresses_.push_back({{slave, master, master + 1, master + 2, master + 3}});
     }
+    const bool acceleration_port = port.storage == SolidForcePort::Storage::PDAccelerationPrior;
+    if (base)
+    {
+        const auto result = projection_batch_->assembleContactTraceOnDevice(
+            trace_generation_, contact_addresses_, base, device_mass, acceleration_port, max_rate);
+        device_trace_pullback = true;
+        return result;
+    }
+
     trace_particle_input_.resize(port.count);
     for (size_t i = 0; i < port.count; ++i)
     {
         trace_particle_input_[i].mass = port.mass[i];
         std::copy_n(port.external[i].data(), 3, trace_particle_input_[i].external);
     }
-    const bool acceleration_port = port.storage == SolidForcePort::Storage::PDAccelerationPrior;
     projection_batch_->assembleContactTrace(trace_generation_, contact_addresses_, trace_particle_input_,
                                             acceleration_port, trace_particle_output_);
     if (trace_particle_output_.size() != port.count)
@@ -98,9 +107,15 @@ void CrackSurfaceContactNetwork::applyDeviceTracePullback(SolidForcePort &port)
         rates[i] = Vecd(particle.rate[0], particle.rate[1], particle.rate[2]);
     }
     device_trace_pullback = true;
+    return {};
 }
 
-void CrackSurfaceContactNetwork::apply(){
+DeviceParticleVectorView CrackSurfaceContactNetwork::apply(DeviceParticleVectorView base, const double *device_mass)
+{
+    if (base && (!projection_batch_ || !projection_batch_->assemblesTracePullback() || !device_mass))
+        throw std::invalid_argument("A device crack-force chain needs a CUDA trace backend and device masses");
+    DeviceParticleVectorView result = base;
+    Real device_rate = 0;
     energy=max_penetration=normal_force_sum=force_residual=torque_residual=power_residual=tangential_force_sum=0;active_contacts=outside_projections=neighbor_contacts=0;for(auto&r:rates)r.setZero();
     struct Master {std::array<Vecd,4>x,v;};StdVec<Master>masters(sides.size());
     using Cell=std::array<long long,3>;struct Hash{size_t operator()(const Cell&a)const{size_t h=0;for(auto v:a)h^=std::hash<long long>{}(v)+0x9e3779b9+(h<<6)+(h>>2);return h;}};
@@ -393,7 +408,16 @@ void CrackSurfaceContactNetwork::apply(){
             return result.valid;
         });
         if (!selected_contacts_.empty() && one_force_port && valid_batch && projection_batch_->assemblesTracePullback())
-            applyDeviceTracePullback(port);
+            result = applyDeviceTracePullback(port, base, device_mass, device_rate);
+        else if (base && !selected_contacts_.empty())
+        {
+            // Preserve the starting load and the original order of additions
+            // when a local contact needs the host tangent evaluation.
+            projection_batch_->copyDeviceForces(base, fallback_base_forces_);
+            for (size_t i = 0; i < port.count; ++i)
+                port.external[i] = surface_execution_detail::vector(fallback_base_forces_[i].component);
+            result = {};
+        }
 
         for (size_t i = 0; i < selected_contacts_.size(); ++i)
         {
@@ -412,6 +436,11 @@ void CrackSurfaceContactNetwork::apply(){
         }
     }
 
-    Real bound=0;for(const auto&r:rates)bound=std::max(bound,r.maxCoeff());stable_dt=bound>0?.2/std::sqrt(bound):std::numeric_limits<Real>::infinity();force_residual=balance.norm()/std::max(magnitude,Real(1e-30));torque_residual=moment.norm()/std::max(magnitude*length,Real(1e-30));power_residual=std::abs(power+energy_rate)/std::max(power_scale,Real(1e-30));
+    Real bound = device_rate;
+    if (!result)
+        for (const auto &r : rates)
+            bound = std::max(bound, r.maxCoeff());
+    stable_dt=bound>0?.2/std::sqrt(bound):std::numeric_limits<Real>::infinity();force_residual=balance.norm()/std::max(magnitude,Real(1e-30));torque_residual=moment.norm()/std::max(magnitude*length,Real(1e-30));power_residual=std::abs(power+energy_rate)/std::max(power_scale,Real(1e-30));
+    return result;
 }
 }

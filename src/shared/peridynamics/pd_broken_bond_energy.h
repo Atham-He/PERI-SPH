@@ -56,6 +56,14 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
     }
     bool hasDeviceDerivatives() const noexcept { return derivatives_ != nullptr; }
     bool hasDeviceMaterial() const noexcept { return derivatives_ && derivatives_->supportsResidentBiot(); }
+    peridynamics::DeviceParticleVectorView deviceElasticAdjoint() const noexcept
+    {
+        return derivatives_ && device_residual_current_ ? derivatives_->assembledAdjoint() : peridynamics::DeviceParticleVectorView{};
+    }
+    peridynamics::DeviceParticleVectorView deviceStabilizingForce() const noexcept
+    {
+        return derivatives_ && device_residual_current_ ? derivatives_->weightedDifferenceForces() : peridynamics::DeviceParticleVectorView{};
+    }
     size_t hostMaterialPoints() const
     {
         if (!hasDeviceMaterial()) return projection.size();
@@ -70,13 +78,13 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
         evaluatePoint(i, nullptr);
     }
 
-    void evaluateAll()
+    void evaluateAll(peridynamics::DeviceParticleVectorView device_position = {})
     {
         if (version != reference.topology_version || reference.topologyPending())
             throw std::runtime_error("Live elastic residual not rebuilt after bond topology change");
         const size_t count = projection.size();
         if (derivatives_)
-            evaluateDeviceDerivatives(count);
+            evaluateDeviceDerivatives(count, device_position);
         resident_material_complete_=hasDeviceMaterial()&&
             derivatives_->evaluateResidentBiot(elastic.K,elastic.mu,device_material_results_);
         tbb::parallel_for(size_t(0), count, [&](size_t i)
@@ -272,14 +280,19 @@ class PDBrokenBondEnergy : public LocalDynamics,public DataDelegateInner {
             throw std::logic_error("Spatial adjoint backend returned an incomplete live PD force field");
     }
 
-    void evaluateDeviceDerivatives(size_t count)
+    void evaluateDeviceDerivatives(size_t count, peridynamics::DeviceParticleVectorView position)
     {
         prepareDerivativeStencil(count);
-        device_field_.resize(count);
-        for (size_t i = 0; i < count; ++i)
-            device_field_[i] = {{x[i][0], x[i][1], x[i][2]}};
         device_residual_current_ = false;
-        derivatives_->evaluate(device_field_, device_derivatives_, &device_residual_);
+        if (position)
+            derivatives_->evaluateOnDevice(position, device_derivatives_, &device_residual_);
+        else
+        {
+            device_field_.resize(count);
+            for (size_t i = 0; i < count; ++i)
+                device_field_[i] = {{x[i][0], x[i][1], x[i][2]}};
+            derivatives_->evaluate(device_field_, device_derivatives_, &device_residual_);
+        }
         if (device_derivatives_.size() != count || device_residual_.energy_density.size() != count ||
             device_residual_.forces.size() != count)
             throw std::logic_error("Spatial derivative backend returned an incomplete live PD field");

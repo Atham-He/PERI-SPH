@@ -293,6 +293,16 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
     {
         if (!configured_ || particles.size() != particle_count_)
             throw std::invalid_argument("Particle field does not match the spatial derivative stencil");
+        if (rows_ != 0)
+            upload(particles_, particles, "spatial derivative particle field");
+        evaluateOnDevice({particles_.get(), particles.size()}, result, weighted_difference);
+    }
+
+    void evaluateOnDevice(DeviceParticleVectorView particles, std::vector<SpatialDerivatives3> &result,
+                          WeightedDifferenceResult *weighted_difference = nullptr) override
+    {
+        if (!configured_ || particles.count != particle_count_ || (rows_ != 0 && particles.count != 0 && !particles))
+            throw std::invalid_argument("Device particle field does not match the spatial derivative stencil");
         if (weighted_difference && weighted_differences_count_ == 0)
             throw std::invalid_argument("Stencil has no weighted difference fit");
         derivative_result_ready_ = false;
@@ -302,20 +312,19 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
             return;
 
         const auto blocks = grid(rows_);
-        upload(particles_, particles, "spatial derivative particle field");
         result_.reserve(rows_);
         const auto *origins = use_origins_ ? origins_.get() : nullptr;
         if (use_hessians_)
             evaluateSpatialDerivatives<true><<<blocks, threads>>>(
                 offsets_.get(), neighbors_.get(), origins, gradients_.get(), hessians_.get(),
-                particles_.get(), add_identity_, rows_, result_.get());
+                particles.data, add_identity_, rows_, result_.get());
         else
             evaluateSpatialDerivatives<false><<<blocks, threads>>>(
                 offsets_.get(), neighbors_.get(), origins, gradients_.get(), nullptr,
-                particles_.get(), add_identity_, rows_, result_.get());
+                particles.data, add_identity_, rows_, result_.get());
         check(cudaGetLastError(), "spatial derivative evaluation");
         if (weighted_difference)
-            evaluateWeightedDifference(*weighted_difference);
+            evaluateWeightedDifference(particles.data, *weighted_difference);
         download(result, result_, "spatial derivative results");
         derivative_result_ready_ = true;
     }
@@ -398,6 +407,16 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
         gatherAdjoint(result,false);
     }
 
+    DeviceParticleVectorView assembledAdjoint() const noexcept override
+    {
+        return {adjoint_result_.get(), particle_count_};
+    }
+
+    DeviceParticleVectorView weightedDifferenceForces() const noexcept override
+    {
+        return {weighted_forces_.get(), particle_count_};
+    }
+
   private:
     void gatherAdjoint(std::vector<ParticleVector3> &result,bool second_order)
     {
@@ -430,13 +449,13 @@ class CudaSpatialDerivatives final : public SpatialDerivativeBatch
         return static_cast<unsigned int>(blocks);
     }
 
-    void evaluateWeightedDifference(WeightedDifferenceResult &result)
+    void evaluateWeightedDifference(const ParticleVector3 *particles, WeightedDifferenceResult &result)
     {
         edge_forces_.reserve(weighted_differences_count_);
         row_energies_.reserve(rows_);
         weighted_forces_.reserve(particle_count_);
         evaluateWeightedDifferences<<<grid(rows_), threads>>>(
-            offsets_.get(), neighbors_.get(), origins_.get(), weighted_differences_.get(), particles_.get(),
+            offsets_.get(), neighbors_.get(), origins_.get(), weighted_differences_.get(), particles,
             rows_, edge_forces_.get(), row_energies_.get());
         check(cudaGetLastError(), "evaluate weighted difference fit");
         gatherWeightedDifferenceForces<<<grid(particle_count_), threads>>>(

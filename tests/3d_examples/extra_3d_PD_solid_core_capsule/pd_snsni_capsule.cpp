@@ -186,6 +186,20 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells,const PeriExec
     size_t count=cn+sn;StdVec<Real>mass(count);Field X(count);
     for(size_t j=0;j<cn;++j){mass[j]=cm[j];X[j]=cX[j];}for(size_t j=0;j<sn;++j){mass[cn+j]=sm[j];X[cn+j]=sX[j];}
     SnsniCentralDifference time(mass,execution);Field bulk_force(count,Vecd::Zero()),internal(count,Vecd::Zero()),cohesive_force(sn,Vecd::Zero());
+    const bool use_device_drive = share_surface_forces && fracture_contact_only && !o.preflight_only &&
+                                  crack_projection && crack_projection->assemblesTracePullback() && time.deviceMass();
+    if (use_device_drive)
+        time.configureCoupledReference(X);
+    bool host_drive_current = true;
+    bool device_core_force_current = false;
+    auto syncBulkForce = [&](){
+        if (!host_drive_current)
+        {
+            time.readCoupledDrive(bulk_force);
+            host_drive_current = true;
+        }
+    };
+    std::cout << "Coupled force stepping " << (use_device_drive ? "CUDA device forces" : "host force exchange") << std::endl;
     Field inverse_shell_mass(sn);for(size_t j=0;j<sn;++j)inverse_shell_mass[j]=Vecd::Constant(1/sm[j]);
     auto*sF=sp.getVariableDataByName<Matd>("DeformationGradient");auto*sstress=sp.getVariableDataByName<Matd>("PDStress");
     Real shell_mass=std::accumulate(sm,sm+sn,Real(0)),exact_mass=o.shell_rho*4*Pi*(R*R*R-rc*rc*rc)/3;
@@ -193,27 +207,71 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells,const PeriExec
     Real radial_spacing=o.thickness;for(size_t k=1;k<rule.xi.size();++k)radial_spacing=std::min(radial_spacing,.5*o.thickness*(rule.xi[k]-rule.xi[k-1]));
     auto&mat=DynamicCast<HughesWingetSolid>(&shell,shell.getMatterMaterial());Real radial_dt=o.pd_cfl*std::min(radial_spacing,o.pd_spacing)/mat.ReferenceSoundSpeed(),core_dt=o.cfl/std::sqrt(cb.linear_frequency_bound_squared);
     auto setPositions=[&](const Field&d,const Field&v){for(size_t j=0;j<cn;++j){cx[j]=cX[j]+d[j];cv[j]=v[j];}for(size_t j=0;j<sn;++j){sx[j]=sX[j]+d[cn+j];sv[j]=v[cn+j];}};
-    auto assembleShellAndConstraints=[&](Real compression){
-        sb.evaluateAll();sb.recomputeForces();
+    auto assembleShellAndConstraints=[&](Real compression, DeviceSolidKinematics geometry = {}, bool detailed = false){
+        if (!geometry.position && use_device_drive)
+            geometry = time.coupledKinematics(false);
+        sb.evaluateAll(geometry.position.subview(cn,sn));
+        sb.recomputeForces();
         core_port.clear();
         pd_port.clear();
         const Real top = R - compression / 2;
-        if (!share_surface_forces || !tie->applyWithPlaneContactOnFirstBody(contact, -top, top))
+        BondedDeviceForces device_forces;
+        BondedDeviceKinematics device_kinematics;
+        if (geometry.position)
         {
+            device_kinematics.first = {geometry.position.subview(cn,sn), geometry.velocity.subview(cn,sn), time.deviceMass()+cn};
+            device_kinematics.second = {geometry.position.subview(0,cn), geometry.velocity.subview(0,cn), nullptr};
+        }
+        const bool shared = share_surface_forces &&
+            tie->applyWithPlaneContactOnFirstBody(contact, -top, top, use_device_drive ? &device_forces : nullptr,
+                                                 geometry.position ? &device_kinematics : nullptr, detailed);
+        if (!shared)
+        {
+            if (use_device_drive)
+                throw std::logic_error("The coupled CUDA force backends could not share the shell state");
             tie->apply();
             contact.apply(-top, top);
         }
-        growth.applyContact();
-        for(size_t j=0;j<cn;++j){internal[j]=cb.internal[j];bulk_force[j]=core_port.external[j]-internal[j];}
-        for(size_t j=0;j<sn;++j){internal[cn+j]=-sb.internal[j]-sb.hourglass[j];bulk_force[cn+j]=sm[j]*pd_port.external[j]-internal[cn+j];}
+        for (size_t j=0;j<cn;++j)
+            internal[j]=cb.internal[j];
+        for (size_t j=0;j<sn;++j)
+            internal[cn+j]=-sb.internal[j]-sb.hourglass[j];
+
+        if (use_device_drive)
+        {
+            const auto shell = growth.applyContact(device_forces.first, time.deviceMass()+cn);
+            const DeviceCoupledMaterialForces material{
+                device_core_force_current ? cb.deviceInternalForce() : DeviceParticleVectorView{},
+                sb.deviceElasticAdjoint(),sb.deviceStabilizingForce()};
+            time.setCoupledDrive(device_forces.second,shell,pd_port.external,material,internal);
+            host_drive_current = false;
+        }
+        else
+        {
+            growth.applyContact();
+            for (size_t j=0;j<cn;++j)
+                bulk_force[j]=core_port.external[j]-internal[j];
+            for (size_t j=0;j<sn;++j)
+                bulk_force[cn+j]=sm[j]*pd_port.external[j]-internal[cn+j];
+            host_drive_current = true;
+        }
     };
-    auto forceAt=[&](const Field&d,const Field&v,Real compression,bool commit){setPositions(d,v);Field cd(d.begin(),d.begin()+cn);cb.evaluate(cd,o.core_rho,o.cfl);if(commit)cb.commit();else cb.discard();assembleShellAndConstraints(compression);};
+    auto forceAt=[&](const Field&d,const Field&v,Real compression,bool commit){
+        setPositions(d,v);
+        const auto geometry=use_device_drive ? time.coupledKinematics(commit) : DeviceSolidKinematics{};
+        Field cd(d.begin(),d.begin()+cn);
+        cb.evaluate(cd,o.core_rho,o.cfl,geometry.displacement.subview(0,cn));
+        device_core_force_current = use_device_drive;
+        if(commit)cb.commit();else cb.discard();
+        assembleShellAndConstraints(compression,geometry);
+    };
     auto recoverable=[&](){return sb.energy()+growth.stored+growth.contact_energy+tie->energy+contact.energy;};
     size_t stage=1,checks=0;Real stage_time=0,elapsed=0,Wp=0,Wcore=0,Wd=0,Walgorithmic=0,interface_switch_work=0,inner_hold_elapsed=0;bool onset=false,fully_failed=false,column_hold=false,inner_hold=false;
     auto compression=[&](Real t){Real a=column_hold?0:std::clamp((inner_hold?stage_time:t)/o.ramp_duration,Real(0),Real(1));return o.diameter*o.strain*(Real(stage-1)+.5*(1-std::cos(Pi*a)))/o.load_steps;};
     forceAt(time.displacement,time.velocity,0,false);Real U0=recoverable(),K0=time.kinetic();
     std::ofstream parameters(out/"parameters.json");parameters<<std::setprecision(17)<<"{\"core_backend\":\"SNSNI_RKPM_DPC_unchanged\",\"shell_backend\":\"layered_NOSB_PD_live_reconstruction\",\"shell_constitutive\":\"unchanged_finite_volume_Biot\",\"fracture_representation\":"<<std::quoted(fracture_contact_only?"strength_triggered_bond_deletion_contact_only":"strength_triggered_extrinsic_cohesive_true_bonds")<<",\"cohesive_integrator\":"<<std::quoted(fracture_contact_only?"disabled":"explicit_bulk_half_kicks_implicit_objective_surface_drift")<<",\"Gc_used_for_surface_softening\":"<<(fracture_contact_only?"false":"true")<<",\"mixed_mode_assumption\":"<<std::quoted(fracture_contact_only?"equal_strength":"equal_strength_and_Gc")<<",\"candidate_geometry\":\"through_thickness_radial_Voronoi_facets\",\"E_Pa\":"<<o.shell_E<<",\"nu\":"<<o.shell_nu<<",\"ft_Pa\":"<<o.fracture_stress<<",\"Gc_J_m2\":"<<o.fracture_energy<<",\"delta_f_m\":"<<growth.delta_f<<",\"core_particles\":"<<cn<<",\"shell_particles\":"<<sn<<",\"candidate_facets\":"<<bank.size()<<",\"shell_mass_kg\":"<<shell_mass<<",\"interface_K_Pa_per_m\":"<<Ktie<<",\"platen_and_crack_contact_K_Pa_per_m\":"<<Kcontact<<",\"execution_backend\":"<<std::quoted(execution.backendName())<<",\"crack_projection_backend\":"<<std::quoted(crack_projection?"cuda_fp64":"cpu_fp64")<<",\"crack_local_contact_backend\":"<<std::quoted(crack_projection&&crack_projection->assemblesLocalContact()?"cuda_fp64":"cpu_fp64")<<",\"crack_node_assembly_backend\":"<<std::quoted(crack_projection&&crack_projection->assemblesTracePullback()?"cuda_fp64":"cpu_fp64")<<",\"shell_derivatives_backend\":"<<std::quoted(sb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")<<",\"core_derivatives_backend\":"<<std::quoted(cb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")<<",\"shell_stress_force_backend\":"<<std::quoted(sb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")<<",\"shell_stabilization_backend\":"<<std::quoted(sb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")
       <<",\"shell_material_backend\":"<<std::quoted(sb.hasDeviceMaterial()?"cuda_fp64":"cpu_fp64")<<",\"core_internal_force_backend\":"<<std::quoted(cb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")<<",\"core_material_backend\":"<<std::quoted(cb.hasDeviceMaterial()?"cuda_fp64":"cpu_fp64")<<",\"trial_stress_gradient_backend\":"<<std::quoted(cb.hasDeviceMaterial()?"cuda_fp64":"cpu_fp64")<<",\"core_sampling_gradients_backend\":"<<std::quoted(cb.hasDeviceSamplingGradients()?"cuda_fp64":"cpu_fp64")<<",\"core_force_projection_backend\":"<<std::quoted(cb.hasDeviceDerivatives()?"cuda_fp64":"cpu_fp64")<<",\"solid_time_step_backend\":"<<std::quoted(time.hasDeviceTimeStep()?"cuda_fp64":"cpu_fp64")<<",\"bonded_interface_backend\":"<<std::quoted(execution.bondedInterfaceOnDevice()?"cuda_fp64":"cpu_fp64")<<",\"hybrid_loading\":"<<(hybrid_loading?"true":"false")
+      <<",\"coupled_force_step\":"<<std::quoted(use_device_drive?"cuda_device_drive":"host_force_exchange")
       <<",\"core_parameters_changed\":false,\"source_hash\":"<<std::quoted(CAPSULE_SOURCE_SHA256)<<"}\n";parameters.close();
     if(o.preflight_only)
     {
@@ -336,7 +394,14 @@ std::vector<std::pair<Real,std::string>>frame_index;
             if(a.reading)installColumnInterface();
         }
         a.fields(stage,stage_time,elapsed,checks,onset,fully_failed,Wp,Wcore,Wd,Walgorithmic,U0,K0,bulk_force,internal,cohesive_force);
-        recovery::integrator(a,time);recovery::solid(a,cb);recovery::contact(a,contact);a.fields(growth.insertion_defect,growth.max_insertion_fraction,growth.initial_dissipation,growth.insertion_events,growth.rejected_events,growth.stabilizer_transfer_loss,growth.unresolved_candidates);
+        recovery::integrator(a,time);
+        if (a.reading)
+        {
+            time.invalidateCoupledMotion();
+            host_drive_current = true;
+            device_core_force_current = false; // restored host material force is newer than the CUDA adjoint buffer
+        }
+        recovery::solid(a,cb);recovery::contact(a,contact);a.fields(growth.insertion_defect,growth.max_insertion_fraction,growth.initial_dissipation,growth.insertion_events,growth.rejected_events,growth.stabilizer_transfer_loss,growth.unresolved_candidates);
         StdVec<Vecd> inner_transfer,inner_velocity;
         if(si){inner_transfer=si->transferValues();inner_velocity=si->transferVelocities();}
         StdVec<Vecd> outer_transfer=so.transferValues(),outer_velocity=so.transferVelocities();
@@ -427,7 +492,7 @@ std::vector<std::pair<Real,std::string>>frame_index;
             so.restoreTransferValues(outer_transfer,outer_velocity);growth.restorePatches(order,history.imex[0].history,minus_transfer,plus_transfer,minus_velocity,plus_velocity,integrations);if(traction.size()!=growth.history.size())throw std::runtime_error("Checkpoint adhesion-traction dimensions");growth.last_traction=std::move(traction);if(candidate_flags.size()!=growth.active.size())throw std::runtime_error("Checkpoint candidate-state dimensions");for(size_t k=0;k<candidate_flags.size();++k){if(candidate_flags[k]>2||(candidate_flags[k]==1)!=(growth.active[k]==1))throw std::runtime_error("Checkpoint candidate-state mismatch");}growth.active=std::move(candidate_flags);sb.rebuild();refresh();}
         if(time.displacement.size()!=count||cb.history.size()!=cr.cells.size())throw std::runtime_error("Checkpoint geometry mismatch");
     };
-    auto save=[&](){progress.flush();eq.flush();events.flush();recovery::checkpoint.save(out,{"progress.csv","equilibria.csv","fracture_events.csv"},time.steps,transfer);};
+    auto save=[&](){syncBulkForce();time.copyCoupledAccelerationForCheckpoint();progress.flush();eq.flush();events.flush();recovery::checkpoint.save(out,{"progress.csv","equilibria.csv","fracture_events.csv"},time.steps,transfer);};
     StdVec<size_t> bounded_rows;
     Real platen_bound=std::numeric_limits<Real>::infinity();
     size_t bound_version=~size_t(0);
@@ -464,13 +529,13 @@ std::vector<std::pair<Real,std::string>>frame_index;
         return platen_bound;
     };
     if(!recovery::checkpoint.resume.empty()){progress.close();eq.close();events.close();recovery::checkpoint.load(out,{"progress.csv","equilibria.csv","fracture_events.csv"},transfer);progress.open(out/"progress.csv",std::ios::app);eq.open(out/"equilibria.csv",std::ios::app);events.open(out/"fracture_events.csv",std::ios::app);progress<<std::setprecision(17);eq<<std::setprecision(17);events<<std::setprecision(17);
-        Field expected=bulk_force;assembleShellAndConstraints(compression(stage_time));Real error=0,scale=0;for(size_t j=0;j<count;++j){error=std::max(error,(bulk_force[j]-expected[j]).norm());scale=std::max(scale,expected[j].norm());}if(error>1e-9*std::max(scale,Real(1e-20)))throw std::runtime_error("Resumed physical-fracture force does not reproduce committed checkpoint");
+        Field expected=bulk_force;assembleShellAndConstraints(compression(stage_time),{},true);syncBulkForce();Real error=0,scale=0;for(size_t j=0;j<count;++j){error=std::max(error,(bulk_force[j]-expected[j]).norm());scale=std::max(scale,expected[j].norm());}if(error>1e-9*std::max(scale,Real(1e-20)))throw std::runtime_error("Resumed physical-fracture force does not reproduce committed checkpoint");
         if(use_column_interface&&si){
             if(stage_time!=0||stage<2||checks!=0)
                 throw std::runtime_error("The fixed-column interface must be initialized at an accepted load point");
             const Real u=compression(stage_time),old_energy=tie->energy,old_dt=tie->stable_dt;
             const Real old_reaction=.5*(contact.upper+contact.lower);
-            installColumnInterface();assembleShellAndConstraints(u);
+            installColumnInterface();assembleShellAndConstraints(u);syncBulkForce();
             interface_switch_work=tie->energy-old_energy;
             const Real energy_fraction=std::abs(interface_switch_work)/std::max(std::abs(Wp),Real(1e-30));
             const Real reaction=.5*(contact.upper+contact.lower);
@@ -531,6 +596,7 @@ std::vector<std::pair<Real,std::string>>frame_index;
             }
             growth.transferContactTracesToAffine();
             assembleShellAndConstraints(u);
+            syncBulkForce();
             const auto&network=*growth.contact_network;
             Real corner_error=0,opening_error=0,new_weight_max=0;
             size_t i=0,surface_index=0,patch_index=0;
@@ -590,7 +656,8 @@ std::vector<std::pair<Real,std::string>>frame_index;
             const size_t old_commits=cb.commits;
             inner_affine_positions.assign(sx,sx+sn);
             installAffineInner(old_positions,{});
-            assembleShellAndConstraints(u);
+            assembleShellAndConstraints(u,{},true);
+            syncBulkForce();
             growth.statistics(growth.positions());
             Real position_change=0,force_change=0,force_scale=0,redistribution=0,new_residual=0;
             for(size_t i=0;i<old_positions.size();++i){
@@ -736,8 +803,9 @@ std::vector<std::pair<Real,std::string>>frame_index;
         const auto crack_pairs=growth.contact_network ?
             growth.contact_network->activePairs() : std::vector<std::array<size_t,3>>{};
         factor=std::exp(-.5*o.damping_rate*dt);
-        dampedK=time.predictForceStep(dt,factor,bulk_force,next_d,half_velocity);
-        const Field old_force=bulk_force;
+        dampedK=use_device_drive ? time.predictCoupledForceStep(dt,factor,next_d,half_velocity,true)
+                                 : time.predictForceStep(dt,factor,bulk_force,next_d,half_velocity);
+        const Field old_force=use_device_drive ? Field{} : bulk_force;
         Field update=next_d;
         const Real trial_u=compression(stage_time+dt);
         const Real missing=std::numeric_limits<Real>::quiet_NaN();
@@ -747,18 +815,23 @@ std::vector<std::pair<Real,std::string>>frame_index;
         for(size_t iteration=0;iteration<max_iterations;++iteration){
             setPositions(next_d,half_velocity);
             try{
-                cb.evaluate(Field(next_d.begin(),next_d.begin()+cn),o.core_rho,o.cfl);
-                assembleShellAndConstraints(trial_u);
+                const auto geometry=use_device_drive ? time.coupledKinematics(true) : DeviceSolidKinematics{};
+                cb.evaluate(Field(next_d.begin(),next_d.begin()+cn),o.core_rho,o.cfl,geometry.displacement.subview(0,cn));
+                device_core_force_current = use_device_drive;
+                assembleShellAndConstraints(trial_u,geometry);
             }catch(const std::runtime_error&){
                 reason="trial_state_rejected";
                 break;
             }
             Real error_squared=0,increment_squared=0;
-            for(size_t j=0;j<count;++j){
-                update[j]=time.displacement[j]+dt*(half_velocity[j]+.25*dt*((bulk_force[j]-old_force[j])/mass[j]));
-                error_squared+=(update[j]-next_d[j]).squaredNorm();
-                increment_squared+=(next_d[j]-time.displacement[j]).squaredNorm();
-            }
+            if (use_device_drive)
+                std::tie(error_squared,increment_squared)=time.correctCoupledTrial(dt,update);
+            else
+                for(size_t j=0;j<count;++j){
+                    update[j]=time.displacement[j]+dt*(half_velocity[j]+.25*dt*((bulk_force[j]-old_force[j])/mass[j]));
+                    error_squared+=(update[j]-next_d[j]).squaredNorm();
+                    increment_squared+=(next_d[j]-time.displacement[j]).squaredNorm();
+                }
             constexpr Real relative_tolerance=1e-4;
             const Real absolute_tolerance=32*std::numeric_limits<Real>::epsilon()*o.diameter;
             if(error_squared<=relative_tolerance*relative_tolerance*increment_squared+
@@ -795,6 +868,8 @@ std::vector<std::pair<Real,std::string>>frame_index;
             }
             cb.discard();
             next_d.swap(update);
+            if (use_device_drive)
+                time.advanceCoupledTrial();
         }
         if(cb.pending_commit)cb.discard();
         forceAt(time.displacement,time.velocity,old_u,false);
@@ -929,7 +1004,8 @@ std::vector<std::pair<Real,std::string>>frame_index;
             if(!std::isfinite(dt)||(dt<1e-15&&!landing_on_hold)||time.steps>=o.max_steps)
                 throw std::runtime_error("Coupled physical time/count bound exhausted");
             factor=std::exp(-.5*o.damping_rate*dt);
-            dampedK=time.predictForceStep(dt,factor,bulk_force,next_d,vhalf);
+            dampedK=use_device_drive ? time.predictCoupledForceStep(dt,factor,next_d,vhalf)
+                                     : time.predictForceStep(dt,factor,bulk_force,next_d,vhalf);
             if(!fracture_contact_only){
                 for(size_t j=0;j<sn;++j)qfree[j]=sX[j]+next_d[cn+j];
                 try{
@@ -956,7 +1032,8 @@ std::vector<std::pair<Real,std::string>>frame_index;
         }
         time.displacement=next_d;
         if(!used_large_step)forceAt(time.displacement,vhalf,compression(stage_time+dt),true);
-        const Real undampedK=time.finishForceStep(dt,factor,vhalf,bulk_force,cohesive_force,cn);
+        const Real undampedK=use_device_drive ? time.finishCoupledForceStep(dt,factor)
+                                              : time.finishForceStep(dt,factor,vhalf,bulk_force,cohesive_force,cn);
         Wd+=undampedK-time.kinetic();++time.steps;setPositions(time.displacement,time.velocity);Real u=compression(stage_time+dt),mean=.5*(contact.upper+contact.lower);Wp+=.5*(oldReaction+mean)*(u-old_u);for(size_t j=0;j<cn;++j)Wcore+=.5*(old_internal[j]+internal[j]).dot(time.displacement[j]-old_d[j]);if(inner_hold)inner_hold_elapsed+=dt;else stage_time+=dt;elapsed+=dt;
         if(hybrid_ramp && dt==ramp_remaining){
             stage_time=o.ramp_duration;
@@ -976,7 +1053,7 @@ std::vector<std::pair<Real,std::string>>frame_index;
         }
         if(!fracture_contact_only||time.steps%200==0||(!fully_failed&&onset))growth.statistics(growth.positions());
         if(!fully_failed&&growth.failed_quadrature){fully_failed=true;events<<(fracture_contact_only?"first_contact_only_crack":"first_full_cohesive_failure")<<','<<time.steps<<','<<stage<<','<<u/o.diameter<<",0,0,"<<sr.physical_broken_bonds<<','<<growth.max_gap<<'\n';events.flush();snapshot("first_full_failure",u);}
-        if(time.steps%200==0){Real residual=0,minc=1,mins=1,newK=time.kinetic();for(size_t j=0;j<count;++j){Vecd f=bulk_force[j];if(j>=cn)f+=cohesive_force[j-cn];residual+=f.squaredNorm();}residual=std::sqrt(residual)/std::max(mean,Real(1e-20));for(const auto&F:cb.F)minc=std::min(minc,F.determinant());for(size_t j=0;j<sn;++j)mins=std::min(mins,sF[j].determinant());Real imbalance=std::abs(contact.upper-contact.lower)/std::max(mean,Real(1e-20)),kr=newK/std::max(mean*u,Real(1e-30));Real budget=Wp+interface_switch_work-Wcore-(recoverable()-U0)-(growth.dissipated-growth.initial_dissipation)-(newK-K0)-Wd-Walgorithmic-growth.stabilizer_transfer_loss+growth.insertion_defect;
+        if(time.steps%200==0){syncBulkForce();Real residual=0,minc=1,mins=1,newK=time.kinetic();for(size_t j=0;j<count;++j){Vecd f=bulk_force[j];if(j>=cn)f+=cohesive_force[j-cn];residual+=f.squaredNorm();}residual=std::sqrt(residual)/std::max(mean,Real(1e-20));for(const auto&F:cb.F)minc=std::min(minc,F.determinant());for(size_t j=0;j<sn;++j)mins=std::min(mins,sF[j].determinant());Real imbalance=std::abs(contact.upper-contact.lower)/std::max(mean,Real(1e-20)),kr=newK/std::max(mean*u,Real(1e-30));Real budget=Wp+interface_switch_work-Wcore-(recoverable()-U0)-(growth.dissipated-growth.initial_dissipation)-(newK-K0)-Wd-Walgorithmic-growth.stabilizer_transfer_loss+growth.insertion_defect;
             auto row=[&](std::ostream&f){f<<time.steps<<','<<stage<<','<<elapsed<<','<<u/o.diameter<<','<<u<<','<<dt<<','<<contact.upper<<','<<contact.lower<<','<<residual<<','<<imbalance<<','<<kr<<','<<minc<<','<<mins<<','<<sr.physical_broken_bonds<<','<<growth.insertion_events<<','<<growth.failed_quadrature<<','<<growth.max_gap<<','<<growth.stored<<','<<growth.dissipated-growth.initial_dissipation<<','<<sb.energy()<<','<<tie->energy<<','<<contact.energy<<','<<growth.contact_energy<<','<<std::max(contact.max_penetration,growth.max_penetration)<<','<<Wp<<','<<Wcore<<','<<Wd<<','<<Walgorithmic<<','<<growth.stabilizer_transfer_loss<<','<<growth.insertion_defect<<','<<budget<<'\n';f.flush();};row(progress);if(time.steps%1000==0)std::cout<<"PROGRESS step="<<time.steps<<" stage="<<stage<<" strain="<<u/o.diameter<<" force="<<mean<<" residual="<<residual<<" cracks="<<growth.insertion_events<<" gap="<<growth.max_gap<<" dt="<<dt<<std::endl;
             const bool use_reaction_window=reaction_settling_window_s>0&&!column_hold&&!inner_hold;
             Real reaction_span=std::numeric_limits<Real>::infinity();

@@ -12,6 +12,29 @@ struct ParticleVector3
     double component[3];
 };
 
+// Non-owning view into an execution backend. The producing operation owns
+// the buffer, and its next evaluation or reconfiguration may replace it.
+struct DeviceParticleVectorView
+{
+    const ParticleVector3 *data = nullptr;
+    std::size_t count = 0;
+    explicit operator bool() const noexcept { return data != nullptr; }
+
+    DeviceParticleVectorView subview(std::size_t begin, std::size_t size) const
+    {
+        if (!data)
+            return {};
+        if (begin > count || size > count - begin)
+            throw std::out_of_range("Device particle range is outside its producer");
+        return {data + begin, size};
+    }
+};
+
+struct DeviceSolidKinematics
+{
+    DeviceParticleVectorView displacement, position, velocity;
+};
+
 struct ShapeHessian3
 {
     double derivative[3][3];
@@ -72,6 +95,11 @@ class SpatialDerivativeBatch
     virtual void evaluate(const std::vector<ParticleVector3> &particles,
                           std::vector<SpatialDerivatives3> &result,
                           WeightedDifferenceResult *weighted_difference = nullptr) = 0;
+    virtual void evaluateOnDevice(DeviceParticleVectorView, std::vector<SpatialDerivatives3> &,
+                                  WeightedDifferenceResult * = nullptr)
+    {
+        throw std::logic_error("This spatial backend does not consume device kinematics");
+    }
     // Each scalar channel uses the same first derivative stencil. Inputs are
     // indexed by particle then channel, and outputs by row then channel.
     // Origins and differences are retained; no identity term is added.
@@ -86,6 +114,9 @@ class SpatialDerivativeBatch
     virtual void assembleSmoothedAdjoint(const std::vector<SmoothedStressField> &stress,
                                          std::vector<SpatialDerivatives3> &coefficients,
                                          std::vector<ParticleVector3> &result) = 0;
+
+    virtual DeviceParticleVectorView assembledAdjoint() const noexcept { return {}; }
+    virtual DeviceParticleVectorView weightedDifferenceForces() const noexcept { return {}; }
 
     virtual bool supportsResidentBiot() const noexcept { return false; }
     // Evaluates Biot from the latest deformation gradients. A false result

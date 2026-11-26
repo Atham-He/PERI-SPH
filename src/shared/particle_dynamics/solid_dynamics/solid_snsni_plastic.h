@@ -63,12 +63,16 @@ class SnsniPlasticSolid
     bool hasDeviceSamplingGradients() const noexcept { return sampling_derivatives_ != nullptr; }
     bool hasDeviceDerivatives() const noexcept { return derivatives_ != nullptr; }
     bool hasDeviceMaterial() const noexcept { return material_points_ != nullptr; }
-    void evaluate(const Field&d,Real rho0,Real cfl)
+    peridynamics::DeviceParticleVectorView deviceInternalForce() const noexcept
+    {
+        return derivatives_ ? derivatives_->assembledAdjoint() : peridynamics::DeviceParticleVectorView{};
+    }
+    void evaluate(const Field&d,Real rho0,Real cfl, peridynamics::DeviceParticleVectorView device_displacement = {})
     {
         if(pending_commit)throw std::logic_error("Commit or explicitly discard pending DPC history before the next evaluation");
         const size_t n=history.size();
         if (derivatives_)
-            evaluateDeviceDerivatives(d);
+            evaluateDeviceDerivatives(d, device_displacement);
         if (material_points_)
             point_input_.resize(n);
         if (sampling_derivatives_)
@@ -403,12 +407,17 @@ class SnsniPlasticSolid
         derivatives_->configure(map);
     }
 
-    void evaluateDeviceDerivatives(const Field &displacement)
+    void evaluateDeviceDerivatives(const Field &displacement, peridynamics::DeviceParticleVectorView device_displacement)
     {
-        device_field_.resize(displacement.size());
-        for (size_t i = 0; i < displacement.size(); ++i)
-            device_field_[i] = {{displacement[i][0], displacement[i][1], displacement[i][2]}};
-        derivatives_->evaluate(device_field_, device_derivatives_);
+        if (device_displacement)
+            derivatives_->evaluateOnDevice(device_displacement, device_derivatives_);
+        else
+        {
+            device_field_.resize(displacement.size());
+            for (size_t i = 0; i < displacement.size(); ++i)
+                device_field_[i] = {{displacement[i][0], displacement[i][1], displacement[i][2]}};
+            derivatives_->evaluate(device_field_, device_derivatives_);
+        }
         if (device_derivatives_.size() != history.size())
             throw std::logic_error("Spatial derivative backend returned an incomplete S-NSNI cell field");
     }
@@ -438,6 +447,123 @@ class SnsniCentralDifference
 
     bool hasDeviceTimeStep() const noexcept { return device_time_step_!=nullptr; }
 
+    const double *deviceMass() const noexcept
+    {
+        return device_time_step_ ? device_time_step_->deviceMass() : nullptr;
+    }
+
+    void setCoupledDrive(peridynamics::DeviceParticleVectorView core, peridynamics::DeviceParticleVectorView shell,
+                         const Vecd *host_shell_acceleration, peridynamics::DeviceCoupledMaterialForces material,
+                         const Field &internal)
+    {
+        coupled_internal_.clear();
+        if (!material)
+        {
+            coupled_internal_.resize(internal.size());
+            for (size_t j=0;j<internal.size();++j)
+                coupled_internal_[j]=pack(internal[j]);
+        }
+
+        coupled_host_shell_.clear();
+        if (!shell)
+        {
+            if (!host_shell_acceleration || core.count>mass.size())
+                throw std::invalid_argument("Coupled shell forces are missing");
+            const size_t shell_count=mass.size()-core.count;
+            coupled_host_shell_.resize(shell_count);
+            for (size_t j=0;j<shell_count;++j)
+                coupled_host_shell_[j]=pack(host_shell_acceleration[j]);
+        }
+        device_time_step_->setCoupledDrive(core,Input::Force,shell,Input::Acceleration,
+                                           coupled_host_shell_,material,coupled_internal_);
+    }
+
+    void readCoupledDrive(Field &drive)
+    {
+        device_time_step_->readCoupledDrive(coupled_host_drive_);
+        drive.resize(coupled_host_drive_.size());
+        for (size_t j=0;j<drive.size();++j)
+            drive[j]=unpack(coupled_host_drive_[j]);
+    }
+
+    void configureCoupledReference(const Field &reference)
+    {
+        std::vector<peridynamics::ParticleVector3> positions(reference.size());
+        for (size_t j=0;j<reference.size();++j)
+            positions[j]=pack(reference[j]);
+        device_time_step_->configureCoupledReference(positions);
+    }
+
+    peridynamics::DeviceSolidKinematics coupledKinematics(bool trial)
+    {
+        return coupled_motion_current_ ? device_time_step_->coupledKinematics(trial)
+                                       : peridynamics::DeviceSolidKinematics{};
+    }
+
+    void invalidateCoupledMotion()
+    {
+        coupled_motion_current_=false;
+        acceleration_needs_copy_=false;
+    }
+
+    void copyCoupledAccelerationForCheckpoint()
+    {
+        if (!acceleration_needs_copy_)
+            return;
+        device_time_step_->readCoupledAcceleration(coupled_host_acceleration_);
+        for (size_t j=0;j<mass.size();++j)
+            acceleration[j]=unpack(coupled_host_acceleration_[j]);
+        acceleration_needs_copy_=false;
+    }
+
+    Real predictCoupledForceStep(Real dt, Real factor, Field &next_displacement, Field &half_velocity,
+                                 bool implicit=false)
+    {
+        if (!coupled_motion_current_)
+        {
+            coupled_motion_.resize(mass.size());
+            for (size_t j=0;j<mass.size();++j)
+                coupled_motion_[j]={pack(displacement[j]),pack(velocity[j])};
+            device_time_step_->initializeCoupledMotion(coupled_motion_);
+            coupled_motion_current_=true;
+        }
+        device_time_step_->predictCoupled(dt,factor,implicit,drift_output_);
+        return collectDrift(next_displacement,half_velocity);
+    }
+
+    std::pair<Real,Real> correctCoupledTrial(Real dt, Field &update)
+    {
+        device_time_step_->correctCoupledTrial(dt,coupled_correction_);
+        if (coupled_correction_.size()!=mass.size())
+            throw std::logic_error("Solid time stepping backend returned an incomplete correction");
+        update.resize(mass.size());
+        Real error=0,increment=0;
+        for (size_t j=0;j<mass.size();++j)
+        {
+            update[j]=unpack(coupled_correction_[j].displacement);
+            error+=coupled_correction_[j].error_squared;
+            increment+=coupled_correction_[j].increment_squared;
+        }
+        return {error,increment};
+    }
+
+    void advanceCoupledTrial() { device_time_step_->advanceCoupledTrial(); }
+
+    Real finishCoupledForceStep(Real dt, Real factor)
+    {
+        device_time_step_->finishCoupled(dt,factor,coupled_finish_);
+        if (coupled_finish_.size()!=mass.size())
+            throw std::logic_error("Solid time stepping backend returned an incomplete coupled finish");
+        Real undamped_kinetic=0;
+        for (size_t j=0;j<mass.size();++j)
+        {
+            velocity[j]=unpack(coupled_finish_[j].velocity);
+            undamped_kinetic+=coupled_finish_[j].undamped_kinetic;
+        }
+        acceleration_needs_copy_=true;
+        return undamped_kinetic;
+    }
+
     Real kinetic() const
     {
         Real energy=0;
@@ -449,6 +575,7 @@ class SnsniCentralDifference
     template<class Evaluate>
     void step(Real dt, Real damping, Evaluate &&evaluate)
     {
+        invalidateCoupledMotion();
         const Real factor=std::exp(-.5*damping*dt);
         if (device_time_step_)
             predictOnDevice(dt,factor,acceleration,peridynamics::SolidKickInput::Acceleration,displacement,velocity);
@@ -496,6 +623,7 @@ class SnsniCentralDifference
     Real finishForceStep(Real dt, Real factor, const Field &half_velocity, const Field &force,
                          const Field &additional_force, size_t additional_start)
     {
+        invalidateCoupledMotion();
         if (additional_start>mass.size() || additional_force.size()>mass.size()-additional_start)
             throw std::invalid_argument("Additional solid force lies outside the particle range");
         if (device_time_step_)
@@ -520,6 +648,12 @@ class SnsniCentralDifference
     std::vector<peridynamics::SolidDriftResult> drift_output_;
     std::vector<peridynamics::SolidFinishInput> finish_input_;
     std::vector<peridynamics::SolidFinishResult> finish_output_;
+    std::vector<peridynamics::SolidMotion> coupled_motion_;
+    std::vector<peridynamics::ParticleVector3> coupled_internal_, coupled_host_shell_, coupled_host_drive_;
+    std::vector<peridynamics::SolidImplicitCorrection> coupled_correction_;
+    std::vector<peridynamics::SolidCoupledFinishResult> coupled_finish_;
+    std::vector<peridynamics::ParticleVector3> coupled_host_acceleration_;
+    bool coupled_motion_current_=false, acceleration_needs_copy_=false;
 
     static peridynamics::ParticleVector3 pack(const Vecd &v) { return {{v[0],v[1],v[2]}}; }
     static Vecd unpack(const peridynamics::ParticleVector3 &v)
@@ -544,6 +678,12 @@ class SnsniCentralDifference
         for (size_t j=0;j<count;++j)
             drift_input_[j]={pack(displacement[j]),pack(velocity[j]),pack(drive[j])};
         device_time_step_->predict(drift_input_,dt,factor,mode,drift_output_);
+        return collectDrift(next_displacement,half_velocity);
+    }
+
+    Real collectDrift(Field &next_displacement, Field &half_velocity)
+    {
+        const size_t count=mass.size();
         if (drift_output_.size()!=count)
             throw std::logic_error("Solid time stepping backend returned an incomplete drift");
         next_displacement.resize(count);
@@ -568,6 +708,12 @@ class SnsniCentralDifference
         for (size_t j=0;j<count;++j)
             finish_input_[j]={pack(half_velocity[j]),pack(force[j]),pack(additionalForce(additional_force,additional_start,j))};
         device_time_step_->finish(finish_input_,dt,factor,mode,finish_output_);
+        return collectFinish();
+    }
+
+    Real collectFinish()
+    {
+        const size_t count=mass.size();
         if (finish_output_.size()!=count)
             throw std::logic_error("Solid time stepping backend returned an incomplete final kick");
         Real undamped_kinetic=0;

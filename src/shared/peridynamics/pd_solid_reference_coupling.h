@@ -235,6 +235,8 @@ inline Vecd vector(const double *values)
 
 } // namespace surface_execution_detail
 
+class SolidSurfacePlaneContact;
+
 /** One reference interface energy:U=sum(k_i|W_a*x_a-W_b*x_b|^2/2).
  * Both bodies receive the transpose pullback of the SAME physical force.
  * No fluid pressure, velocity overwrite or duplicate repulsion is added. */
@@ -243,6 +245,7 @@ class BondedSolidInterface
     std::unique_ptr<BondedInterfaceBatch> backend_;
     std::vector<BondedInterfaceNode> nodes_a_, nodes_b_;
     std::vector<BondedInterfacePoint> points_;
+    CoupledSurfaceDiagnostics compact_diagnostics_;
 
     void finishAudit(const Vecd &sum, const Vecd &torque, Real power, Real force_scale, Real power_scale)
     {
@@ -254,18 +257,24 @@ class BondedSolidInterface
         worst_power = std::max(worst_power, power_residual);
     }
 
-    void applyBackend()
+    void packBackendState()
     {
-        using namespace surface_execution_detail;
-        packState(a.port, nodes_a_);
-        packState(b.port, nodes_b_);
-        backend_->apply(nodes_a_, nodes_b_, points_);
+        surface_execution_detail::packState(a.port, nodes_a_);
+        surface_execution_detail::packState(b.port, nodes_b_);
+    }
+
+    void collectBackendResult(bool collect_forces = true)
+    {
+        using surface_execution_detail::vector;
         if (points_.size() != stiffness.size())
             throw std::logic_error("Bonded interface backend returned the wrong point count");
-        for (size_t i = 0; i < nodes_a_.size(); ++i)
-            a.port.external[i] = vector(nodes_a_[i].external);
-        for (size_t i = 0; i < nodes_b_.size(); ++i)
-            b.port.external[i] = vector(nodes_b_[i].external);
+        if (collect_forces)
+        {
+            for (size_t i = 0; i < nodes_a_.size(); ++i)
+                a.port.external[i] = vector(nodes_a_[i].external);
+            for (size_t i = 0; i < nodes_b_.size(); ++i)
+                b.port.external[i] = vector(nodes_b_[i].external);
+        }
 
         energy = max_gap = 0;
         Vecd sum = Vecd::Zero(), torque = Vecd::Zero();
@@ -285,6 +294,14 @@ class BondedSolidInterface
             power_scale += point.power_scale;
         }
         finishAudit(sum, torque, power, force_scale, power_scale);
+    }
+
+    void updateMapping()
+    {
+        a.ensureCurrent();
+        b.ensureCurrent();
+        if (a_mapping_version != a.mappingVersion() || b_mapping_version != b.mappingVersion())
+            refreshTimeStepBound();
     }
 
   public:
@@ -324,12 +341,21 @@ class BondedSolidInterface
         a_mapping_version = a.mappingVersion();
         b_mapping_version = b.mappingVersion();
     }
+    // Combine independent surface loads for an already initialized force
+    // assembly. Call the separate operators when the backends cannot share data.
+    bool applyWithPlaneContactOnFirstBody(SolidSurfacePlaneContact &plane, Real bottom, Real top,
+                                          BondedDeviceForces *device_forces = nullptr,
+                                          const BondedDeviceKinematics *device_motion = nullptr,
+                                          bool detailed = true);
+
     void apply()
     {
-        a.ensureCurrent();b.ensureCurrent();if(a_mapping_version!=a.mappingVersion()||b_mapping_version!=b.mappingVersion())refreshTimeStepBound();
+        updateMapping();
         if (backend_)
         {
-            applyBackend();
+            packBackendState();
+            backend_->apply(nodes_a_, nodes_b_, points_);
+            collectBackendResult();
             return;
         }
         energy=max_gap=0;Vecd sum=Vecd::Zero(),torque=Vecd::Zero();Real power=0,fs=0,ps=0;
@@ -363,6 +389,8 @@ class BondedSolidInterface
  * The same surface interpolation and transpose force map serve all components. */
 class SolidSurfacePlaneContact
 {
+    friend class BondedSolidInterface;
+
     std::unique_ptr<SurfacePlaneContactBatch> backend_;
     std::vector<TraceForceNode> nodes_;
     std::vector<SurfacePlaneContactPoint> points_;
@@ -383,10 +411,16 @@ class SolidSurfacePlaneContact
             }
         }
         backend_->apply(bottom, top, nodes_, points_, friction>0?&friction_transfer_:nullptr);
-        if (points_.size() != stiffness.size())
-            throw std::logic_error("Plane contact backend returned the wrong point count");
         for (size_t i = 0; i < nodes_.size(); ++i)
             surface.port.external[i] = vector(nodes_[i].external);
+        collectBackendPoints(commit_history);
+    }
+
+    void collectBackendPoints(bool commit_history)
+    {
+        using surface_execution_detail::vector;
+        if (points_.size() != stiffness.size())
+            throw std::logic_error("Plane contact backend returned the wrong point count");
 
         Vecd net_force=Vecd::Zero(), torque=Vecd::Zero();
         Real power=0, force_scale=0, power_scale=0;
@@ -442,6 +476,37 @@ class SolidSurfacePlaneContact
         worst_power=std::max(worst_power,std::abs(power)/std::max(power_scale,Real(1e-30)));
     }
 
+    void collectCompactDiagnostics(const CoupledSurfaceDiagnostics &diagnostics)
+    {
+        if (diagnostics.plate_rows.size() != stiffness.size())
+            throw std::logic_error("Plane contact diagnostics do not match the trace");
+        const auto &total = diagnostics.plane_totals;
+        upper=total.upper; lower=total.lower; energy=total.energy; max_penetration=total.penetration;
+        for (size_t j=0;j<diagnostics.plate_rows.size();++j)
+        {
+            position[j]=Vecd(0,0,diagnostics.plate_rows[j].z);
+            force[j]=Vecd(0,0,diagnostics.plate_rows[j].force_z);
+        }
+        using surface_execution_detail::vector;
+        const Real scale=std::max(total.force_scale,Real(1e-30));
+        worst_force=std::max(worst_force,vector(total.sum).norm()/scale);
+        worst_torque=std::max(worst_torque,vector(total.torque).norm()/std::max(length_scale*total.force_scale,Real(1e-30)));
+        worst_power=std::max(worst_power,std::abs(total.power)/std::max(total.power_scale,Real(1e-30)));
+    }
+
+    void updateMapping()
+    {
+        surface.ensureCurrent();
+        if (surface_mapping_version != surface.mappingVersion())
+            refreshTimeStepBound();
+    }
+
+    void clearDiagnostics()
+    {
+        upper=lower=energy=max_penetration=tangent_energy=max_cone_ratio=tangential_force_sum=0;
+        active_friction_points=sliding_points=0;
+    }
+
   public:
     ReferenceSolidSurface &surface;
     StdVec<Real> areas,stiffness;
@@ -493,9 +558,8 @@ class SolidSurfacePlaneContact
     }
     void apply(Real bottom,Real top,bool commit_history=false)
     {
-        surface.ensureCurrent();if(surface_mapping_version!=surface.mappingVersion())refreshTimeStepBound();
-        upper=lower=energy=max_penetration=tangent_energy=max_cone_ratio=tangential_force_sum=0;
-        active_friction_points=sliding_points=0;
+        updateMapping();
+        clearDiagnostics();
         if (onDevice())
         {
             applyBackend(bottom, top, commit_history);
@@ -545,6 +609,40 @@ class SolidSurfacePlaneContact
         worst_power=std::max(worst_power,std::abs(perr)/std::max(ps,Real(1e-30)));
     }
 };
+
+inline bool BondedSolidInterface::applyWithPlaneContactOnFirstBody(
+    SolidSurfacePlaneContact &plane, Real bottom, Real top, BondedDeviceForces *device_forces,
+    const BondedDeviceKinematics *device_motion, bool detailed)
+{
+    if (!backend_ || !plane.backend_ || &a.port != &plane.surface.port || plane.friction != 0)
+        return false;
+
+    updateMapping();
+    plane.updateMapping();
+    if (!device_motion || !device_forces)
+        packBackendState();
+    // The compact result is for force assemblies that only consume device
+    // loads, reductions and the frictionless plate's normal traces.
+    auto *compact = device_forces && !detailed ? &compact_diagnostics_ : nullptr;
+    if (!backend_->applyWithPlaneContact(*plane.backend_, bottom, top, nodes_a_, nodes_b_,
+                                        points_, plane.points_, device_forces, device_motion, compact))
+        return false;
+    plane.clearDiagnostics();
+    if (compact)
+    {
+        using surface_execution_detail::vector;
+        const auto &total=compact->interface_totals;
+        energy=total.energy; max_gap=total.gap;
+        finishAudit(vector(total.sum),vector(total.torque),total.power,total.force_scale,total.power_scale);
+        plane.collectCompactDiagnostics(*compact);
+    }
+    else
+    {
+        collectBackendResult(device_forces == nullptr);
+        plane.collectBackendPoints(false);
+    }
+    return true;
+}
 
 } // namespace SPH::peridynamics
 #endif

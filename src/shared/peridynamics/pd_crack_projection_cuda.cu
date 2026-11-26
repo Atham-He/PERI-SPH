@@ -144,20 +144,13 @@ __global__ void collectTraceLoads(const CrackLocalContactInput *input,
     output[trace] = load;
 }
 
-__global__ void pullBackCrackTraces(const std::size_t *node_offsets,
-                                    const ParticleTraceContribution *entries,
-                                    const TraceLoad *traces,
-                                    const CrackTraceParticleState *particles, bool acceleration_port,
-                                    std::size_t count, CrackTraceParticleResult *output)
+__device__ CrackTraceParticleResult crackTraceForce(
+    const std::size_t *node_offsets, const ParticleTraceContribution *entries, const TraceLoad *traces,
+    std::size_t i, const double *external, double mass, bool acceleration_port)
 {
-    const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= count)
-        return;
-
-    const auto &particle = particles[i];
-    const double divisor = acceleration_port ? particle.mass : 1.0;
-    const double sqrt_mass = sqrt(particle.mass);
-    CrackTraceParticleResult state{{particle.external[0], particle.external[1], particle.external[2]}, {}};
+    const double divisor = acceleration_port ? mass : 1.0;
+    const double sqrt_mass = sqrt(mass);
+    CrackTraceParticleResult state{{external[0], external[1], external[2]}, {}};
     for (auto k = node_offsets[i]; k < node_offsets[i + 1]; ++k)
     {
         const auto entry = entries[k];
@@ -168,7 +161,47 @@ __global__ void pullBackCrackTraces(const std::size_t *node_offsets,
             state.rate[d] += (fabs(entry.weight) * trace.rate[d]) / sqrt_mass;
         }
     }
-    output[i] = state;
+    return state;
+}
+
+__global__ void pullBackCrackTraces(const std::size_t *node_offsets,
+                                    const ParticleTraceContribution *entries,
+                                    const TraceLoad *traces,
+                                    const CrackTraceParticleState *particles, bool acceleration_port,
+                                    std::size_t count, CrackTraceParticleResult *output)
+{
+    const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < count)
+        output[i] = crackTraceForce(node_offsets, entries, traces, i, particles[i].external,
+                                   particles[i].mass, acceleration_port);
+}
+
+__global__ void pullBackDeviceCrackTraces(const std::size_t *node_offsets,
+                                          const ParticleTraceContribution *entries,
+                                          const TraceLoad *traces, const double *mass,
+                                          DeviceParticleVectorView base, bool acceleration_port,
+                                          ParticleVector3 *output, double *block_rates)
+{
+    extern __shared__ double local_rates[];
+    const auto i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    double rate = 0;
+    if (i < base.count)
+    {
+        const auto state = crackTraceForce(node_offsets, entries, traces, i,
+                                           base.data[i].component, mass[i], acceleration_port);
+        output[i] = {{state.external[0], state.external[1], state.external[2]}};
+        rate = fmax(state.rate[0], fmax(state.rate[1], state.rate[2]));
+    }
+    local_rates[threadIdx.x] = rate;
+    __syncthreads();
+    for (unsigned stride = blockDim.x / 2; stride != 0; stride /= 2)
+    {
+        if (threadIdx.x < stride)
+            local_rates[threadIdx.x] = fmax(local_rates[threadIdx.x], local_rates[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0)
+        block_rates[blockIdx.x] = local_rates[0];
 }
 
 class CudaCrackProjection final : public CrackProjectionBatch
@@ -292,18 +325,9 @@ class CudaCrackProjection final : public CrackProjectionBatch
             }
             return;
         }
-        stageContactAddress(address);
         if (particles.empty())
             return;
-
-        trace_loads_.reserve(trace_count_);
-        if (trace_count_ > 0)
-        {
-            collectTraceLoads<<<grid(trace_count_), threads>>>(contact_input_.get(), contact_output_.get(),
-                trace_use_device_offsets_.get(), trace_use_device_entries_.get(), trace_count_, trace_loads_.get());
-            check(cudaGetLastError(), "collect crack trace loads");
-        }
-
+        collectDeviceTraceLoads(address);
         upload(trace_particle_input_, particles, "crack trace particle state");
         trace_particle_output_.reserve(particle_count_);
         pullBackCrackTraces<<<grid(particle_count_), threads>>>(node_trace_offsets_.get(), node_trace_entries_.get(),
@@ -312,7 +336,52 @@ class CudaCrackProjection final : public CrackProjectionBatch
         download(output, trace_particle_output_, "crack trace particle forces and rates");
     }
 
+    DeviceParticleVectorView assembleContactTraceOnDevice(
+        std::uint64_t generation, const std::vector<CrackTraceAddress> &address,
+        DeviceParticleVectorView base, const double *mass, bool acceleration_port, double &max_rate) override
+    {
+        if (generation == 0 || generation != contactTraceGeneration() || !local_contact_valid_ ||
+            !base || !mass || base.count != particle_count_ || address.size() != local_contact_count_)
+            throw std::invalid_argument("Device crack forces do not match the active trace generation");
+        max_rate = 0;
+        if (address.empty())
+            return base;
+
+        collectDeviceTraceLoads(address);
+        trace_device_forces_.reserve(base.count);
+        const auto blocks = grid(base.count);
+        trace_block_rates_.reserve(blocks);
+        pullBackDeviceCrackTraces<<<blocks, threads, threads * sizeof(double)>>>(
+            node_trace_offsets_.get(), node_trace_entries_.get(), trace_loads_.get(), mass,
+            base, acceleration_port, trace_device_forces_.get(), trace_block_rates_.get());
+        check(cudaGetLastError(), "pull back crack forces into device state");
+        host_block_rates_.resize(blocks);
+        download(host_block_rates_, trace_block_rates_, "crack contact stability reduction");
+        max_rate = *std::max_element(host_block_rates_.begin(), host_block_rates_.end());
+        return {trace_device_forces_.get(), base.count};
+    }
+
+    void copyDeviceForces(DeviceParticleVectorView force, std::vector<ParticleVector3> &output) override
+    {
+        output.resize(force.count);
+        if (force.count)
+            check(cudaMemcpy(output.data(), force.data, force.count * sizeof(ParticleVector3), cudaMemcpyDeviceToHost),
+                  "read device forces for host crack fallback");
+    }
+
   private:
+    void collectDeviceTraceLoads(const std::vector<CrackTraceAddress> &address)
+    {
+        stageContactAddress(address);
+        trace_loads_.reserve(trace_count_);
+        if (trace_count_ > 0)
+        {
+            collectTraceLoads<<<grid(trace_count_), threads>>>(contact_input_.get(), contact_output_.get(),
+                trace_use_device_offsets_.get(), trace_use_device_entries_.get(), trace_count_, trace_loads_.get());
+            check(cudaGetLastError(), "collect crack trace loads");
+        }
+    }
+
     void stageProjectionPairs(std::size_t master_count, std::size_t point_count,
                               const std::vector<CrackProjectionPair> &pairs)
     {
@@ -397,6 +466,9 @@ class CudaCrackProjection final : public CrackProjectionBatch
     DeviceBuffer<TraceLoad> trace_loads_;
     DeviceBuffer<CrackTraceParticleState> trace_particle_input_;
     DeviceBuffer<CrackTraceParticleResult> trace_particle_output_;
+    DeviceBuffer<ParticleVector3> trace_device_forces_;
+    DeviceBuffer<double> trace_block_rates_;
+    std::vector<double> host_block_rates_;
 };
 }
 

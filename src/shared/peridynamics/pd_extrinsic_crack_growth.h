@@ -493,8 +493,8 @@ class ExtrinsicCrackGrowth {
         for(size_t k=0;k<history.size();++k){Real kap=history[k].kappa;auto g=model.geometry(k,q,kap==0?model.absolute_tolerance+model.relative_tolerance*delta_f:0);Vecd t=Vecd::Zero();if(kap>0&&kap<delta_f)t=ft*(1/kap-1/delta_f)*g.jump;else if(kap==0&&k<last_traction.size())t=last_traction[k];for(const auto&e:g.linear.entries)f[e.node]-=model.quadrature[k].area*e.block().transpose()*t;}
         return f;
     }
-    void applyContact(){
-        contact_energy=max_penetration=0;contact_dt=std::numeric_limits<Real>::infinity();if(patches.empty()){contact_network.reset();return;}
+    DeviceParticleVectorView applyContact(DeviceParticleVectorView base = {}, const double *device_mass = nullptr){
+        contact_energy=max_penetration=0;contact_dt=std::numeric_limits<Real>::infinity();if(patches.empty()){contact_network.reset();return base;}
         if(!contact_network||contact_network->sides.size()!=2*patches.size()){
             StdVec<CrackSurfaceContactNetwork::Side>sides;
             for (const auto &patch : patches)
@@ -505,7 +505,9 @@ class ExtrinsicCrackGrowth {
             }
             contact_network=std::make_unique<CrackSurfaceContactNetwork>(sides,contact_K,spacing,contact_projection_);
         }
-        contact_network->apply();contact_energy=contact_network->energy;max_penetration=contact_network->max_penetration;contact_dt=contact_network->stable_dt;
+        const auto force=contact_network->apply(base,device_mass);
+        contact_energy=contact_network->energy;max_penetration=contact_network->max_penetration;contact_dt=contact_network->stable_dt;
+        return force;
     }
 
     CohesiveSurfaceEvolution::Result trialDrift(const Field&qfree,const Field&qold,const Field&inverse_mass,Real dt)const

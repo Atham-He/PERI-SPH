@@ -80,7 +80,9 @@ class CrackSurfaceContactNetwork {
     std::vector<CrackTraceParticleState> trace_particle_input_;
     std::vector<CrackTraceParticleResult> trace_particle_output_;
     void updateDeviceTraceMap();
-    void applyDeviceTracePullback(SolidForcePort &port);
+    DeviceParticleVectorView applyDeviceTracePullback(SolidForcePort &port, DeviceParticleVectorView base,
+                                                       const double *device_mass, Real &max_rate);
+    std::vector<ParticleVector3> fallback_base_forces_;
 
  public:
     struct Side {BilinearCrackSurface*surface=nullptr;const StdVec<Real>*areas=nullptr;Real outward_sign=1;size_t reference_patch=~size_t(0);};
@@ -91,7 +93,7 @@ class CrackSurfaceContactNetwork {
     size_t device_contact_evaluations=0,host_contact_fallbacks=0;
     bool device_trace_pullback=false;
     explicit CrackSurfaceContactNetwork(const StdVec<Side>&s,Real K,Real dp,CrackProjectionBatch *projection_batch=nullptr):projection_batch_(projection_batch),sides(s),penalty(K),spacing(dp){if(K<=0||dp<=0||s.empty())throw std::invalid_argument("Invalid crack-contact network");for(const auto&a:s)if(!a.surface||!a.areas||a.areas->size()!=a.surface->natural.size()||std::abs(a.outward_sign)!=1||a.surface->port.position!=s[0].surface->port.position||a.surface->port.mass!=s[0].surface->port.mass)throw std::invalid_argument("Crack-contact sides must belong to one physical material port");rates.resize(s[0].surface->port.count);}
-    void apply();
+    DeviceParticleVectorView apply(DeviceParticleVectorView base = {}, const double *device_mass = nullptr);
 
     std::vector<std::array<size_t,3>> activePairs() const
     {

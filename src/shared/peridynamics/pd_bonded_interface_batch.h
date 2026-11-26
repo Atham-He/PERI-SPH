@@ -2,6 +2,7 @@
 
 #include "pd_coulomb_friction.h"
 #include "pd_particle_trace_map.h"
+#include "pd_spatial_derivatives.h"
 #include <memory>
 #include <vector>
 
@@ -24,6 +25,26 @@ struct BondedInterfacePoint
     double energy, gap, power, force_scale, power_scale;
 };
 
+struct BondedDeviceForces
+{
+    DeviceParticleVectorView first, second;
+};
+
+struct DeviceSurfaceKinematics
+{
+    DeviceParticleVectorView position, velocity;
+    const double *force_divisor = nullptr; // null for a force port
+};
+
+struct BondedDeviceKinematics
+{
+    DeviceSurfaceKinematics first, second;
+};
+
+class SurfacePlaneContactBatch;
+struct SurfacePlaneContactPoint;
+struct CoupledSurfaceDiagnostics;
+
 class BondedInterfaceBatch
 {
   public:
@@ -33,12 +54,38 @@ class BondedInterfaceBatch
     virtual void apply(std::vector<BondedInterfaceNode> &a,
                        std::vector<BondedInterfaceNode> &b,
                        std::vector<BondedInterfacePoint> &points) = 0;
+
+    // Both operators use the first body's unchanged kinematics. A backend
+    // that cannot share the state returns false without changing any loads.
+    virtual bool applyWithPlaneContact(SurfacePlaneContactBatch &, double, double,
+                                       std::vector<BondedInterfaceNode> &,
+                                       std::vector<BondedInterfaceNode> &,
+                                       std::vector<BondedInterfacePoint> &,
+                                       std::vector<SurfacePlaneContactPoint> &,
+                                       BondedDeviceForces * = nullptr,
+                                       const BondedDeviceKinematics * = nullptr,
+                                       CoupledSurfaceDiagnostics * = nullptr)
+    {
+        return false;
+    }
 };
 
 struct SurfacePlaneContactPoint
 {
     double position[3], force[3], sum[3], torque[3];
     double upper, lower, energy, penetration, power, force_scale, power_scale;
+};
+
+struct PlaneZForce
+{
+    double z, force_z;
+};
+
+struct CoupledSurfaceDiagnostics
+{
+    BondedInterfacePoint interface_totals;
+    SurfacePlaneContactPoint plane_totals;
+    std::vector<PlaneZForce> plate_rows;
 };
 
 struct SurfaceFrictionState

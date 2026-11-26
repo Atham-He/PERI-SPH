@@ -23,6 +23,7 @@ bool affine_inner_interface=false,inner_interface_handoff_only=false;
 constexpr uint64_t split_contact_checkpoint=11;
 uint64_t legacy_contact_layout=0;
 bool tighter_shell_step=false;
+bool separate_cuda_surface_forces=false;
 Real reaction_settling_window_s=0;
 constexpr char reaction_settling_option[]="--reaction-settling-window-s=";
 constexpr char pilot_end_option[]="--pilot-end-time=";
@@ -169,6 +170,10 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells,const PeriExec
     if(use_column_interface&&recovery::checkpoint.resume.empty())installColumnInterface();
     SolidSurfacePlaneContact contact(so,outer_areas,Kcontact,R,0,1,execution.makeSurfacePlaneContact());
     std::cout << "Solid plane contact backend " << (contact.onDevice() ? "cuda_fp64" : "cpu_fp64") << std::endl;
+    const bool share_surface_forces = !separate_cuda_surface_forces &&
+                                      execution.bondedInterfaceOnDevice() && contact.onDevice();
+    std::cout << "Bonded/platen force assembly "
+              << (share_surface_forces ? "shared CUDA shell state" : "separate operators") << std::endl;
     auto bank=ExtrinsicCrackGrowth::readBank(fracture_bank_input,geometry);
     using SurfaceLaw=ExtrinsicCrackGrowth::SurfaceLaw;
     auto crack_projection=execution.makeCrackProjection();
@@ -193,7 +198,7 @@ int runSnsniCapsule(const HybridOptions&o,const std::string&cells,const PeriExec
         core_port.clear();
         pd_port.clear();
         const Real top = R - compression / 2;
-        if (!tie->applyWithPlaneContactOnFirstBody(contact, -top, top))
+        if (!share_surface_forces || !tie->applyWithPlaneContactOnFirstBody(contact, -top, top))
         {
             tie->apply();
             contact.apply(-top, top);
@@ -1045,6 +1050,7 @@ int main(int argc,char**argv)
         }
         else if(a=="--pilot-implicit")pilot_implicit=true;
         else if(a=="--hybrid-loading")hybrid_loading=true;
+        else if(a=="--separate-cuda-surface-forces")separate_cuda_surface_forces=true;
         else if(a=="--fracture-contact-only")fracture_contact_only=true;else if(a=="--affine-crack-contact")affine_crack_contact=true;else if(a=="--affine-contact-handoff-only")affine_contact_handoff_only=true;else if(a=="--affine-inner-interface")affine_inner_interface=true;else if(a=="--inner-interface-handoff-only")inner_interface_handoff_only=true;else if(a=="--cuda-crack-projection")legacy.crack_projection=true;else if(a=="--cuda-bonded-interface")legacy.bonded_interface=true;else if(recovery::checkpoint.take(a)){}else args.push_back(argv[i]);}
         if(use_column_interface){recovery::checkpoint.schema_version=5;recovery::checkpoint.compatible_read_version=4;}
         if(fracture_contact_only){
